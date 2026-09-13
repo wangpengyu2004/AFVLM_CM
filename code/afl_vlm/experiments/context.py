@@ -10,6 +10,8 @@ from typing import Any
 
 
 def _json_default(value: Any) -> Any:
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return value.detach().cpu().tolist()
     if hasattr(value, "item"):
         return value.item()
     if hasattr(value, "__dict__"):

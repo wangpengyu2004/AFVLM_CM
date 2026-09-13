@@ -26,12 +26,26 @@ def main() -> int:
     )
     parser.add_argument("--output-root", help="Optional output-root override for this invocation")
     parser.add_argument(
+        "--methods",
+        nargs="+",
+        metavar="METHOD_ID",
+        help="Run only these method IDs from the config (for example: fedavg afvlm_cm)",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Explicitly allow replacement of existing run artifacts",
     )
     arguments = parser.parse_args()
     config = load_config(arguments.config)
+    if arguments.methods:
+        requested = set(arguments.methods)
+        available = {str(item["id"]) for item in config["methods"]}
+        unknown = requested - available
+        if unknown:
+            parser.error(f"unknown method ID(s): {sorted(unknown)}; available: {sorted(available)}")
+        for method in config["methods"]:
+            method["enabled"] = str(method["id"]) in requested
     if arguments.output_root:
         config["run"]["output_root"] = arguments.output_root
     if arguments.overwrite:

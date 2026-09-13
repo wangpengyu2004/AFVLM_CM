@@ -1,4 +1,4 @@
-"""Resolve one FCIT fixed-task benchmark variant into runtime configuration."""
+"""Resolve one fixed-task VLM benchmark variant into runtime configuration."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def _root_path(raw: str, config_path: Path) -> Path:
     return path.resolve()
 
 
-def resolve_fcit_preset(payload: dict[str, Any], config_path: Path) -> dict[str, Any]:
+def resolve_fixed_task_preset(payload: dict[str, Any], config_path: Path) -> dict[str, Any]:
     """Hydrate tasks and client ownership from a generated benchmark variant.
 
     The generated ``framework_config.yaml`` remains the benchmark's machine-readable
@@ -41,26 +41,26 @@ def resolve_fcit_preset(payload: dict[str, Any], config_path: Path) -> dict[str,
     and output policy continue to come from the user's config.
     """
     dataset = dict(payload.get("dataset") or {})
-    if dataset.get("name") != "fcit_fixed":
+    if dataset.get("name") != "fixed_task_vlm":
         return payload
     variant = str(dataset.get("variant", ""))
     try:
         canonical = VARIANT_ALIASES[variant]
     except KeyError as exc:
         raise ValueError(
-            f"Unknown FCIT dataset.variant '{variant}'. Available: {sorted(VARIANT_ALIASES)}"
+            f"Unknown fixed-task dataset.variant '{variant}'. Available: {sorted(VARIANT_ALIASES)}"
         ) from exc
     root = _root_path(str(dataset.get("root", "data/fcit/fixed_task_benchmark")), config_path)
     variant_dir = root / Path(canonical)
     generated_path = variant_dir / "framework_config.yaml"
     if not generated_path.is_file():
         raise FileNotFoundError(
-            f"FCIT variant is not generated: {generated_path}. "
-            "Run python -m scripts.prepare_fcit_fixed_benchmark first."
+            f"Fixed-task variant is not generated: {generated_path}. "
+            "Run python -m scripts.prepare_fixed_task_benchmark first."
         )
     generated = yaml.safe_load(generated_path.read_text(encoding="utf-8"))
     if not isinstance(generated, dict):
-        raise ValueError(f"Invalid generated FCIT config: {generated_path}")
+        raise ValueError(f"Invalid generated fixed-task config: {generated_path}")
 
     resolved = copy.deepcopy(payload)
     image_root = str(dataset.get("image_root", "data/fcit/dataset"))
@@ -82,6 +82,6 @@ def resolve_fcit_preset(payload: dict[str, Any], config_path: Path) -> dict[str,
     timing["train_delay"] = copy.deepcopy(generated["timing"]["train_delay"])
     resolved["timing"] = timing
     if str(resolved.get("run", {}).get("output_root")) == "auto":
-        resolved["run"]["output_root"] = f"runs/fcit/{canonical}"
+        resolved["run"]["output_root"] = f"runs/afvlm_cm/{canonical}"
     resolved["dataset"]["resolved_variant"] = canonical
     return resolved

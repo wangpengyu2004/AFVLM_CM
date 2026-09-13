@@ -1,9 +1,4 @@
-"""LLaVA-1.5 7B LoRA adapter matching the backbone used by FCIT.
-
-FCIT's official code uses the original LLaVA repository checkpoint. This
-adapter targets the equivalent Transformers-converted checkpoint so it can
-share the framework's model contract without vendoring FCIT's training stack.
-"""
+"""LLaVA-1.5 7B LoRA adapter for AFVLM-CM experiments."""
 
 from __future__ import annotations
 
@@ -15,8 +10,8 @@ from afl_vlm.models.base import LoRAState, ModelAdapter, TrainConfig, TrainResul
 from afl_vlm.models.registry import register_model
 
 
-@register_model("llava15_fcit")
-class Llava15FCITAdapter(ModelAdapter):
+@register_model("llava15")
+class Llava15Adapter(ModelAdapter):
     def __init__(self) -> None:
         self.model: Any = None
         self.processor: Any = None
@@ -92,7 +87,7 @@ class Llava15FCITAdapter(ModelAdapter):
         lora = dict(config["lora"])
         if lora.get("include_visual", False):
             raise ValueError(
-                "llava15_fcit currently federates language-model LoRA only; "
+                "llava15 currently federates language-model LoRA only; "
                 "set model.lora.include_visual to false"
             )
         peft_config = LoraConfig(
@@ -146,7 +141,7 @@ class Llava15FCITAdapter(ModelAdapter):
 
     def _image(self, sample: Any) -> Any:
         if not sample.image:
-            raise ValueError(f"FCIT LLaVA sample has no image: {sample.id}")
+            raise ValueError(f"LLaVA sample has no image: {sample.id}")
         _, _, _, _, Image, *_ = self._imports()
         with Image.open(sample.image) as handle:
             return handle.convert("RGB")

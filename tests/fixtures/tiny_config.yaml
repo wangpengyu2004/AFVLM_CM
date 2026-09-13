@@ -1,0 +1,126 @@
+# This is the only file users need to edit. Every runtime option has one
+# authoritative location; no YAML inheritance or hidden defaults are required.
+run:
+  seeds: [42]
+  output_root: runs/validation
+
+model:
+  adapter: tiny_mock
+  hf_id: Qwen/Qwen2.5-VL-7B-Instruct
+  dtype: bf16
+  quantization: nf4
+  gradient_checkpointing: true
+  device_map: auto
+  mock_dimension: 3
+  mock_step_size: 0.18
+  lora:
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    include_visual: false
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+tasks:
+  fast:
+    backend: fedmllm
+    name: hateful_memes
+    train_per_client: 128
+    allow_synthetic: true
+    data_files: {}
+  slow:
+    backend: fedmllm
+    name: vqa_rad
+    train_per_client: 128
+    allow_synthetic: true
+    data_files: {}
+
+clients:
+  count: 4
+  upload_quota: 2
+  data_partition: disjoint
+  assignments:
+    - {id: c0, task: fast, virtual_train_time: 1.0}
+    - {id: c1, task: fast, virtual_train_time: 1.2}
+    - {id: c2, task: slow, virtual_train_time: 3.0}
+    - {id: c3, task: slow, virtual_train_time: 3.2}
+
+training:
+  local_steps: 5
+  batch_size: 1
+  grad_accumulation: 4
+  client_lr: 2.0e-4
+  max_text_length: 512
+
+timing:
+  clock: virtual
+  train_delay:
+    type: per_client
+    values: {}
+  network_delay:
+    type: fixed
+    value: 0.0
+
+methods:
+  - id: additive
+    implementation: async_additive
+    enabled: true
+    params: {server_lr: 0.5}
+  - id: decay
+    implementation: staleness_decay
+    enabled: false
+    params: {server_lr: 0.5, decay_exponent: 1.0}
+  - id: sync
+    implementation: fedavg_sync
+    enabled: false
+    params: {server_lr: 1.0}
+  - id: fedasync
+    implementation: fedasync
+    enabled: false
+    params: {alpha: 0.5, decay_exponent: 0.5}
+  - id: fedbuff
+    implementation: fedbuff
+    enabled: false
+    params: {server_lr: 0.5, buffer_size: 2, flush_tail: true}
+  - id: afvlm_cm
+    implementation: afvlm_cm
+    enabled: false
+    params:
+      download_correction: true
+      upload_correction: true
+
+experiments:
+  - id: e1
+    type: stale_twin
+    enabled: true
+    methods: [additive]
+    params:
+      tau: 2
+      paths:
+        - [fast, fast]
+        - [slow, slow]
+  - id: e2
+    type: biased_start
+    enabled: true
+    methods: [additive]
+    params:
+      biased_path: [fast, fast, fast, fast]
+      balanced_path: [fast, slow, fast, slow]
+  - id: trace
+    type: end_to_end
+    enabled: false
+    methods: all_enabled
+    params:
+      delay_scenarios: [task_correlated, task_shuffled]
+
+evaluation:
+  probe_samples_per_task: 16
+  final_samples_per_task: 64
+  window_size: 4
+  save_update_norm: true
+  probe_on_selected_events: true
+  generation_on_selected_checkpoints: true
+
+output:
+  save_adapter: true
+  save_method_state: true
+  overwrite: false

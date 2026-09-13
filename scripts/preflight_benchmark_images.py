@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that every image referenced by a generated FCIT benchmark exists and is readable."""
+"""Verify every image referenced by the generated fixed-task benchmark."""
 
 from __future__ import annotations
 
