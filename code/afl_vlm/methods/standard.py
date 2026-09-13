@@ -51,6 +51,7 @@ class _RoundAggregator(Method):
 @register_method("local")
 class LocalTraining(Method):
     name = "local"
+    evaluation_scope = "client_local_mean"
     capabilities = MethodCapabilities(mode="local", requires_local_state=True)
     allowed_params = set()
 

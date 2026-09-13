@@ -57,10 +57,26 @@ paths from the actual annotations and never rewrites instruction JSON.
 
 ## Evaluation
 
-The single task-aware evaluator reports classification accuracy, CIDEr and
-ROUGE-L, VQA accuracy, DVQA/FigureQA answer accuracy, and Grounding mean IoU
-plus IoU@0.5. It reports a dictionary per task and does not raw-average
-incompatible metric scales.
+The primary protocol follows conventional asynchronous FL evaluation:
+
+1. after every configured number of successful server-version increments,
+   evaluate a copy of the current server federated state on common validation
+   sets;
+2. process all scheduled arrivals and run method finalization, including a
+   residual FedBuff flush;
+3. evaluate the final server federated state on common test sets.
+
+Evaluation does not mutate training state or consume virtual training time.
+Every aggregated method uses `server_global` as its primary scope. Pilot keeps
+task routing but uses the server state and the mean output of server-held
+client visual adapters for the selected task. Local-only has no server model;
+its explicitly labelled `client_local_mean` result averages client models
+within each fixed task on the same common held-out split.
+
+The task-aware evaluator reports classification accuracy, CIDEr and ROUGE-L,
+VQA accuracy, DVQA/FigureQA answer accuracy, and Grounding mean IoU plus
+IoU@0.5. It records protocol, split, server version, virtual time, and a metric
+dictionary per task. It does not raw-average incompatible metric scales.
 
 Flickr30k records currently contain one reference caption. The built-in CIDEr
 uses the standard 1--4 gram TF-IDF cosine construction, but it is not claimed

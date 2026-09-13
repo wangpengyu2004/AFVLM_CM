@@ -5,6 +5,13 @@ LLaVA-1.5-7B parameters are never placed in an update or federated checkpoint.
 For fair comparison, every client job creates a fresh AdamW optimizer; local
 optimizer moments do not persist across jobs.
 
+Primary evaluation is always the current server federated state at a common
+server-update checkpoint and the final server state after method finalization.
+Local-only is the sole exception because no server model exists. Pilot's
+server-global evaluation uses task routing with a task-wise mean of its
+server-held client visual adapters; personalized LoRA states are not used as
+the primary score.
+
 ## Reference and classical FL
 
 - **Local-only:** persistent per-client LoRA states, no global mutation.

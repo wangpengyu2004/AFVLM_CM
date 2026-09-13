@@ -49,26 +49,34 @@ def _append(path: Path, payload: Any) -> None:
 def evaluate_method(
     model: Any, method: Any, server_state: dict[str, Any], tasks: dict[str, Any], split: str
 ) -> dict[str, Any]:
+    """Run the conventional primary evaluation for one server checkpoint.
+
+    Aggregated methods always use the current server state. Local-only has no
+    global model, so its client states are evaluated on their task's common
+    held-out split and then macro-averaged within that task.
+    """
     sample_ids = {
         task: [sample.id for sample in adapter.load_split(split)] for task, adapter in tasks.items()
     }
     original = model.snapshot_trainable()
-    states = method.evaluation_states(server_state)
+    states = (
+        method.evaluation_states(server_state)
+        if method.evaluation_scope == "client_local_mean"
+        else {"global": server_state}
+    )
     try:
         if set(states) == {"global"}:
             model.load_trainable(states["global"])
             metrics = {}
             for task, adapter in tasks.items():
-                if getattr(model, "_pilot_connector", None) is not None:
-                    model._set_context(task, model._pilot_eval_client[task])
+                model.set_evaluation_context(task, None)
                 metrics[task] = model.evaluate(adapter, sample_ids[task], "final")
             return metrics
         by_task: dict[str, list[dict[str, float]]] = defaultdict(list)
         for client_id, state in states.items():
             task = client_id.split("/", 1)[0]
             model.load_trainable(state)
-            if getattr(model, "_pilot_connector", None) is not None:
-                model._set_context(task, client_id)
+            model.set_evaluation_context(task, client_id)
             by_task[task].append(model.evaluate(tasks[task], sample_ids[task], "final"))
         return {
             task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
@@ -177,6 +185,8 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
     last_virtual_time = 0.0
     last_evaluated_version = -1
     eval_interval = int(config["evaluation"].get("eval_every_server_updates", 0))
+    periodic_split = str(config["evaluation"].get("periodic_split", "validation"))
+    final_split = str(config["evaluation"].get("final_split", "final"))
     training = config["training"]
     for virtual_time, _, kind, event in timeline:
         last_virtual_time = max(last_virtual_time, virtual_time)
@@ -274,11 +284,13 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
             and server.version % eval_interval == 0
             and server.version != last_evaluated_version
         ):
-            validation_metrics = evaluate_method(model, method, server.state, tasks, "validation")
+            validation_metrics = evaluate_method(model, method, server.state, tasks, periodic_split)
             _append(
                 output / "task_metrics.jsonl",
                 {
                     "kind": "validation",
+                    "protocol": method.evaluation_scope,
+                    "split": periodic_split,
                     "server_version": server.version,
                     "virtual_time": event.arrival_time,
                     "per_task": validation_metrics,
@@ -292,15 +304,24 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
         if "mean_buffer_waiting_time" in result.metadata:
             buffer_waiting_times.append(float(result.metadata["mean_buffer_waiting_time"]))
     _write_json(output / "train_plan.json", records)
-    metrics = evaluate_method(model, method, server.state, tasks, "final")
+    metrics = evaluate_method(model, method, server.state, tasks, final_split)
     _write_json(
         output / "metrics.json",
-        {"per_task": metrics, "note": "Incompatible task metrics are not raw-averaged."},
+        {
+            "protocol": method.evaluation_scope,
+            "split": final_split,
+            "server_version": server.version,
+            "virtual_time": last_virtual_time,
+            "per_task": metrics,
+            "note": "Incompatible task metrics are not raw-averaged.",
+        },
     )
     _append(
         output / "task_metrics.jsonl",
         {
             "kind": "final",
+            "protocol": method.evaluation_scope,
+            "split": final_split,
             "server_version": server.version,
             "virtual_time": last_virtual_time,
             "per_task": metrics,

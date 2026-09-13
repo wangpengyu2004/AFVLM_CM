@@ -197,6 +197,10 @@ class ModelAdapter(ABC):
     def evaluate(self, task_adapter: Any, sample_ids: list[str], mode: str) -> MetricDict:
         """Evaluate the current state on a task-specific adapter."""
 
+    def set_evaluation_context(self, task: str, client_id: str | None = None) -> None:
+        """Select optional task/client routing without changing model state."""
+        return None
+
     def get_federated_state(self) -> LoRAState:
         return self.snapshot_trainable()
 

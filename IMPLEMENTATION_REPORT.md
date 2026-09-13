@@ -243,6 +243,20 @@ The registered methods are `local`, `fedavg`, `fedprox`, `fedadam`, `fedasync`, 
 - The repository-local verification environment does not currently have the newly declared NumPy/Hugging Face runtime dependencies installed; CLI parsing was checked where imports permit, and the documented editable install is required before downloads/training.
 - The proposed method is intentionally not invented.
 
+## Evaluation protocol
+
+- Periodic validation is triggered by successful server model updates, using
+  `evaluation.eval_every_server_updates` and the current server federated state.
+- Final test evaluation runs only after all scheduled arrivals and method
+  finalization, including a configured residual-buffer flush.
+- Aggregated methods report `server_global`; Local-only reports the explicitly
+  labelled `client_local_mean` because it has no global model.
+- Pilot uses its current server state with task routing and a task-wise mean of
+  server-held client visual adapters, rather than arbitrarily selecting one
+  client or promoting personalized LoRA states to the primary result.
+- Evaluation artifacts record protocol, split, server version, virtual time,
+  and independent per-task metrics. Incompatible task metrics are not raw-averaged.
+
 ## Uncertain files intentionally kept
 
 - `Codex项目规格_两项机制最小验证.md`: historical user-authored guidance; retained because it is not safe to treat user documentation as disposable.

@@ -126,6 +126,17 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
             raise ValueError(f"training.{key} must be positive")
     if float(training.get("learning_rate", 0.0)) <= 0:
         raise ValueError("training.learning_rate must be positive")
+    evaluation = config["evaluation"]
+    if evaluation.get("protocol") != "server_global":
+        raise ValueError("evaluation.protocol must be server_global")
+    if evaluation.get("interval_unit") != "server_updates":
+        raise ValueError("evaluation.interval_unit must be server_updates")
+    if int(evaluation.get("eval_every_server_updates", 0)) <= 0:
+        raise ValueError("evaluation.eval_every_server_updates must be positive")
+    if evaluation.get("periodic_split") not in {"validation", "val"}:
+        raise ValueError("evaluation.periodic_split must be validation or val")
+    if evaluation.get("final_split") not in {"final", "test"}:
+        raise ValueError("evaluation.final_split must be final or test")
     method_cfg = config["method"]
     method = create_method(str(method_cfg["name"]), method_cfg.get("params", {}))
     configured_mode = str(config["federation"]["mode"])
