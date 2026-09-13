@@ -10,6 +10,7 @@ from afl_vlm.experiments.common import batch_for, probe_all, train_config_for, u
 from afl_vlm.federation.server import FederatedServer
 from afl_vlm.scheduling.delay_models import CombinedDelay, create_delay_model
 from afl_vlm.scheduling.virtual_event import (
+    build_fedcompass_schedule,
     build_schedule,
     build_sync_schedule,
     schedule_records,
@@ -40,8 +41,18 @@ def run(context: Any, params: dict[str, Any], scenario: str) -> list[dict[str, A
     network_delay = create_delay_model(timing["network_delay"], {key: 0.0 for key in defaults})
     delay_model = CombinedDelay(train_delay, network_delay)
     upload_quota = int(context.config["clients"]["upload_quota"])
-    if context.method.name == "fedavg_sync":
+    if context.method.schedule_mode == "synchronous":
         schedule = build_sync_schedule(specs, upload_quota, delay_model, context.seed)
+    elif context.method.schedule_mode == "fedcompass":
+        schedule = build_fedcompass_schedule(
+            specs,
+            upload_quota,
+            delay_model,
+            context.seed,
+            context.train_config.local_steps,
+            context.method.min_local_steps,
+            context.method.max_local_steps,
+        )
     else:
         schedule = build_schedule(specs, upload_quota, delay_model, context.seed)
     context.writer.write_json("schedule.json", schedule_records(schedule))
@@ -51,7 +62,9 @@ def run(context: Any, params: dict[str, Any], scenario: str) -> list[dict[str, A
     }
     arrivals: deque[str] = deque(maxlen=int(context.config["evaluation"]["window_size"]))
     quota_counts: Counter[str] = Counter()
+    max_task_mass = 0.0
     max_fast_mass = 0.0
+    optimizer_steps = 0
     for event in schedule:
         key = (event.client_id, event.local_round)
         if key not in downloads:
@@ -64,20 +77,25 @@ def run(context: Any, params: dict[str, Any], scenario: str) -> list[dict[str, A
             download["state"],
             int(download["version"]),
             event.local_round,
-            batch_for(context, client, event.local_round),
+            batch_for(context, client, event.local_round, event.local_steps),
             train_config_for(
                 context,
                 context.derived_seed("training", event.client_id, event.local_round),
+                event.local_steps,
             ),
         )
         receive_version = server.version
         context.writer.append("updates.jsonl", update_record(update, server.state))
         results = server.receive(update)
         quota_counts[event.client_id] += 1
+        optimizer_steps += update.optimizer_steps
         arrivals.append(event.task)
         window_counts = dict(Counter(arrivals))
         fast_mass = window_counts.get("fast", 0) / len(arrivals)
-        max_fast_mass = max(max_fast_mass, fast_mass)
+        task_mass = max(window_counts.values()) / len(arrivals)
+        if len(arrivals) == arrivals.maxlen:
+            max_fast_mass = max(max_fast_mass, fast_mass)
+            max_task_mass = max(max_task_mass, task_mass)
         applied_weight = sum(result.applied_weight for result in results if result.applied)
         context.writer.append(
             "events.jsonl",
@@ -92,6 +110,7 @@ def run(context: Any, params: dict[str, Any], scenario: str) -> list[dict[str, A
                 "receive_version": receive_version,
                 "staleness": receive_version - update.download_version,
                 "virtual_duration": event.virtual_duration,
+                "local_steps": update.optimizer_steps,
                 "applied_weight": applied_weight,
                 "recent_window_task_counts": window_counts,
                 "window_mass_fast": fast_mass,
@@ -108,7 +127,7 @@ def run(context: Any, params: dict[str, Any], scenario: str) -> list[dict[str, A
             },
         )
         next_round = event.local_round + 1
-        if next_round < upload_quota and context.method.name != "fedavg_sync":
+        if next_round < upload_quota and context.method.schedule_mode != "synchronous":
             downloads[(event.client_id, next_round)] = _capture_download(context, server)
     tail_results = server.finish()
     expected_counts = {client.id: upload_quota for client in specs}
@@ -123,11 +142,9 @@ def run(context: Any, params: dict[str, Any], scenario: str) -> list[dict[str, A
         "received_updates": server.received_updates,
         "applied_client_updates": server.applied_updates,
         "server_versions": server.version,
-        "optimizer_steps": sum(
-            update_quota * context.train_config.local_steps
-            for update_quota in quota_counts.values()
-        ),
+        "optimizer_steps": optimizer_steps,
         "max_window_mass_fast": max_fast_mass,
+        "max_window_task_mass": max_task_mass,
         "tail_server_applications": len(tail_results),
         "method_extra_cost": 0.0,
         "final_task_metrics": final_metrics,

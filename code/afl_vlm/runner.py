@@ -21,6 +21,7 @@ from afl_vlm.models.base import TrainConfig
 from afl_vlm.models.registry import create_model
 from afl_vlm.scheduling.delay_models import CombinedDelay, create_delay_model
 from afl_vlm.scheduling.virtual_event import (
+    build_fedcompass_schedule,
     build_schedule,
     build_sync_schedule,
     schedule_records,
@@ -67,17 +68,32 @@ def dry_run(config: dict[str, Any]) -> dict[str, Any]:
             network_delay = create_delay_model(
                 config["timing"]["network_delay"], {key: 0.0 for key in defaults}
             )
-            schedule_builder = (
-                build_sync_schedule
-                if run_spec.method_implementation == "fedavg_sync"
-                else build_schedule
-            )
-            schedule = schedule_builder(
-                scenario_specs,
-                int(config["clients"]["upload_quota"]),
-                CombinedDelay(train_delay, network_delay),
-                run_spec.seed,
-            )
+            method = create_method(run_spec.method_implementation, run_spec.method_params)
+            delay_model = CombinedDelay(train_delay, network_delay)
+            if method.schedule_mode == "synchronous":
+                schedule = build_sync_schedule(
+                    scenario_specs,
+                    int(config["clients"]["upload_quota"]),
+                    delay_model,
+                    run_spec.seed,
+                )
+            elif method.schedule_mode == "fedcompass":
+                schedule = build_fedcompass_schedule(
+                    scenario_specs,
+                    int(config["clients"]["upload_quota"]),
+                    delay_model,
+                    run_spec.seed,
+                    int(config["training"]["local_steps"]),
+                    method.min_local_steps,
+                    method.max_local_steps,
+                )
+            else:
+                schedule = build_schedule(
+                    scenario_specs,
+                    int(config["clients"]["upload_quota"]),
+                    delay_model,
+                    run_spec.seed,
+                )
             plan["schedule"] = schedule_records(schedule)
         else:
             plan["controlled_paths"] = run_spec.experiment_params
@@ -88,16 +104,13 @@ def dry_run(config: dict[str, Any]) -> dict[str, Any]:
 def _prepare_context(
     config: dict[str, Any], run_spec: RunSpec, writer: ArtifactWriter
 ) -> ExperimentContext:
-    model = create_model(str(config["model"]["adapter"]))
-    model_config = dict(config["model"])
-    model_config["max_text_length"] = int(config["training"]["max_text_length"])
-    model.load(model_config)
-    method = create_method(run_spec.method_implementation, run_spec.method_params)
     tasks = {
         task_key: create_task(task_key, task_config)
         for task_key, task_config in config["tasks"].items()
     }
     specs = _client_specs(config)
+    assignments = {str(item["id"]): item for item in config["clients"]["assignments"]}
+    prepartitioned = config["clients"]["data_partition"] == "prepartitioned"
     clients: dict[str, FederatedClient] = {}
     heldout: dict[str, list[Any]] = {}
     probe_ids: dict[str, list[str]] = {}
@@ -107,25 +120,39 @@ def _prepare_context(
     )
     for task_key, task in tasks.items():
         task_specs = [item for item in specs if item.task == task_key]
-        train_samples = task.load_split("train")
-        per_client = int(config["tasks"][task_key]["train_per_client"])
-        partitions = partition_disjoint(
-            train_samples,
-            [item.id for item in task_specs],
-            per_client,
-            _derived_seed(run_spec.seed, "partition", task_key),
-        )
-        used_ids = {sample.id for samples in partitions.values() for sample in samples}
-        heldout[task_key] = [sample for sample in train_samples if sample.id not in used_ids][
-            :required_batch
-        ]
-        if len(heldout[task_key]) < required_batch:
-            raise ValueError(
-                f"Task {task_key} needs {required_batch} held-out training samples "
-                "after client partitioning"
+        if prepartitioned:
+            seen_ids: set[str] = set()
+            for item in task_specs:
+                samples = task.load_file(str(assignments[item.id]["train_file"]), "train")
+                sample_ids = {sample.id for sample in samples}
+                overlap = seen_ids & sample_ids
+                if overlap:
+                    raise ValueError(
+                        f"Prepartitioned clients overlap in task {task_key}: {sorted(overlap)[:3]}"
+                    )
+                seen_ids.update(sample_ids)
+                clients[item.id] = FederatedClient(item.id, item.task, samples)
+            heldout[task_key] = []
+        else:
+            train_samples = task.load_split("train")
+            per_client = int(config["tasks"][task_key]["train_per_client"])
+            partitions = partition_disjoint(
+                train_samples,
+                [item.id for item in task_specs],
+                per_client,
+                _derived_seed(run_spec.seed, "partition", task_key),
             )
-        for item in task_specs:
-            clients[item.id] = FederatedClient(item.id, item.task, partitions[item.id])
+            used_ids = {sample.id for samples in partitions.values() for sample in samples}
+            heldout[task_key] = [sample for sample in train_samples if sample.id not in used_ids][
+                :required_batch
+            ]
+            if len(heldout[task_key]) < required_batch:
+                raise ValueError(
+                    f"Task {task_key} needs {required_batch} held-out training samples "
+                    "after client partitioning"
+                )
+            for item in task_specs:
+                clients[item.id] = FederatedClient(item.id, item.task, partitions[item.id])
         probe_ids[task_key] = select_ids(
             task.load_split("probe"),
             int(config["evaluation"]["probe_samples_per_task"]),
@@ -136,6 +163,12 @@ def _prepare_context(
             int(config["evaluation"]["final_samples_per_task"]),
             _derived_seed(run_spec.seed, "final", task_key),
         )
+    # Data and image paths are checked before loading a potentially large VLM.
+    model = create_model(str(config["model"]["adapter"]))
+    model_config = dict(config["model"])
+    model_config["max_text_length"] = int(config["training"]["max_text_length"])
+    model.load(model_config)
+    method = create_method(run_spec.method_implementation, run_spec.method_params)
     training = config["training"]
     train_config = TrainConfig(
         local_steps=int(training["local_steps"]),

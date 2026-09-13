@@ -1,4 +1,4 @@
-"""FedMLLM JSON/JSONL normalization for Hateful-Memes and medical VQA tasks."""
+"""FedMLLM JSON/JSONL normalization with explicit shared image-root support."""
 
 from __future__ import annotations
 
@@ -88,6 +88,29 @@ class FedMLLMTaskAdapter(TaskAdapter):
                 return payload[key]
         raise ValueError(f"Unsupported JSON container in {path}")
 
+    def _image_path(self, value: Any, data_root: Path) -> str | None:
+        if not value:
+            return None
+        text = str(value)
+        if text.startswith(("http://", "https://")):
+            return text
+        configured_root = self.config.get("image_root")
+        image_root = (
+            Path(str(configured_root)).expanduser().resolve() if configured_root else data_root
+        )
+        raw_path = Path(text)
+        image_path = (
+            raw_path.resolve() if raw_path.is_absolute() else (image_root / raw_path).resolve()
+        )
+        if configured_root and not image_path.is_relative_to(image_root):
+            raise ValueError(f"Image path escapes configured image_root: {text}")
+        if self.config.get("require_images", False) and not image_path.is_file():
+            raise FileNotFoundError(
+                f"Image required by task '{self.task_key}' is missing: {image_path}. "
+                f"Expected relative to image_root={image_root}."
+            )
+        return str(image_path)
+
     def _normalize(self, record: Mapping[str, Any], split: str, index: int, root: Path) -> Sample:
         conversations = record.get("conversations") or record.get("messages") or []
         question = record.get("instruction") or record.get("question") or record.get("text")
@@ -104,12 +127,9 @@ class FedMLLMTaskAdapter(TaskAdapter):
             raise ValueError(
                 f"Record {index} in split '{split}' lacks question/instruction or answer"
             )
-        image = record.get("image") or record.get("image_path") or record.get("img")
-        if image:
-            image_path = Path(str(image))
-            if not image_path.is_absolute():
-                image_path = (root / image_path).resolve()
-            image = str(image_path)
+        image = self._image_path(
+            record.get("image") or record.get("image_path") or record.get("img"), root
+        )
         sample_id = str(
             record.get("id") or record.get("question_id") or f"{self.task_key}-{split}-{index}"
         )
@@ -127,21 +147,28 @@ class FedMLLMTaskAdapter(TaskAdapter):
             metadata=metadata,
         )
 
+    def load_file(self, path: str | Path, split: str = "train") -> list[Sample]:
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"Configured {self.task_key}.{split} file not found: {resolved}"
+            )
+        samples = [
+            self._normalize(record, split, index, resolved.parent)
+            for index, record in enumerate(self._records(resolved))
+        ]
+        if len({sample.id for sample in samples}) != len(samples):
+            raise ValueError(f"Duplicate sample IDs in {self.task_key}.{split}: {resolved}")
+        self._by_id.update({sample.id: sample for sample in samples})
+        return samples
+
     def load_split(self, split: str) -> list[Sample]:
         if split in self._cache:
             return list(self._cache[split])
         data_files = dict(self.config.get("data_files") or {})
         path_value = data_files.get(split)
         if path_value:
-            path = Path(path_value).expanduser().resolve()
-            if not path.is_file():
-                raise FileNotFoundError(
-                    f"Configured {self.task_key}.{split} file not found: {path}"
-                )
-            samples = [
-                self._normalize(record, split, index, path.parent)
-                for index, record in enumerate(self._records(path))
-            ]
+            samples = self.load_file(path_value, split)
         elif self.config.get("allow_synthetic", False):
             samples = self._synthetic(split)
         else:

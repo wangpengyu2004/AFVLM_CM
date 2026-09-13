@@ -9,10 +9,10 @@ from afl_vlm.evaluation.probes import evaluate_tasks
 from afl_vlm.models.base import state_cosine, state_norm, subtract
 
 
-def train_config_for(context: Any, seed: int) -> Any:
+def train_config_for(context: Any, seed: int, local_steps: int | None = None) -> Any:
     config = context.train_config
     return type(config)(
-        local_steps=config.local_steps,
+        local_steps=config.local_steps if local_steps is None else local_steps,
         batch_size=config.batch_size,
         grad_accumulation=config.grad_accumulation,
         client_lr=config.client_lr,
@@ -21,11 +21,14 @@ def train_config_for(context: Any, seed: int) -> Any:
     )
 
 
-def batch_for(context: Any, client: Any, local_round: int) -> list[Any]:
+def batch_for(
+    context: Any, client: Any, local_round: int, local_steps: int | None = None
+) -> list[Any]:
+    steps = context.train_config.local_steps if local_steps is None else local_steps
     return local_batch(
         client.samples,
         local_round,
-        context.train_config.local_steps,
+        steps,
         context.train_config.grad_accumulation,
     )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import random
+import statistics
 from collections.abc import Iterable
 
 from afl_vlm.federation.types import ClientSpec, ScheduledEvent
@@ -58,6 +59,7 @@ def schedule_records(events: list[ScheduledEvent]) -> list[dict[str, object]]:
             "start_time": event.start_time,
             "finish_time": event.finish_time,
             "virtual_duration": event.virtual_duration,
+            "local_steps": event.local_steps,
         }
         for event in events
     ]
@@ -100,6 +102,68 @@ def build_sync_schedule(
                 )
             )
         round_start = max(event.finish_time for event in round_events)
+    return events
+
+
+def build_fedcompass_schedule(
+    clients: Iterable[ClientSpec],
+    upload_quota: int,
+    delay_model: DelayModel,
+    seed: int,
+    base_local_steps: int,
+    min_local_steps: int,
+    max_local_steps: int,
+) -> list[ScheduledEvent]:
+    """Align arrivals by assigning more work to faster clients.
+
+    The target duration is the median nominal client duration in each local
+    round. Clients remain event-driven and immediately start their next job.
+    """
+    specs = {client.id: client for client in clients}
+    if upload_quota <= 0 or base_local_steps <= 0:
+        raise ValueError("Upload quota and base local steps must be positive")
+    if min_local_steps <= 0 or max_local_steps < min_local_steps:
+        raise ValueError("Invalid FedCompass local-step bounds")
+    plans: dict[tuple[str, int], tuple[float, int]] = {}
+    for local_round in range(upload_quota):
+        nominal: dict[str, float] = {}
+        for client in sorted(specs.values(), key=lambda item: item.id):
+            rng = random.Random(f"{seed}:timing:{client.id}:{local_round}")
+            duration = delay_model.duration(client.id, client.task, local_round, rng)
+            if duration <= 0:
+                raise ValueError("Virtual durations must be positive")
+            nominal[client.id] = duration
+        target = statistics.median(nominal.values())
+        for client_id, duration in nominal.items():
+            steps = round(base_local_steps * target / duration)
+            steps = max(min_local_steps, min(max_local_steps, steps))
+            plans[(client_id, local_round)] = (duration * steps / base_local_steps, steps)
+
+    queue: list[tuple[float, str, int, float]] = []
+    for client_id in sorted(specs):
+        duration, _ = plans[(client_id, 0)]
+        heapq.heappush(queue, (duration, client_id, 0, 0.0))
+    events: list[ScheduledEvent] = []
+    while queue:
+        finish_time, client_id, local_round, start_time = heapq.heappop(queue)
+        spec = specs[client_id]
+        _, steps = plans[(client_id, local_round)]
+        events.append(
+            ScheduledEvent(
+                event_id=len(events),
+                client_id=client_id,
+                task=spec.task,
+                local_round=local_round,
+                start_time=start_time,
+                finish_time=finish_time,
+                virtual_duration=finish_time - start_time,
+                local_steps=steps,
+            )
+        )
+        next_round = local_round + 1
+        if next_round < upload_quota:
+            duration, _ = plans[(client_id, next_round)]
+            heapq.heappush(queue, (finish_time + duration, client_id, next_round, finish_time))
     return events
 
 

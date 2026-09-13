@@ -26,6 +26,14 @@ qwen = [
   "torch>=2.5",
   "transformers>=4.49",
 ]
+llava = [
+  "accelerate>=1.2",
+  "bitsandbytes>=0.45; platform_system != 'Windows'",
+  "peft>=0.14",
+  "pillow>=10.4",
+  "torch>=2.5",
+  "transformers>=4.49",
+]
 plots = [
   "matplotlib>=3.9",
 ]

@@ -24,6 +24,7 @@ class ScheduledEvent:
     start_time: float
     finish_time: float
     virtual_duration: float
+    local_steps: int | None = None
 
 
 @dataclass(slots=True)
