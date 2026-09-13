@@ -7,7 +7,7 @@ from afl_vlm.runner import execute
 
 
 def test_tiny_mock_completes_e1_e2_and_writes_artifacts(tmp_path: Path) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs" / "run.yaml")
+    config = load_config(Path(__file__).resolve().parent / "fixtures" / "tiny_config.yaml")
     config["run"]["output_root"] = str(tmp_path / "runs")
     rows = execute(config)
     assert {row["experiment"] for row in rows} == {"e1", "e2"}

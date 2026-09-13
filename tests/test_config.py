@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from afl_vlm.config import expand_runs, load_config, validate_config
 
-CONFIG = Path(__file__).resolve().parents[1] / "configs" / "run.yaml"
+CONFIG = Path(__file__).resolve().parent / "fixtures" / "tiny_config.yaml"
 
 
 def test_default_config_is_complete_and_expands_to_e1_e2() -> None:

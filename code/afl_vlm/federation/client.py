@@ -58,7 +58,11 @@ class FederatedClient:
             task=self.task,
             local_round=local_round,
             download_version=download_version,
-            base_state=clone_state(start_state),
+            # The base is the server state at download, not the method-specific
+            # client initialization. This keeps staleness drift well-defined;
+            # a download correction influences local optimization without being
+            # re-applied as a raw server update.
+            base_state=clone_state(global_state),
             delta=clone_state(result.delta),
             seed=train_config.seed,
             sample_ids_hash=sample_ids_hash(samples),

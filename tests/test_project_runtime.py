@@ -27,8 +27,8 @@ def _update(identifier: str, delta: float, examples: int = 1) -> Update:
     )
 
 
-def test_fcit_and_baseline_registries_are_complete() -> None:
-    assert "llava15_fcit" in model_names()
+def test_project_model_and_method_registries_are_complete() -> None:
+    assert "llava15" in model_names()
     assert {
         "async_additive",
         "staleness_decay",
@@ -38,6 +38,7 @@ def test_fcit_and_baseline_registries_are_complete() -> None:
         "fedadam_sync",
         "fedyogi_sync",
         "fedcompass_sim",
+        "afvlm_cm",
     } <= method_names()
 
 
@@ -73,7 +74,7 @@ def test_fedcompass_assigns_more_steps_to_faster_clients() -> None:
     assert by_client["fast"].virtual_duration < by_client["slow"].virtual_duration
 
 
-def test_fcit_preset_hydrates_tasks_and_assignments(tmp_path: Path) -> None:
+def test_fixed_task_preset_hydrates_tasks_and_assignments(tmp_path: Path) -> None:
     variant = tmp_path / "benchmark" / "small_16_clients" / "balanced"
     variant.mkdir(parents=True)
     generated = {
@@ -117,10 +118,11 @@ def test_fcit_preset_hydrates_tasks_and_assignments(tmp_path: Path) -> None:
         "timing": {"train_delay": {"type": "per_task", "values": {"Task1": 1, "Task2": 2}}},
     }
     (variant / "framework_config.yaml").write_text(yaml.safe_dump(generated), encoding="utf-8")
-    base = yaml.safe_load(Path("configs/fcit.yaml").read_text(encoding="utf-8"))
+    base = yaml.safe_load(Path("configs/run.yaml").read_text(encoding="utf-8"))
     base["dataset"]["root"] = "benchmark"
     base["dataset"]["image_root"] = "images"
-    config_path = tmp_path / "configs" / "fcit.yaml"
+    base["run"]["output_root"] = "auto"
+    config_path = tmp_path / "configs" / "run.yaml"
     config_path.parent.mkdir()
     config_path.write_text(yaml.safe_dump(base), encoding="utf-8")
 
@@ -129,4 +131,4 @@ def test_fcit_preset_hydrates_tasks_and_assignments(tmp_path: Path) -> None:
     assert resolved["clients"]["count"] == 2
     assert resolved["clients"]["upload_quota"] == 10
     assert resolved["tasks"]["Task1"]["image_root"] == "images"
-    assert resolved["run"]["output_root"] == "runs/fcit/small_16_clients/balanced"
+    assert resolved["run"]["output_root"] == "runs/afvlm_cm/small_16_clients/balanced"

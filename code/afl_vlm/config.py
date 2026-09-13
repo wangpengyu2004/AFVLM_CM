@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from afl_vlm.data.fcit_preset import resolve_fcit_preset, variant_names
+from afl_vlm.data.fixed_task_preset import resolve_fixed_task_preset, variant_names
 from afl_vlm.data.registry import backend_names
 from afl_vlm.methods.registry import create_method, method_names
 from afl_vlm.models.registry import model_names
@@ -55,7 +55,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("Configuration root must be a mapping")
-    payload = resolve_fcit_preset(payload, config_path)
+    payload = resolve_fixed_task_preset(payload, config_path)
     payload["_config_path"] = str(config_path)
     return payload
 
@@ -75,8 +75,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
             {"name", "variant", "resolved_variant", "root", "image_root", "require_images"},
             "dataset",
         )
-        if dataset["name"] != "fcit_fixed":
-            raise ValueError("dataset.name must be 'fcit_fixed'")
+        if dataset["name"] != "fixed_task_vlm":
+            raise ValueError("dataset.name must be 'fixed_task_vlm'")
         if dataset["variant"] not in variant_names():
             raise ValueError(f"dataset.variant must be one of: {sorted(variant_names())}")
         if not isinstance(dataset.get("require_images", True), bool):

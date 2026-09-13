@@ -8,7 +8,7 @@ from afl_vlm.data.fedmllm import FedMLLMTaskAdapter
 from afl_vlm.runner import execute
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "configs" / "run.yaml"
+DEFAULT_CONFIG = ROOT / "tests" / "fixtures" / "tiny_config.yaml"
 
 
 def record(sample_id: str, image: str) -> dict[str, object]:

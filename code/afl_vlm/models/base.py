@@ -125,14 +125,19 @@ def state_norm(state: Mapping[str, ScalarOrTensor]) -> float:
     )
 
 
-def state_cosine(left: Mapping[str, ScalarOrTensor], right: Mapping[str, ScalarOrTensor]) -> float:
+def state_dot(left: Mapping[str, ScalarOrTensor], right: Mapping[str, ScalarOrTensor]) -> float:
+    """Return the Euclidean inner product of two compatible trainable states."""
     if set(left) != set(right):
         raise ValueError("State keys differ")
-    dot = sum(
+    return sum(
         a * b
         for key in sorted(left)
         for a, b in zip(_flat_values(left[key]), _flat_values(right[key]), strict=True)
     )
+
+
+def state_cosine(left: Mapping[str, ScalarOrTensor], right: Mapping[str, ScalarOrTensor]) -> float:
+    dot = state_dot(left, right)
     denominator = state_norm(left) * state_norm(right)
     return 0.0 if denominator == 0 else dot / denominator
 

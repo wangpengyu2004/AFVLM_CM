@@ -30,7 +30,7 @@ def _load_builtins() -> None:
         fedopt_sync,
         staleness_decay,
     )
-    from afl_vlm.methods.custom import my_method  # noqa: F401
+    from afl_vlm.methods.custom import afvlm_cm  # noqa: F401
 
 
 def create_method(name: str, params: Mapping[str, Any]) -> Method:

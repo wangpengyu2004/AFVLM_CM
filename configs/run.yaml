@@ -1,18 +1,24 @@
-# This is the only file users need to edit. Every runtime option has one
-# authoritative location; no YAML inheritance or hidden defaults are required.
+# AFVLM-CM authoritative experiment configuration.
+# Switch client scale/data imbalance with dataset.variant; select methods from
+# the command line with --methods, without editing this file.
+dataset:
+  name: fixed_task_vlm
+  variant: small_balanced
+  root: data/fcit/fixed_task_benchmark
+  image_root: data/fcit/dataset
+  require_images: true
+
 run:
   seeds: [42]
-  output_root: runs/validation
+  output_root: auto
 
 model:
-  adapter: tiny_mock
+  adapter: qwen25_vl
   hf_id: Qwen/Qwen2.5-VL-7B-Instruct
   dtype: bf16
   quantization: nf4
   gradient_checkpointing: true
   device_map: auto
-  mock_dimension: 3
-  mock_step_size: 0.18
   lora:
     r: 8
     alpha: 16
@@ -20,59 +26,36 @@ model:
     include_visual: false
     target_modules: [q_proj, k_proj, v_proj, o_proj]
 
-tasks:
-  fast:
-    backend: fedmllm
-    name: hateful_memes
-    train_per_client: 128
-    allow_synthetic: true
-    data_files: {}
-  slow:
-    backend: fedmllm
-    name: vqa_rad
-    train_per_client: 128
-    allow_synthetic: true
-    data_files: {}
-
+# tasks, clients.count, assignments and task-correlated delays are hydrated
+# from the selected generated benchmark variant.
 clients:
-  count: 4
-  upload_quota: 2
-  data_partition: disjoint
-  assignments:
-    - {id: c0, task: fast, virtual_train_time: 1.0}
-    - {id: c1, task: fast, virtual_train_time: 1.2}
-    - {id: c2, task: slow, virtual_train_time: 3.0}
-    - {id: c3, task: slow, virtual_train_time: 3.2}
+  upload_quota: 10
 
 training:
   local_steps: 5
   batch_size: 1
   grad_accumulation: 4
   client_lr: 2.0e-4
-  max_text_length: 512
+  max_text_length: 2048
 
 timing:
   clock: virtual
-  train_delay:
-    type: per_client
-    values: {}
-  network_delay:
-    type: fixed
-    value: 0.0
+  train_delay: {type: fixed, value: 1.0}
+  network_delay: {type: fixed, value: 0.0}
 
 methods:
-  - id: additive
+  - id: async_sgd
     implementation: async_additive
-    enabled: true
+    enabled: false
     params: {server_lr: 0.5}
-  - id: decay
+  - id: async_decay
     implementation: staleness_decay
     enabled: false
     params: {server_lr: 0.5, decay_exponent: 1.0}
-  - id: sync
+  - id: fedavg
     implementation: fedavg_sync
     enabled: false
-    params: {server_lr: 1.0}
+    params: {server_lr: 1.0, sample_weighted: true}
   - id: fedasync
     implementation: fedasync
     enabled: false
@@ -80,34 +63,40 @@ methods:
   - id: fedbuff
     implementation: fedbuff
     enabled: false
-    params: {server_lr: 0.5, buffer_size: 2, flush_tail: true}
-  - id: ours
-    implementation: my_method
+    params: {server_lr: 0.5, buffer_size: 8, flush_tail: true, sample_weighted: false}
+  - id: fedadam
+    implementation: fedadam_sync
+    enabled: false
+    params: {server_lr: 0.01, beta1: 0.9, beta2: 0.99, tau: 0.001, sample_weighted: true}
+  - id: fedyogi
+    implementation: fedyogi_sync
+    enabled: false
+    params: {server_lr: 0.01, beta1: 0.9, beta2: 0.99, tau: 0.001, sample_weighted: true}
+  - id: fedcompass_sim
+    implementation: fedcompass_sim
     enabled: false
     params:
+      server_lr: 1.0
+      buffer_size: 8
+      min_local_steps: 1
+      max_local_steps: 5
+      flush_tail: true
+      sample_weighted: true
+  - id: afvlm_cm
+    implementation: afvlm_cm
+    enabled: true
+    params:
+      server_lr: 0.5
+      staleness_exponent: 1.0
       download_correction: true
+      download_strength: 0.1
       upload_correction: true
+      memory_momentum: 0.9
 
 experiments:
-  - id: e1
-    type: stale_twin
-    enabled: true
-    methods: [additive]
-    params:
-      tau: 2
-      paths:
-        - [fast, fast]
-        - [slow, slow]
-  - id: e2
-    type: biased_start
-    enabled: true
-    methods: [additive]
-    params:
-      biased_path: [fast, fast, fast, fast]
-      balanced_path: [fast, slow, fast, slow]
   - id: trace
     type: end_to_end
-    enabled: false
+    enabled: true
     methods: all_enabled
     params:
       delay_scenarios: [task_correlated, task_shuffled]
@@ -115,7 +104,7 @@ experiments:
 evaluation:
   probe_samples_per_task: 16
   final_samples_per_task: 64
-  window_size: 4
+  window_size: 16
   save_update_norm: true
   probe_on_selected_events: true
   generation_on_selected_checkpoints: true

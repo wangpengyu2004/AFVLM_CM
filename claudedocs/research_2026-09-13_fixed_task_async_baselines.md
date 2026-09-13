@@ -1,4 +1,4 @@
-# FCIT fixed-task asynchronous FL: source audit and baseline selection
+# AFVLM-CM fixed-task asynchronous FL: source audit and baseline selection
 
 Date: 2026-09-13
 
@@ -13,12 +13,12 @@ is the better primary protocol for the stated causal question because it holds
 total participation fixed while varying task-correlated latency. It should be
 reported under its own name, not as an exact FLGo reproduction.
 
-FCIT's official Task-Heterogeneous training script uses LLaVA-1.5-7B with CLIP
-ViT-L/14-336, LoRA rank 64/alpha 128, a separately trained multimodal projector,
-one local epoch, 10 communication rounds, and 10% client selection. The local
-adapter added here mirrors the backbone and trainable parameter classes through
-the Transformers-converted LLaVA checkpoint. It intentionally excludes FCIT's
-continual task sequence and expert-routing algorithm.
+The source work's official Task-Heterogeneous training script uses LLaVA-1.5-7B
+with CLIP ViT-L/14-336, LoRA rank 64/alpha 128, a separately trained multimodal
+projector, one local epoch, 10 communication rounds, and 10% client selection.
+The optional `llava15` adapter mirrors that backbone through the
+Transformers-converted checkpoint. AFVLM-CM uses Qwen2.5-VL by default and
+excludes the source work's continual task sequence and expert-routing algorithm.
 
 The runnable baseline suite contains eight controls: AsyncSGD, polynomial
 staleness decay, FedAvg, FedAsync, FedBuff, FedAdam, FedYogi, and a clearly
@@ -31,7 +31,7 @@ the current single-global-state runtime.
 
 | Question | Evidence | Decision | Confidence |
 |---|---|---|---|
-| Which FCIT model? | Official `task_1.sh` specifies `llava-v1.5-7b`, CLIP-L/14-336, LoRA 64/128, projector LR 2e-5 | Add `llava15_fcit` with those tuning defaults | High |
+| Which source-work model should remain available? | Official `task_1.sh` specifies `llava-v1.5-7b`, CLIP-L/14-336, LoRA 64/128, projector LR 2e-5 | Keep it as optional `llava15`; use Qwen2.5-VL for AFVLM-CM by default | High |
 | Is the runtime the same as FLGo? | Official FLGo `fedasync.py` samples idle clients by `period` and averages simultaneous interpolated models | Document non-equivalence; keep equal-quota event runtime | High |
 | Which classic baselines? | FedAvg, FedAsync, FedBuff and FedOpt are canonical controls for sync, immediate async, buffered async and heterogeneous server optimization | Make all four families runnable | High |
 | Which recent systems baseline? | FedCompass (ICLR 2024) assigns varying local work to align heterogeneous client arrivals and groups updates | Implement its core virtual-scheduler mechanisms as `fedcompass_sim`, not an official reproduction | Medium |

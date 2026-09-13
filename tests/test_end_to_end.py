@@ -6,7 +6,7 @@ from afl_vlm.runner import execute
 
 
 def test_equal_quota_trace_and_delay_control(tmp_path: Path) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs" / "run.yaml")
+    config = load_config(Path(__file__).resolve().parent / "fixtures" / "tiny_config.yaml")
     config["run"]["output_root"] = str(tmp_path / "trace")
     for experiment in config["experiments"]:
         experiment["enabled"] = experiment["id"] == "trace"
