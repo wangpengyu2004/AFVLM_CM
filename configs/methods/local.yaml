@@ -1,0 +1,5 @@
+method:
+  name: local
+  params: {}
+federation:
+  mode: local

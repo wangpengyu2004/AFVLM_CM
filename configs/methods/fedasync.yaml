@@ -1,0 +1,9 @@
+method:
+  name: fedasync
+  params:
+    alpha: 0.5
+    staleness:
+      type: polynomial
+      a: 0.5
+federation:
+  mode: asynchronous

@@ -1,0 +1,308 @@
+{
+  "schema_version": 1,
+  "setting": 5,
+  "seed": 42,
+  "generation_scope": "method_independent",
+  "clients": [
+    {
+      "client_id": "cls/client_0",
+      "task": "cls",
+      "dataset": "ImageNet-R",
+      "num_samples": 3420,
+      "speed_factor": 1.550168,
+      "network_delay": 0.363287,
+      "initial_availability": 0.561824,
+      "base_training_cost": 1.047575
+    },
+    {
+      "client_id": "cls/client_1",
+      "task": "cls",
+      "dataset": "ImageNet-R",
+      "num_samples": 2692,
+      "speed_factor": 1.459369,
+      "network_delay": 0.116783,
+      "initial_availability": 0.059215,
+      "base_training_cost": 0.955736
+    },
+    {
+      "client_id": "cls/client_2",
+      "task": "cls",
+      "dataset": "ImageNet-R",
+      "num_samples": 3216,
+      "speed_factor": 1.586506,
+      "network_delay": 0.137903,
+      "initial_availability": 0.587275,
+      "base_training_cost": 0.985767
+    },
+    {
+      "client_id": "cls/client_3",
+      "task": "cls",
+      "dataset": "ImageNet-R",
+      "num_samples": 3455,
+      "speed_factor": 1.463552,
+      "network_delay": 0.242757,
+      "initial_availability": 0.463435,
+      "base_training_cost": 0.898744
+    },
+    {
+      "client_id": "cls/client_4",
+      "task": "cls",
+      "dataset": "ImageNet-R",
+      "num_samples": 2217,
+      "speed_factor": 1.754337,
+      "network_delay": 0.26313,
+      "initial_availability": 0.169976,
+      "base_training_cost": 0.839185
+    },
+    {
+      "client_id": "caption/client_0",
+      "task": "caption",
+      "dataset": "Flickr30k",
+      "num_samples": 3755,
+      "speed_factor": 0.925988,
+      "network_delay": 0.135735,
+      "initial_availability": 0.652599,
+      "base_training_cost": 0.884565
+    },
+    {
+      "client_id": "caption/client_1",
+      "task": "caption",
+      "dataset": "Flickr30k",
+      "num_samples": 3779,
+      "speed_factor": 0.609289,
+      "network_delay": 0.292303,
+      "initial_availability": 0.05847,
+      "base_training_cost": 1.110731
+    },
+    {
+      "client_id": "caption/client_2",
+      "task": "caption",
+      "dataset": "Flickr30k",
+      "num_samples": 4260,
+      "speed_factor": 0.919728,
+      "network_delay": 0.349834,
+      "initial_availability": 0.91963,
+      "base_training_cost": 1.169519
+    },
+    {
+      "client_id": "caption/client_3",
+      "task": "caption",
+      "dataset": "Flickr30k",
+      "num_samples": 3788,
+      "speed_factor": 1.688753,
+      "network_delay": 0.378279,
+      "initial_availability": 0.115803,
+      "base_training_cost": 0.878327
+    },
+    {
+      "client_id": "caption/client_4",
+      "task": "caption",
+      "dataset": "Flickr30k",
+      "num_samples": 4418,
+      "speed_factor": 1.029311,
+      "network_delay": 0.279403,
+      "initial_availability": 0.184071,
+      "base_training_cost": 1.07915
+    },
+    {
+      "client_id": "vqa/client_0",
+      "task": "vqa",
+      "dataset": "AOKVQA",
+      "num_samples": 2446,
+      "speed_factor": 0.638707,
+      "network_delay": 0.052309,
+      "initial_availability": 0.947796,
+      "base_training_cost": 0.822314
+    },
+    {
+      "client_id": "vqa/client_1",
+      "task": "vqa",
+      "dataset": "AOKVQA",
+      "num_samples": 2270,
+      "speed_factor": 1.371783,
+      "network_delay": 0.397344,
+      "initial_availability": 0.821882,
+      "base_training_cost": 0.810539
+    },
+    {
+      "client_id": "vqa/client_2",
+      "task": "vqa",
+      "dataset": "AOKVQA",
+      "num_samples": 2734,
+      "speed_factor": 1.423439,
+      "network_delay": 0.177668,
+      "initial_availability": 0.352652,
+      "base_training_cost": 1.13116
+    },
+    {
+      "client_id": "vqa/client_3",
+      "task": "vqa",
+      "dataset": "AOKVQA",
+      "num_samples": 2350,
+      "speed_factor": 0.765679,
+      "network_delay": 0.479424,
+      "initial_availability": 0.242487,
+      "base_training_cost": 0.938423
+    },
+    {
+      "client_id": "vqa/client_4",
+      "task": "vqa",
+      "dataset": "AOKVQA",
+      "num_samples": 2200,
+      "speed_factor": 0.861495,
+      "network_delay": 0.389434,
+      "initial_availability": 0.156267,
+      "base_training_cost": 0.924849
+    },
+    {
+      "client_id": "chart_vqa/client_0",
+      "task": "chart_vqa",
+      "dataset": "DVQA",
+      "num_samples": 2166,
+      "speed_factor": 0.93286,
+      "network_delay": 0.297545,
+      "initial_availability": 0.079509,
+      "base_training_cost": 0.950974
+    },
+    {
+      "client_id": "chart_vqa/client_1",
+      "task": "chart_vqa",
+      "dataset": "DVQA",
+      "num_samples": 1883,
+      "speed_factor": 0.820754,
+      "network_delay": 0.373521,
+      "initial_availability": 0.564014,
+      "base_training_cost": 0.819553
+    },
+    {
+      "client_id": "chart_vqa/client_2",
+      "task": "chart_vqa",
+      "dataset": "DVQA",
+      "num_samples": 1931,
+      "speed_factor": 0.717759,
+      "network_delay": 0.243638,
+      "initial_availability": 0.739765,
+      "base_training_cost": 0.999133
+    },
+    {
+      "client_id": "chart_vqa/client_3",
+      "task": "chart_vqa",
+      "dataset": "DVQA",
+      "num_samples": 2382,
+      "speed_factor": 1.504588,
+      "network_delay": 0.442135,
+      "initial_availability": 0.196891,
+      "base_training_cost": 1.079342
+    },
+    {
+      "client_id": "chart_vqa/client_4",
+      "task": "chart_vqa",
+      "dataset": "DVQA",
+      "num_samples": 2443,
+      "speed_factor": 1.121649,
+      "network_delay": 0.176612,
+      "initial_availability": 0.730765,
+      "base_training_cost": 0.915533
+    },
+    {
+      "client_id": "visual_reasoning/client_0",
+      "task": "visual_reasoning",
+      "dataset": "FigureQA",
+      "num_samples": 2211,
+      "speed_factor": 0.751641,
+      "network_delay": 0.243742,
+      "initial_availability": 0.964083,
+      "base_training_cost": 1.077336
+    },
+    {
+      "client_id": "visual_reasoning/client_1",
+      "task": "visual_reasoning",
+      "dataset": "FigureQA",
+      "num_samples": 2526,
+      "speed_factor": 0.780818,
+      "network_delay": 0.201888,
+      "initial_availability": 0.642393,
+      "base_training_cost": 0.828417
+    },
+    {
+      "client_id": "visual_reasoning/client_2",
+      "task": "visual_reasoning",
+      "dataset": "FigureQA",
+      "num_samples": 2291,
+      "speed_factor": 1.452665,
+      "network_delay": 0.232524,
+      "initial_availability": 0.97378,
+      "base_training_cost": 0.926585
+    },
+    {
+      "client_id": "visual_reasoning/client_3",
+      "task": "visual_reasoning",
+      "dataset": "FigureQA",
+      "num_samples": 2327,
+      "speed_factor": 0.900769,
+      "network_delay": 0.141501,
+      "initial_availability": 0.685801,
+      "base_training_cost": 0.94663
+    },
+    {
+      "client_id": "visual_reasoning/client_4",
+      "task": "visual_reasoning",
+      "dataset": "FigureQA",
+      "num_samples": 2645,
+      "speed_factor": 1.259935,
+      "network_delay": 0.156405,
+      "initial_availability": 0.042796,
+      "base_training_cost": 1.010484
+    },
+    {
+      "client_id": "grounding/client_0",
+      "task": "grounding",
+      "dataset": "Grounding",
+      "num_samples": 5052,
+      "speed_factor": 0.664134,
+      "network_delay": 0.32612,
+      "initial_availability": 0.979489,
+      "base_training_cost": 1.121206
+    },
+    {
+      "client_id": "grounding/client_1",
+      "task": "grounding",
+      "dataset": "Grounding",
+      "num_samples": 3300,
+      "speed_factor": 1.321608,
+      "network_delay": 0.100241,
+      "initial_availability": 0.633566,
+      "base_training_cost": 1.075818
+    },
+    {
+      "client_id": "grounding/client_2",
+      "task": "grounding",
+      "dataset": "Grounding",
+      "num_samples": 4048,
+      "speed_factor": 0.59914,
+      "network_delay": 0.488112,
+      "initial_availability": 0.601777,
+      "base_training_cost": 1.066665
+    },
+    {
+      "client_id": "grounding/client_3",
+      "task": "grounding",
+      "dataset": "Grounding",
+      "num_samples": 4241,
+      "speed_factor": 1.751184,
+      "network_delay": 0.184411,
+      "initial_availability": 0.686366,
+      "base_training_cost": 1.094427
+    },
+    {
+      "client_id": "grounding/client_4",
+      "task": "grounding",
+      "dataset": "Grounding",
+      "num_samples": 3359,
+      "speed_factor": 1.046216,
+      "network_delay": 0.119117,
+      "initial_availability": 0.441749,
+      "base_training_cost": 1.111549
+    }
+  ]
+}

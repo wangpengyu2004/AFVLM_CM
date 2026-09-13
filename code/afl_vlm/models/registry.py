@@ -33,4 +33,4 @@ def model_names() -> set[str]:
 
 
 def _load_builtins() -> None:
-    from afl_vlm.models import llava15, qwen25_vl, tiny_mock  # noqa: F401
+    from afl_vlm.models import llava15  # noqa: F401

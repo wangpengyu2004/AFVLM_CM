@@ -1,0 +1,16 @@
+method:
+  name: unifed_lora
+  params:
+    hidden_size: 32
+    hyper_lr: 0.001
+    conditioning_scale: 0.05
+    seed: 42
+    task_descriptors:
+      cls: [1, 0, 0, 0, 0, 0]
+      caption: [0, 1, 0, 0, 0, 0]
+      vqa: [0, 0, 1, 0, 0, 0]
+      chart_vqa: [0, 0, 0, 1, 0, 0]
+      visual_reasoning: [0, 0, 0, 0, 1, 0]
+      grounding: [0, 0, 0, 0, 0, 1]
+federation:
+  mode: synchronous

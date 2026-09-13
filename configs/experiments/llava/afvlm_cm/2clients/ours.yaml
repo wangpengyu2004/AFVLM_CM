@@ -1,0 +1,7 @@
+inherits:
+  - ../../../../base.yaml
+  - ../../../../models/llava15_7b_lora.yaml
+  - ../../../../datasets/afvlm_cm_2clients.yaml
+  - ../../../../methods/ours.yaml
+output:
+  directory: runs/llava/afvlm_cm/2clients/ours/seed42

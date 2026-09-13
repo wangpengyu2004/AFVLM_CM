@@ -1,0 +1,28 @@
+run:
+  seed: 42
+
+training:
+  local_epochs: 1
+  batch_size: 1
+  gradient_accumulation: 4
+  learning_rate: 0.00002
+  max_text_length: 512
+  optimizer: adamw
+
+federation:
+  rounds: 10
+  base_local_steps: 10
+  mode: asynchronous
+  system_profile: null
+
+evaluation:
+  split: test
+  eval_every_server_updates: 10
+  generation_max_new_tokens: 64
+  grounding_iou_threshold: 0.5
+
+output:
+  directory: runs/afvlm_cm
+  overwrite: false
+  save_checkpoint: true
+  event_log: true

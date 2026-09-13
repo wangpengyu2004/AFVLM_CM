@@ -1,0 +1,20 @@
+model:
+  adapter: llava15
+  model_path: pretrained/llava-v1.5-7b
+  vision_tower_path: pretrained/clip-vit-large-patch14-336
+  local_files_only: true
+  dtype: bf16
+  quantization: none
+  device_map: auto
+  gradient_checkpointing: true
+  conversation_template: v1
+  max_new_tokens: 64
+  mm_projector_lr: 0.00002
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    bias: none
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    train_mm_projector: false

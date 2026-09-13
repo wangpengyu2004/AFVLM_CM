@@ -1,0 +1,6 @@
+method:
+  name: fedprox
+  params:
+    mu: 0.01
+federation:
+  mode: synchronous

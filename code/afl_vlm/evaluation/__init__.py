@@ -1,1 +1,0 @@
-"""Evaluation and paired diagnostics."""

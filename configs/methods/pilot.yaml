@@ -1,0 +1,10 @@
+method:
+  name: pilot
+  params:
+    adapter_bottleneck: 64
+    difference_weight: 0.1
+    balance_weight: 0.01
+    router_z_weight: 0.001
+    text_neighbors: 3
+federation:
+  mode: synchronous

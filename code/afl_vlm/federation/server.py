@@ -1,4 +1,4 @@
-"""Versioned server that applies method-produced mutations."""
+"""Versioned server applying only method-produced trainable-state mutations."""
 
 from __future__ import annotations
 
@@ -11,67 +11,59 @@ from afl_vlm.models.base import clone_state
 
 class FederatedServer:
     def __init__(self, model: Any, method: Any, expected_clients: int) -> None:
-        self.model = model
-        self.method = method
-        self.expected_clients = expected_clients
+        self.model, self.method, self.expected_clients = model, method, expected_clients
         self.version = 0
         self.state_store = StateStore(model.snapshot_trainable())
         self.received_updates = 0
-        self.applied_updates = 0
+        self.accepted_updates = 0
 
     @property
     def state(self) -> dict[str, Any]:
         return self.state_store.get(self.version)
 
-    def _context(self) -> ServerContext:
-        return ServerContext(
-            global_state=self.state,
-            version=self.version,
-            expected_clients=self.expected_clients,
-        )
+    def context(self) -> ServerContext:
+        return ServerContext(self.state, self.version, self.expected_clients)
 
     def receive(self, update: Update) -> list[ApplyResult]:
         receive_version = self.version
         self.received_updates += 1
-        mutations = self.method.on_arrival(update, self._context())
+        mutations = self.method.on_arrival(update, self.context())
         if not mutations:
             return [
                 ApplyResult(
-                    applied=False,
-                    applied_weight=0.0,
-                    receive_version=receive_version,
-                    training_version=update.download_version,
-                    resulting_version=self.version,
-                    contributing_update_ids=[],
-                    metadata={"buffered": True},
+                    False,
+                    0.0,
+                    receive_version,
+                    update.base_version,
+                    self.version,
+                    [],
+                    {"buffered": True},
                 )
             ]
-        return [
-            self._apply(mutation, receive_version, update.download_version)
-            for mutation in mutations
-        ]
+        return [self._apply(item, receive_version, update.base_version) for item in mutations]
 
     def finish(self) -> list[ApplyResult]:
-        results: list[ApplyResult] = []
+        results = []
         while True:
-            mutations = self.method.on_finish(self._context())
+            mutations = self.method.on_finish(self.context())
             if not mutations:
-                break
-            for mutation in mutations:
-                results.append(self._apply(mutation, self.version, self.version))
-        return results
+                return results
+            results.extend(self._apply(item, self.version, self.version) for item in mutations)
 
-    def _apply(self, mutation: Any, receive_version: int, training_version: int) -> ApplyResult:
-        self.version += 1
-        self.state_store.put(self.version, mutation.new_state)
-        self.model.load_trainable(clone_state(mutation.new_state))
-        self.applied_updates += len(mutation.contributing_update_ids)
+    def _apply(self, mutation: Any, receive_version: int, base_version: int) -> ApplyResult:
+        if mutation.increment_version:
+            self.version += 1
+            self.state_store.put(self.version, mutation.new_state)
+            self.model.load_trainable(clone_state(mutation.new_state))
+        self.accepted_updates += (
+            len(mutation.contributing_update_ids) if mutation.applied_weight > 0 else 0
+        )
         return ApplyResult(
-            applied=True,
-            applied_weight=float(mutation.applied_weight),
-            receive_version=receive_version,
-            training_version=training_version,
-            resulting_version=self.version,
-            contributing_update_ids=list(mutation.contributing_update_ids),
-            metadata=dict(mutation.metadata),
+            True,
+            float(mutation.applied_weight),
+            receive_version,
+            base_version,
+            self.version,
+            list(mutation.contributing_update_ids),
+            dict(mutation.metadata),
         )

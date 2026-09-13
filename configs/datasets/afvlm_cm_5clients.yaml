@@ -1,0 +1,11 @@
+dataset:
+  name: afvlm_cm
+  clients_per_task: 5
+  total_clients: 30
+  partition_root: data/AFVLM_CM/partitioned/5_clients
+  image_root: data/AFVLM_CM/dataset
+  require_images: true
+  tasks: [cls, caption, vqa, chart_vqa, visual_reasoning, grounding]
+federation:
+  system_profile: plans/afvlm_cm/5clients/system_profile.json
+  train_plan: plans/afvlm_cm/5clients/async_train_plan.json

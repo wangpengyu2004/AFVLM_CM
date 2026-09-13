@@ -18,14 +18,17 @@ MetricDict: TypeAlias = dict[str, float]
 
 @dataclass(slots=True)
 class TrainConfig:
-    local_steps: int
+    local_epochs: int
     batch_size: int
-    grad_accumulation: int
-    client_lr: float
+    gradient_accumulation: int
+    learning_rate: float
     max_text_length: int
     seed: int
     loss_hook: Any | None = None
+    gradient_hook: Any | None = None
+    step_hook: Any | None = None
     context: dict[str, Any] = field(default_factory=dict)
+    max_local_steps: int | None = None
 
 
 @dataclass(slots=True)
@@ -33,6 +36,7 @@ class TrainResult:
     delta: LoRAState
     losses: list[float]
     optimizer_steps: int
+    mean_gradient: LoRAState | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -108,6 +112,22 @@ def _map_value(value: ScalarOrTensor, fn: Any) -> ScalarOrTensor:
     return fn(value)
 
 
+def map_state(state: Mapping[str, ScalarOrTensor], fn: Any) -> LoRAState:
+    return {key: _map_value(value, fn) for key, value in state.items()}
+
+
+def zip_states(
+    left: Mapping[str, ScalarOrTensor], right: Mapping[str, ScalarOrTensor], fn: Any
+) -> LoRAState:
+    if set(left) != set(right):
+        raise ValueError("State keys differ")
+    return {key: _binary_value(left[key], right[key], fn) for key in sorted(left)}
+
+
+def zeros_like(state: Mapping[str, ScalarOrTensor]) -> LoRAState:
+    return map_state(state, lambda value: value * 0)
+
+
 def _flat_values(value: ScalarOrTensor) -> Iterable[float]:
     if isinstance(value, list):
         for item in value:
@@ -176,3 +196,19 @@ class ModelAdapter(ABC):
     @abstractmethod
     def evaluate(self, task_adapter: Any, sample_ids: list[str], mode: str) -> MetricDict:
         """Evaluate the current state on a task-specific adapter."""
+
+    def get_federated_state(self) -> LoRAState:
+        return self.snapshot_trainable()
+
+    def load_federated_state(self, state: Mapping[str, ScalarOrTensor]) -> None:
+        self.load_trainable(state)
+
+    @staticmethod
+    def compute_federated_delta(
+        local_state: Mapping[str, ScalarOrTensor],
+        base_state: Mapping[str, ScalarOrTensor],
+    ) -> LoRAState:
+        return subtract(local_state, base_state)
+
+    def apply_federated_state(self, state: Mapping[str, ScalarOrTensor]) -> None:
+        self.load_trainable(state)

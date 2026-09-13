@@ -1,0 +1,11 @@
+method:
+  name: fedbuff
+  params:
+    buffer_size: 5
+    staleness_weighting: false
+    staleness:
+      type: polynomial
+      a: 0.5
+    flush_last_buffer: true
+federation:
+  mode: asynchronous
