@@ -85,6 +85,23 @@ def mean_states(states: Iterable[Mapping[str, ScalarOrTensor]]) -> LoRAState:
     return result
 
 
+def weighted_mean_states(
+    states: Iterable[Mapping[str, ScalarOrTensor]], weights: Iterable[float]
+) -> LoRAState:
+    """Average compatible states with normalized non-negative weights."""
+    items = list(states)
+    raw_weights = [float(weight) for weight in weights]
+    if not items or len(items) != len(raw_weights):
+        raise ValueError("States and weights must be non-empty and have equal length")
+    if any(weight < 0 for weight in raw_weights) or sum(raw_weights) <= 0:
+        raise ValueError("State weights must be non-negative with a positive sum")
+    total = sum(raw_weights)
+    result = scale_state(items[0], raw_weights[0] / total)
+    for item, weight in zip(items[1:], raw_weights[1:], strict=True):
+        result = add_scaled(result, item, weight / total)
+    return result
+
+
 def _map_value(value: ScalarOrTensor, fn: Any) -> ScalarOrTensor:
     if isinstance(value, list):
         return [_map_value(item, fn) for item in value]

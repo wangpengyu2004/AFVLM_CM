@@ -19,6 +19,7 @@ from afl_vlm.models.base import LoRAState, clone_state
 class Method(ABC):
     name = "base"
     branch_compatible = False
+    schedule_mode = "asynchronous"
     allowed_params: set[str] = set()
 
     def __init__(self, params: Mapping[str, Any] | None = None) -> None:

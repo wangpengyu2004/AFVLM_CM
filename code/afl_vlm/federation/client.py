@@ -66,6 +66,10 @@ class FederatedClient:
             optimizer_steps=result.optimizer_steps,
             update_kind=update_kind,
             pair_id=pair_id,
-            metadata=dict(result.extra),
+            metadata={
+                **dict(result.extra),
+                "num_examples": len(self.samples),
+                "batch_examples": len(samples),
+            },
         )
         return method.prepare_upload(update, context)

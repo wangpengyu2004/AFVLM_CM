@@ -16,11 +16,13 @@ from afl_vlm.methods.registry import register_method
 @register_method("fedavg_sync")
 class FedAvgSyncMethod(Method):
     name = "fedavg_sync"
-    allowed_params = {"server_lr"}
+    schedule_mode = "synchronous"
+    allowed_params = {"server_lr", "sample_weighted"}
 
     def __init__(self, params=None) -> None:
         super().__init__(params)
         self.server_lr = float(self.params.get("server_lr", 1.0))
+        self.sample_weighted = bool(self.params.get("sample_weighted", True))
         self.rounds: dict[int, list[Update]] = defaultdict(list)
 
     def on_arrival(self, update: Update, server_context: ServerContext) -> list[ServerMutation]:
@@ -29,7 +31,12 @@ class FedAvgSyncMethod(Method):
         if len(pending) < server_context.expected_clients:
             return []
         del self.rounds[update.local_round]
-        mutation = apply_buffer(server_context.global_state, pending, self.server_lr)
+        mutation = apply_buffer(
+            server_context.global_state,
+            pending,
+            self.server_lr,
+            sample_weighted=self.sample_weighted,
+        )
         mutation.metadata["synchronous_round"] = update.local_round
         return [mutation]
 

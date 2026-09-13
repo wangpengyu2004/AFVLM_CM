@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from afl_vlm.data.fcit_preset import resolve_fcit_preset, variant_names
 from afl_vlm.data.registry import backend_names
 from afl_vlm.methods.registry import create_method, method_names
 from afl_vlm.models.registry import model_names
@@ -26,7 +27,9 @@ TOP_LEVEL_KEYS = {
     "experiments",
     "evaluation",
     "output",
+    "dataset",
 }
+REQUIRED_TOP_LEVEL_KEYS = TOP_LEVEL_KEYS - {"dataset"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +55,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("Configuration root must be a mapping")
+    payload = resolve_fcit_preset(payload, config_path)
     payload["_config_path"] = str(config_path)
     return payload
 
@@ -59,11 +63,24 @@ def load_config(path: str | Path) -> dict[str, Any]:
 def validate_config(config: Mapping[str, Any]) -> None:
     visible = {key for key in config if not key.startswith("_")}
     unknown = visible - TOP_LEVEL_KEYS
-    missing = TOP_LEVEL_KEYS - visible
+    missing = REQUIRED_TOP_LEVEL_KEYS - visible
     if unknown or missing:
         raise ValueError(
             f"Top-level config fields: missing={sorted(missing)}, unknown={sorted(unknown)}"
         )
+    if "dataset" in config:
+        dataset = config["dataset"]
+        _check_keys(
+            dataset,
+            {"name", "variant", "resolved_variant", "root", "image_root", "require_images"},
+            "dataset",
+        )
+        if dataset["name"] != "fcit_fixed":
+            raise ValueError("dataset.name must be 'fcit_fixed'")
+        if dataset["variant"] not in variant_names():
+            raise ValueError(f"dataset.variant must be one of: {sorted(variant_names())}")
+        if not isinstance(dataset.get("require_images", True), bool):
+            raise ValueError("dataset.require_images must be boolean")
     run = config["run"]
     _check_keys(run, {"seeds", "output_root"}, "run")
     seeds = run["seeds"]
@@ -85,6 +102,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "lora",
             "mock_dimension",
             "mock_step_size",
+            "mm_projector_lr",
         },
         "model",
     )
@@ -95,39 +113,52 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if model["quantization"] not in {"nf4", "none"}:
         raise ValueError("model.quantization must be 'nf4' or 'none'")
     lora = model["lora"]
-    _check_keys(lora, {"r", "alpha", "dropout", "include_visual", "target_modules"}, "model.lora")
+    _check_keys(
+        lora,
+        {
+            "r",
+            "alpha",
+            "dropout",
+            "include_visual",
+            "target_modules",
+            "train_mm_projector",
+        },
+        "model.lora",
+    )
     if int(lora["r"]) <= 0 or int(lora["alpha"]) <= 0:
         raise ValueError("LoRA rank and alpha must be positive")
     if not 0.0 <= float(lora["dropout"]) < 1.0:
         raise ValueError("model.lora.dropout must be in [0, 1)")
 
     tasks = config["tasks"]
-    if not isinstance(tasks, dict) or {"fast", "slow"} - set(tasks):
-        raise ValueError("tasks must define at least 'fast' and 'slow'")
+    if not isinstance(tasks, dict) or len(tasks) < 2:
+        raise ValueError("tasks must define at least two tasks")
     for task_key, task in tasks.items():
         _check_keys(
             task,
-            {"backend", "name", "train_per_client", "data_files", "allow_synthetic"},
+            {
+                "backend",
+                "name",
+                "train_per_client",
+                "data_files",
+                "allow_synthetic",
+                "image_root",
+                "require_images",
+            },
             f"tasks.{task_key}",
         )
         if task["backend"] not in backend_names():
             raise ValueError(f"Unknown backend for tasks.{task_key}: {task['backend']}")
         if int(task["train_per_client"]) <= 0:
             raise ValueError(f"tasks.{task_key}.train_per_client must be positive")
+        if not isinstance(task.get("require_images", False), bool):
+            raise ValueError(f"tasks.{task_key}.require_images must be boolean")
         data_files = task.get("data_files") or {}
         unknown_splits = set(data_files) - {"train", "probe", "final"}
         if unknown_splits:
             raise ValueError(
                 f"Unknown data split(s) for tasks.{task_key}: {sorted(unknown_splits)}"
             )
-    if model["adapter"] != "tiny_mock":
-        for task_key, task in tasks.items():
-            if task.get("allow_synthetic", False):
-                raise ValueError(f"Real model cannot use synthetic data: tasks.{task_key}")
-            required = {"train", "probe", "final"}
-            if required - set(task.get("data_files") or {}):
-                raise ValueError(f"tasks.{task_key}.data_files must define train/probe/final")
-
     clients = config["clients"]
     _check_keys(
         clients,
@@ -135,6 +166,16 @@ def validate_config(config: Mapping[str, Any]) -> None:
         "clients",
     )
     assignments = clients["assignments"]
+    prepartitioned = clients["data_partition"] == "prepartitioned"
+
+    if model["adapter"] != "tiny_mock":
+        for task_key, task in tasks.items():
+            if task.get("allow_synthetic", False):
+                raise ValueError(f"Real model cannot use synthetic data: tasks.{task_key}")
+            required = {"probe", "final"} if prepartitioned else {"train", "probe", "final"}
+            if required - set(task.get("data_files") or {}):
+                required_text = "/".join(sorted(required))
+                raise ValueError(f"tasks.{task_key}.data_files must define {required_text}")
     if int(clients["count"]) != len(assignments):
         raise ValueError("clients.count does not match clients.assignments length")
     identifiers = [str(item["id"]) for item in assignments]
@@ -142,16 +183,22 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Client IDs must be unique")
     if int(clients["upload_quota"]) <= 0:
         raise ValueError("clients.upload_quota must be positive")
-    if clients["data_partition"] != "disjoint":
-        raise ValueError("The mechanism validation requires clients.data_partition='disjoint'")
+    if clients["data_partition"] not in {"disjoint", "prepartitioned"}:
+        raise ValueError("clients.data_partition must be 'disjoint' or 'prepartitioned'")
     for item in assignments:
         _check_keys(
-            item, {"id", "task", "virtual_train_time"}, f"clients.assignments[{item.get('id')}]"
+            item,
+            {"id", "task", "virtual_train_time", "train_file"},
+            f"clients.assignments[{item.get('id')}]",
         )
         if item["task"] not in tasks:
             raise ValueError(f"Client {item['id']} references unknown task {item['task']}")
         if float(item["virtual_train_time"]) <= 0:
             raise ValueError("Client virtual_train_time must be positive")
+        if prepartitioned and not item.get("train_file"):
+            raise ValueError("Every prepartitioned client assignment needs train_file")
+        if not prepartitioned and item.get("train_file"):
+            raise ValueError("train_file is only valid for prepartitioned client data")
 
     training = config["training"]
     _check_keys(
@@ -217,6 +264,14 @@ def validate_config(config: Mapping[str, Any]) -> None:
         if unknown_methods:
             raise ValueError(f"Experiment references unknown methods: {sorted(unknown_methods)}")
         if experiment["enabled"] and experiment["type"] in {"stale_twin", "biased_start"}:
+            if {"fast", "slow"} - set(tasks):
+                raise ValueError(
+                    f"Experiment {experiment['id']} requires tasks named 'fast' and 'slow'"
+                )
+            if prepartitioned:
+                raise ValueError(
+                    f"Experiment {experiment['id']} does not support prepartitioned client data"
+                )
             by_id = {item["id"]: item for item in method_configs}
             for method_id in selected:
                 method_config = by_id[method_id]
@@ -247,8 +302,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ValueError(f"evaluation.{key} must be positive")
     _check_keys(config["output"], {"save_adapter", "save_method_state", "overwrite"}, "output")
     task_counts = Counter(item["task"] for item in assignments)
-    if any(task_counts[task_key] == 0 for task_key in ("fast", "slow")):
-        raise ValueError("Both fast and slow tasks need at least one client")
+    missing_client_tasks = [task_key for task_key in tasks if task_counts[task_key] == 0]
+    if missing_client_tasks:
+        raise ValueError(f"Every task needs at least one client: {missing_client_tasks}")
 
 
 def expand_runs(config: Mapping[str, Any]) -> list[RunSpec]:

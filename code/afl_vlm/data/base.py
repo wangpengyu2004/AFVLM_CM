@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -20,6 +21,10 @@ class Sample:
 
 class TaskAdapter(ABC):
     task_key: str
+
+    @abstractmethod
+    def load_file(self, path: str | Path, split: str = "train") -> list[Sample]:
+        """Load a normalized split from an explicit data file."""
 
     @abstractmethod
     def load_split(self, split: str) -> list[Sample]:

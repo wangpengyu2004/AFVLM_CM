@@ -15,13 +15,14 @@ from afl_vlm.methods.registry import register_method
 @register_method("fedbuff")
 class FedBuffMethod(Method):
     name = "fedbuff"
-    allowed_params = {"server_lr", "buffer_size", "flush_tail"}
+    allowed_params = {"server_lr", "buffer_size", "flush_tail", "sample_weighted"}
 
     def __init__(self, params=None) -> None:
         super().__init__(params)
         self.server_lr = float(self.params.get("server_lr", 0.5))
         self.buffer_size = int(self.params.get("buffer_size", 2))
         self.flush_tail = bool(self.params.get("flush_tail", True))
+        self.sample_weighted = bool(self.params.get("sample_weighted", False))
         if self.buffer_size <= 0:
             raise ValueError("FedBuff buffer_size must be positive")
         self.buffer: list[Update] = []
@@ -31,14 +32,26 @@ class FedBuffMethod(Method):
         if len(self.buffer) < self.buffer_size:
             return []
         pending, self.buffer = self.buffer[: self.buffer_size], self.buffer[self.buffer_size :]
-        return [apply_buffer(server_context.global_state, pending, self.server_lr)]
+        return [
+            apply_buffer(
+                server_context.global_state,
+                pending,
+                self.server_lr,
+                sample_weighted=self.sample_weighted,
+            )
+        ]
 
     def on_finish(self, server_context: ServerContext) -> list[ServerMutation]:
         if not self.buffer or not self.flush_tail:
             self.buffer.clear()
             return []
         pending, self.buffer = self.buffer, []
-        mutation = apply_buffer(server_context.global_state, pending, self.server_lr)
+        mutation = apply_buffer(
+            server_context.global_state,
+            pending,
+            self.server_lr,
+            sample_weighted=self.sample_weighted,
+        )
         mutation.metadata["tail_flush"] = True
         return [mutation]
 

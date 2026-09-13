@@ -26,6 +26,8 @@ def _load_builtins() -> None:
         fedasync,
         fedavg_sync,
         fedbuff,
+        fedcompass_sim,
+        fedopt_sync,
         staleness_decay,
     )
     from afl_vlm.methods.custom import my_method  # noqa: F401
