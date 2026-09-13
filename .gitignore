@@ -9,6 +9,7 @@ build/
 dist/
 *.egg-info/
 runs/
+downloads/
 .env
 .env.*
 *.log
@@ -18,3 +19,8 @@ runs/
 Thumbs.db
 task_plan.md
 notes.md
+# Local pretrained weights (keep the placement guide).
+pretrained/*
+!pretrained/README.md
+# Downloaded benchmark images are local, large, and license-governed.
+data/AFVLM_CM/dataset/

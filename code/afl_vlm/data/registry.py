@@ -23,7 +23,7 @@ def register_task_backend(
 
 
 def create_task(task_key: str, config: Mapping[str, Any]) -> TaskAdapter:
-    from afl_vlm.data import fedmllm  # noqa: F401
+    from afl_vlm.data import afvlm_cm  # noqa: F401
 
     backend = str(config["backend"])
     try:
@@ -35,6 +35,6 @@ def create_task(task_key: str, config: Mapping[str, Any]) -> TaskAdapter:
 
 
 def backend_names() -> set[str]:
-    from afl_vlm.data import fedmllm  # noqa: F401
+    from afl_vlm.data import afvlm_cm  # noqa: F401
 
     return set(_REGISTRY)

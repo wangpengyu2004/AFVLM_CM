@@ -1,9 +1,10 @@
-"""Run all enabled experiment × method × seed × scenario combinations."""
+"""Run one formal AFVLM-CM experiment configuration."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -12,60 +13,21 @@ CODE_ROOT = REPOSITORY_ROOT / "code"
 if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
-from afl_vlm.config import expand_runs, load_config  # noqa: E402
-from afl_vlm.runner import dry_run, execute  # noqa: E402
+from afl_vlm.config import load_config  # noqa: E402
+from afl_vlm.runner import execute  # noqa: E402
 
 
-def main() -> int:
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="Path to the single complete YAML config")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate and print schedules without loading a model",
-    )
-    parser.add_argument("--output-root", help="Optional output-root override for this invocation")
-    parser.add_argument(
-        "--methods",
-        nargs="+",
-        metavar="METHOD_ID",
-        help="Run only these method IDs from the config (for example: fedavg afvlm_cm)",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Explicitly allow replacement of existing run artifacts",
-    )
-    arguments = parser.parse_args()
-    config = load_config(arguments.config)
-    if arguments.methods:
-        requested = set(arguments.methods)
-        available = {str(item["id"]) for item in config["methods"]}
-        unknown = requested - available
-        if unknown:
-            parser.error(f"unknown method ID(s): {sorted(unknown)}; available: {sorted(available)}")
-        for method in config["methods"]:
-            method["enabled"] = str(method["id"]) in requested
-    if arguments.output_root:
-        config["run"]["output_root"] = arguments.output_root
-    if arguments.overwrite:
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+    os.chdir(REPOSITORY_ROOT)
+    config = load_config(args.config)
+    if args.overwrite:
         config["output"]["overwrite"] = True
-    if arguments.dry_run:
-        print(json.dumps(dry_run(config), ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    rows = execute(config)
-    print(
-        json.dumps(
-            {
-                "completed_runs": len(expand_runs(config)),
-                "summary_rows": len(rows),
-                "output_root": config["run"]["output_root"],
-            },
-            indent=2,
-        )
-    )
-    return 0
+    print(json.dumps(execute(config), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

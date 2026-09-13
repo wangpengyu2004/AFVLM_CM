@@ -1,4 +1,4 @@
-"""Explicit method registry; adding a method does not touch experiment loops."""
+"""Unified method registry/factory."""
 
 from __future__ import annotations
 
@@ -7,40 +7,38 @@ from typing import Any
 
 from afl_vlm.methods.base import Method
 
-_REGISTRY: dict[str, Callable[[Mapping[str, Any]], Method]] = {}
+METHOD_REGISTRY: dict[str, Callable[[Mapping[str, Any]], Method]] = {}
 
 
 def register_method(name: str) -> Callable[[type[Method]], type[Method]]:
     def decorator(cls: type[Method]) -> type[Method]:
-        if name in _REGISTRY:
+        if name in METHOD_REGISTRY:
             raise ValueError(f"Method already registered: {name}")
-        _REGISTRY[name] = cls
+        METHOD_REGISTRY[name] = cls
         return cls
 
     return decorator
 
 
 def _load_builtins() -> None:
-    from afl_vlm.methods.baselines import (  # noqa: F401
-        async_additive,
-        fedasync,
-        fedavg_sync,
-        fedbuff,
-        fedcompass_sim,
-        fedopt_sync,
-        staleness_decay,
-    )
-    from afl_vlm.methods.custom import afvlm_cm  # noqa: F401
+    from afl_vlm.methods import fedasmu, fedcompass, masfl, ours, standard  # noqa: F401
+    from afl_vlm.methods.pilot import method as pilot  # noqa: F401
+    from afl_vlm.methods.unifed_lora import method as unifed_lora  # noqa: F401
 
 
-def create_method(name: str, params: Mapping[str, Any]) -> Method:
+def create_method(name: str, params: Mapping[str, Any] | None = None) -> Method:
     _load_builtins()
     try:
-        return _REGISTRY[name](params)
+        return METHOD_REGISTRY[name](params or {})
     except KeyError as exc:
-        raise ValueError(f"Unknown method '{name}'. Available: {sorted(_REGISTRY)}") from exc
+        raise ValueError(f"Unknown method '{name}'. Available: {sorted(METHOD_REGISTRY)}") from exc
 
 
-def method_names() -> set[str]:
+def method_names() -> tuple[str, ...]:
     _load_builtins()
-    return set(_REGISTRY)
+    return tuple(sorted(METHOD_REGISTRY))
+
+
+def method_capabilities() -> dict[str, Any]:
+    _load_builtins()
+    return {name: cls({}).capabilities for name, cls in METHOD_REGISTRY.items() if name != "ours"}

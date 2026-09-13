@@ -1,193 +1,236 @@
 # AFVLM-CM
 
-AFVLM-CM 是一个面向**异步联邦视觉语言模型微调**的研究框架。研究场景是：每个客户端长期固定在一个任务上，不发生持续学习式任务切换；不同任务的训练耗时不同，因此更新到达顺序会与任务相关，并同时产生陈旧性和跨任务冲突。
+AFVLM-CM 是用于论文实验的异步联邦视觉语言模型指令微调框架，研究固定任务客户端下的任务异构与系统异构：每个客户端永久属于一个任务，客户端速度、可用时间和网络延迟不同，但不存在持续学习或任务增量流。
 
-本仓库实现的是 AFVLM-CM 自研方法及其对照实验。FCIT 仅是当前指令数据的来源，项目不实现 FCIT 的持续学习算法、专家路由或任务序列。
+正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。一个进程中只保留一份冻结的 7B 主干；逻辑客户端通过装载各自训练起点的 LoRA/显式允许模块状态顺序训练。冻结主干不会上传、聚合或写入联邦检查点。
 
-## 方法概览
+## 已检测的数据
 
-AFVLM-CM 包含两个轻量且可消融的机制：
+框架直接读取现有的 `data/AFVLM_CM`，不生成、不重分区、不改写任何指令文件。
 
-1. **任务条件下载修正**：服务端为每个任务维护已接受更新的指数移动平均方向。客户端下载时，从最新全局 LoRA 状态出发，加上本任务的小幅记忆修正，缓解统一模型对高频/快速任务的偏置。
-2. **陈旧冲突上传修正**：更新到达服务端后，计算客户端训练期间的全局漂移。若更新方向与漂移方向冲突，只删除冲突投影分量，再按陈旧度做多项式衰减；不改变无冲突更新。
+```text
+data/AFVLM_CM/
+├── dataset/                         # 所有图片的唯一根目录
+└── partitioned/
+    ├── 2_clients/                   # 6 × 2 = 12 clients
+    ├── 5_clients/                   # 6 × 5 = 30 clients
+    ├── 10_clients/                  # 6 × 10 = 60 clients
+    └── metadata/
+```
 
-对应实现位于 `code/afl_vlm/methods/custom/afvlm_cm.py`，方法 ID 为 `afvlm_cm`。关键参数都在 `configs/run.yaml`：
+每个规模下均检测到六个任务目录：
 
-- `download_strength`：任务记忆在下载模型中的修正强度；
-- `memory_momentum`：每任务更新记忆的 EMA 动量；
-- `staleness_exponent`：陈旧权重 `(staleness + 1)^(-exponent)` 的指数；
-- `server_lr`：服务端应用修正更新的步长；
-- `download_correction` / `upload_correction`：两项机制的独立消融开关。
+| task ID | 来源数据 | 指标 | 图片相对目录 |
+|---|---|---|---|
+| `cls` | ImageNet-R | accuracy | `ImageNet-R/train/` |
+| `caption` | Flickr30k | CIDEr、ROUGE-L | `Flickr30k/train/` |
+| `vqa` | AOKVQA | VQA accuracy | `COCO2014/train2014/`、`val2014/` |
+| `chart_vqa` | DVQA | answer accuracy | `DVQA/images/` |
+| `visual_reasoning` | FigureQA | answer accuracy | `FigureQA/images/` |
+| `grounding` | COCO grounding | mean IoU、IoU@0.5 accuracy | 与 AOKVQA 共用 `COCO2014/` |
 
-框架记录原始/修正更新范数、冲突余弦、被删除的投影量、陈旧度与实际权重，便于直接验证机制是否发挥作用。
+每个任务目录包含原有的 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 记录只读分区的静态完整性摘要。
+
+三个数据配置为：
+
+- `configs/datasets/afvlm_cm_2clients.yaml`
+- `configs/datasets/afvlm_cm_5clients.yaml`
+- `configs/datasets/afvlm_cm_10clients.yaml`
 
 ## 安装
 
-推荐 Linux、CUDA GPU 和 Python 3.10+。在仓库根目录执行：
+建议使用 Linux、WSL2 或具有 CUDA 的服务器环境。原始 LLaVA 代码通过可选依赖安装：
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -e ".[dev,qwen,plots]"
+pip install -e ".[llava,data,dev]"
 ```
 
-Windows PowerShell 激活命令为：
+NF4 量化需要 CUDA 和 bitsandbytes；默认配置使用非量化 bf16。为避免原始 LLaVA-1.5 与新版本 Transformers/PEFT API 漂移，可选依赖约束在原实现兼容的 Transformers 4.31 与 PEFT 0.4 系列。正式训练不会联网取权重。
 
-```powershell
-.venv\Scripts\Activate.ps1
-```
+## 下载并放置模型
 
-默认主干是 `Qwen/Qwen2.5-VL-7B-Instruct`，使用语言侧 LoRA/QLoRA，只在联邦通信中传输可训练参数。仓库也提供可选的 `llava15` 适配器；使用它时安装 `pip install -e ".[dev,llava,plots]"`，并在配置中把 `model.adapter` 和 `model.hf_id` 改为 `llava15` 与 `llava-hf/llava-1.5-7b-hf`。
-
-## 数据集
-
-AFVLM-CM 固定任务 benchmark 从本地 FCIT 指令标注派生，但会先按任务汇总，再重新划分客户端。每个客户端只拥有一个固定任务，且训练、probe 和 final 集互不重叠。
-
-| 配置值 | 总客户端 | 每任务客户端 | 数据量设置 |
-|---|---:|---:|---|
-| `small_balanced` | 16 | 2 | 同任务客户端等量 |
-| `small_quantity_skew` | 16 | 2 | 同任务客户端不等量 |
-| `medium_balanced` | 40 | 5 | 同任务客户端等量 |
-| `medium_quantity_skew` | 40 | 5 | 同任务客户端不等量 |
-| `large_balanced` | 80 | 10 | 同任务客户端等量 |
-| `large_quantity_skew` | 80 | 10 | 同任务客户端不等量 |
-
-在 `configs/run.yaml` 中只改 `dataset.variant` 即可切换。运行时会自动读取该变体的任务、客户端归属、训练文件和任务延迟，不会二次随机划分。
-
-### 图片放置位置
-
-所有图片统一放在 `data/fcit/dataset/` 下，并保持指令中的相对路径：
-
-| 任务 | 应存在的目录/路径示例 |
-|---|---|
-| ImageNet-R | `data/fcit/dataset/ImageNet-R/train/...` |
-| ArxivQA | `data/fcit/dataset/ArxivQA/images/...` |
-| IconQA | `data/fcit/dataset/IconQA/iconqa_data/iconqa/...` |
-| CLEVR | `data/fcit/dataset/CLEVR/images/...` |
-| OCR-VQA | `data/fcit/dataset/OCR-VQA/images/...` |
-| Flickr30k | `data/fcit/dataset/Flickr30k/train/...` |
-| FigureQA | `data/fcit/dataset/FigureQA/images/...` |
-| super-CLEVR | `data/fcit/dataset/super-CLEVR/images/...` |
-
-不要把图片平铺到同一目录。正式训练设置 `require_images: true`，缺少任意被引用图片都会在加载数据时明确失败。
-
-重新构建或检查指令数据：
-
-```bash
-python -m scripts.prepare_fixed_task_benchmark --force
-python -m scripts.prepare_fixed_task_benchmark --validate-only
-python -m scripts.preflight_benchmark_images
-```
-
-若图片还未全部下载，但想先生成缺失清单：
-
-```bash
-python -m scripts.preflight_benchmark_images --allow-missing
-```
-
-检查结果写入 `data/fcit/fixed_task_benchmark/image_preflight.json`。
-
-## 如何运行
-
-所有正式实验统一使用 `configs/run.yaml`。先验证数据、配置和展开后的调度，不加载模型：
-
-```bash
-python -m scripts.prepare_fixed_task_benchmark --validate-only
-python -m scripts.preflight_benchmark_images
-python -m scripts.validate_config --config configs/run.yaml
-python -m scripts.run_experiment --config configs/run.yaml --methods afvlm_cm --dry-run
-```
-
-### 运行自研方法
-
-```bash
-python -m scripts.run_experiment \
-  --config configs/run.yaml \
-  --methods afvlm_cm \
-  --output-root runs/afvlm_cm/ours
-```
-
-### 运行单个 baseline
-
-以 FedAsync 为例：
-
-```bash
-python -m scripts.run_experiment \
-  --config configs/run.yaml \
-  --methods fedasync \
-  --output-root runs/afvlm_cm/baselines/fedasync
-```
-
-把 `fedasync` 换成下表任一方法 ID 即可。`--methods` 接收的是 `configs/run.yaml` 中的 ID，不需要修改多个 `enabled` 字段。
-
-### 一次运行全部 baseline
-
-```bash
-python -m scripts.run_experiment \
-  --config configs/run.yaml \
-  --methods async_sgd async_decay fedavg fedasync fedbuff fedadam fedyogi fedcompass_sim \
-  --output-root runs/afvlm_cm/baselines/all
-```
-
-### 自研方法与全部 baseline 使用相同调度运行
-
-```bash
-python -m scripts.run_experiment \
-  --config configs/run.yaml \
-  --methods afvlm_cm async_sgd async_decay fedavg fedasync fedbuff fedadam fedyogi fedcompass_sim \
-  --output-root runs/afvlm_cm/full_comparison
-```
-
-已有输出默认不覆盖；确认要重跑同一路径时显式加 `--overwrite`。多随机种子实验在配置中设置 `run.seeds: [42, 43, 44]`。两个延迟场景会在同一份任务/客户端数据上运行：`task_correlated` 保留任务相关速度，`task_shuffled` 打乱客户端速度映射，作为到达偏置控制组。
-
-这里的异步协议与 FLGo/FedAsync 属于同一类“客户端基于旧版本训练、服务端按到达顺序更新”的范式，但并非逐行复现 FLGo。AFVLM-CM 采用确定性事件流和每客户端等上传配额，因为它能在比较任务相关延迟时固定各客户端参与量；`task_shuffled` 则专门检验收益是否只是由速度分布造成。
-
-汇总结果：
-
-```bash
-python -m scripts.summarize_results runs/afvlm_cm/full_comparison
-```
-
-每个运行目录包含解析后的配置、确定性调度、事件/更新/probe 日志、最终指标、LoRA 状态和方法状态。不同方法、种子和延迟场景均从相同初始化独立开始。
-
-## Baseline
-
-仓库提供 8 个可运行对照：
-
-| 方法 ID | 类型 | 作用 |
-|---|---|---|
-| `async_sgd` | 经典异步加法 | 无陈旧补偿的下界 |
-| `async_decay` | 陈旧衰减 | 隔离单纯 staleness weighting 的收益 |
-| `fedavg` | 同步 FedAvg | 无异步到达偏置的参照 |
-| `fedasync` | FedAsync | 经典异步模型插值 |
-| `fedbuff` | FedBuff | 缓冲式异步聚合 |
-| `fedadam` | FedAdam | 自适应服务端优化 |
-| `fedyogi` | FedYogi | 更稳健的自适应服务端优化 |
-| `fedcompass_sim` | FedCompass 风格调度 | 用客户端步数分配缓解系统异构 |
-
-方法选择依据和论文链接见 `claudedocs/research_2026-09-13_fixed_task_async_baselines.md`。
-
-## 项目结构
+期望的本地路径固定为：
 
 ```text
-code/afl_vlm/
-  models/                 # Qwen2.5-VL、LLaVA-1.5、测试模型与状态代数
-  data/                   # 固定任务数据预设、任务适配和图片解析
-  scheduling/             # 确定性虚拟时钟、延迟模型和调度
-  federation/             # 客户端、版本化服务端和状态存储
-  methods/baselines/      # 8 个 baseline
-  methods/custom/         # AFVLM-CM 自研方法
-  experiments/            # 端到端与机制实验协议
-  analysis/               # 指标与结果汇总
-configs/run.yaml          # 唯一正式实验配置
-scripts/                  # 数据构建、图片检查、运行与汇总入口
-tests/                    # 单元与流水线测试（不作为研究实验）
+pretrained/
+├── llava-v1.5-7b/
+└── clip-vit-large-patch14-336/
 ```
 
-## 引用与来源
+使用 Hugging Face 镜像：
 
-- 数据标注来源：[MLLM-CL/FCIT](https://huggingface.co/datasets/MLLM-CL/FCIT)
-- FCIT 原论文与代码：[ICCV 2025 paper](https://www.openaccess.thecvf.com/content/ICCV2025/html/Guo_Federated_Continual_Instruction_Tuning_ICCV_2025_paper.html)、[official repository](https://github.com/Ghy0501/FCIT)
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+python tools/download_models.py
+```
 
-使用派生数据时请同时遵守原始数据集及其组成数据集的许可证和引用要求。
+或显式参数（显式参数优先于环境变量）：
+
+```bash
+python tools/download_models.py --hf_endpoint https://hf-mirror.com
+```
+
+可使用 `--llava_only` 或 `--clip_only` 单独下载，`--resume` 续传，`--skip_existing` 跳过完整目录。下载先进入 `.partial` 目录，只有存在 `config.json` 后才原子移动为正式目录；失败不会伪造完整权重目录。
+
+## 下载并放置图片
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+python tools/download_afvlm_cm_images.py --all --resume --skip_existing
+```
+
+该工具支持 `--imagenet_r`、`--flickr30k`、`--dvqa`、`--figureqa`、`--coco2014` 与 `--output_root`，并在结束时逐条核对指令中的相对路径。ImageNet-R/Flickr30k 先读取 `HaiyangGuo/UCIT` 的真实文件树，再用 `snapshot_download + allow_patterns` 仅取所需归档；DVQA/FigureQA 通过 `list_repo_files` 解析 `MLLM-CL/FCIT` 的实际 `dataset/` 文件，不硬编码压缩包名。仓库结构不唯一或变化时明确报错，不会静默下载整个仓库。AOKVQA 与 Grounding 只保留一份 COCO2014。HF 镜像仅用于 Hugging Face 资源，COCO 始终访问官方 `images.cocodataset.org`，支持 HTTP retry、timeout 与 Range 续传。
+
+只检查当前覆盖率而不下载：
+
+```bash
+python tools/download_afvlm_cm_images.py --validate_only
+```
+
+当前本地审计检测到 64,934 个唯一图片引用，其中 61,304 个尚未就位；因此正式训练会在加载 7B 模型前停止并提示缺失路径。
+
+工具不会修改 `data/AFVLM_CM/partitioned` 来迎合猜测的目录。
+
+## 配置结构
+
+配置采用递归 `inherits` 深合并，并拒绝重复 YAML 键与继承环：
+
+```text
+configs/
+├── base.yaml
+├── models/llava15_7b_lora.yaml
+├── datasets/afvlm_cm_{2,5,10}clients.yaml
+├── methods/{local,...,unifed_lora,ours}.yaml
+└── experiments/llava/afvlm_cm/
+    ├── 2clients/    # 13 个可直接运行配置
+    ├── 5clients/    # 13 个可直接运行配置
+    └── 10clients/   # 13 个可直接运行配置
+```
+
+同一规模的所有方法继承相同模型、LoRA、客户端优化器、学习率、本地 epoch、batch size、随机种子、数据与评估配置。`plans/afvlm_cm/{2,5,10}clients/system_profile.json` 是固定、方法无关的速度/网络/可用性画像；`async_train_plan.json` 是普通异步方法共同重放的基础作业计划。除 FedCompass 的本地工作量分配外，异步算法不得改变这些基础条件。
+
+本地优化器策略明确为 **reset per client job**：每个作业从其下载的联邦状态创建新的 AdamW，一、二阶矩不跨作业保留。该策略对所有比较方法一致；FedAdam 等服务器优化器状态独立保存在方法状态中。
+
+## 异步语义
+
+运行器先用虚拟时钟构造 TrainPlan，再按开始/到达事件重放。客户端在 `start_time` 下载当时的 `base_version` 和 LoRA 快照；即使服务器随后更新，该作业仍从旧快照训练。上传包含 `client_id`、`task`、`dataset`、`num_samples`、`base_version`、`arrival_time`、`local_state` 和 `delta`。服务器在到达时计算 `staleness = server_version - base_version`。
+
+这是连续事件式异步协议，不等同于 FLGo 在同一时钟 tick 汇总同时返回模型的具体实现。两者都具有旧版本训练和异步到达，但本项目用持久化虚拟时间隔离系统异构，保证方法间使用完全相同的到达条件。普通异步方法训练中不会获得新全局模型；只有声明专属能力的 FedASMU 可执行一次中途新鲜模型调整。
+
+## 方法
+
+统一注册表支持：
+
+- `local`：每个客户端独立 LoRA，无服务器聚合。
+- `fedavg`：同步、样本量加权的 LoRA FedAvg。
+- `fedprox`：在联邦可训练参数上加入 `mu/2 ||theta-theta_global||²`。
+- `fedadam`：同步客户端 delta 与服务器 Adam 一、二阶矩。
+- `fedasync`：逐到达插值，支持 constant、polynomial、hinge 陈旧函数。
+- `fedbuff`：异步缓冲聚合，可选样本量/陈旧加权，结尾强制处理残余缓冲。
+- `fedcompass`：计算能力感知的本地步数分配与分组半异步聚合。
+- `fedasmu`：动态陈旧服务器更新以及一次训练中途新鲜全局调整。
+- `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
+- `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
+- `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
+- `ours`：仅注册未来接口；当前调用会抛出 `NotImplementedError: The proposed AFVLM method has not been implemented yet.`
+
+FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前固定任务客户端的强制 baseline；FedAST 的原问题是并行训练多个联邦模型，也不作为当前主 baseline。注册表保留后续扩展能力。
+
+## 运行单个方法
+
+接口为 `bash scripts/run_one.sh <method> <setting>`，其中 setting 为 2、5 或 10。以下是 2 clients/task 的每个正式 baseline 命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh local 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedavg 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedprox 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedadam 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedbuff 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedcompass 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasmu 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh masfl 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh adamasfl 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh pilot 2
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh unifed_lora 2
+```
+
+将最后一个参数改为 5 或 10 即选择对应数据集；例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedcompass 5
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh adamasfl 10
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh pilot 5
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh unifed_lora 10
+```
+
+直接使用完整配置的等价命令为：
+
+```bash
+python scripts/run_experiment.py \
+  --config configs/experiments/llava/afvlm_cm/2clients/fedasync.yaml
+```
+
+批量运行全部 12 个 baseline（默认不包括尚未实现的 `ours`）：
+
+```bash
+bash scripts/run_baselines.sh 2
+bash scripts/run_baselines.sh 5
+bash scripts/run_baselines.sh 10
+```
+
+## 评估与输出
+
+训练完成后可独立复评：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
+  --config configs/experiments/llava/afvlm_cm/2clients/fedasync.yaml \
+  --checkpoint runs/llava/afvlm_cm/2clients/fedasync/seed42/checkpoints/final_trainable.pt \
+  --output runs/llava/afvlm_cm/2clients/fedasync/seed42/metrics.reproduced.json
+```
+
+每个运行目录包含 `resolved_config.yaml`、`system_profile.reference.json`、`train_plan.json`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、`metrics.json`、`system_stats.json`、`train.log` 与 `checkpoints/final_trainable.pt`。`evaluation.eval_every_server_updates` 控制中间 validation 频率。检查点只保存联邦可训练状态、服务器/方法/调度器/随机状态及必要 metadata，不保存冻结的 7B 主干。
+
+系统统计包括 mean/median/max staleness、总/接受更新数、聚合次数、客户端/任务更新分布与虚拟训练时间；FedBuff 额外报告缓冲聚合次数、平均占用和平均等待时间；FedCompass 额外报告本地步数分配、分组完成时间与组内完成跨度。不同任务的量纲不兼容，因此不会把 accuracy、CIDEr 和 IoU 粗暴平均为一个原始分数。
+
+数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。
+
+## 静态工程检查
+
+以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、39 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
+
+```bash
+python -m compileall -q code scripts tools
+python tools/validate_repository.py
+ruff check code scripts tools
+```
+
+## 与论文原始设置的差异
+
+- FedCompass：保留计算能力感知步数分配和分组半异步核心，复用本项目的持久化虚拟时钟，没有复制原框架进程架构；优化状态限定为 LoRA。
+- FedASMU：保留论文动态陈旧混合和中途新鲜模型调整。当前用确定性的可配置刷新位置及在线系数更新代替原工作完整的设备强化学习请求控制器，因此属于明确适配而非逐代码精确复现。
+- MasFL/AdaMasFL：实现控制变量与两级动量方程；模型接口同时返回实际平均 LoRA 梯度。所有向量仅覆盖联邦可训练状态。
+- Pilot：把专属视觉适配器和 CT-MoA 隔离在 Pilot 包装器内，其他方法的 LLaVA 不受影响；数据仍使用 AFVLM-CM 固定分区。当前一次运行联合优化两个阶段的损失，而不是另行执行论文中的独立预训练阶段。
+- UniFed-LoRA：原论文支持异构主干；当前 `backbone heterogeneity = disabled`、`task heterogeneity = enabled`。超网络仍由任务/模态/层/模块描述符条件化，未使用硬编码客户端编号。
+
+## 当前限制
+
+- 代码未替用户启动 7B 训练；显存、CUDA、原始 LLaVA 版本与权重兼容性需要在目标训练机确认。
+- Flickr30k、DVQA、FigureQA 和 COCO 受各自许可与分发条件约束；下载工具不会绕过许可页面。
+- 当前训练入口保存可独立复评的最终联邦检查点，但尚未提供从任意中间异步事件恢复并继续训练的 CLI；这需要同时恢复仍在途的客户端作业快照。
+- Flickr30k 指令当前每条只有一个参考答案；内置 CIDEr 使用标准 1--4 gram TF-IDF 余弦构造，但与拥有五参考标注的官方 COCO caption scorer 不能宣称数值完全等价。
+- Pilot 的联合阶段适配和 FedASMU 的确定性刷新策略必须在论文中按上述差异披露。
+- `ours` 故意没有算法实现，也不在 baseline 批处理里。
+
+## 主要论文与数据来源
+
+- FedCompass, ICLR 2024: <https://proceedings.iclr.cc/paper_files/paper/2024/hash/a9f3457fa97f106f1756885237787789-Abstract-Conference.html>
+- FedASMU, AAAI 2024: <https://ojs.aaai.org/index.php/AAAI/article/view/29297>
+- MasFL/AdaMasFL, ICML 2025: <https://proceedings.mlr.press/v267/yan25f.html>
+- Pilot, AAAI 2025: <https://ojs.aaai.org/index.php/AAAI/article/view/35476>
+- UniFed-LoRA, CVPR Workshops 2026: <https://openaccess.thecvf.com/content/CVPR2026W/FedVision/html/Milasheuski_UniFed-LoRA_Exploiting_Semantic_Task_Correlation_for_Heterogeneous_Multimodal_Federated_Fine-Tuning_CVPRW_2026_paper.html>
+- DVQA 官方数据仓库: <https://github.com/kushalkafle/DVQA_dataset>
+- FigureQA 官方项目: <https://www.microsoft.com/en-us/research/project/figureqa-dataset/>

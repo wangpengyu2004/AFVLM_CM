@@ -1,0 +1,16 @@
+method:
+  name: fedasmu
+  params:
+    mu_alpha: 1.0
+    lambda: 1.0
+    sigma: 0.5
+    iota: 0.0
+    tau: 50
+    server_meta_lr: 0.01
+    mu_beta: 1.0
+    gamma: 1.0
+    upsilon: 0.5
+    local_meta_lr: 0.01
+    refresh_fraction: 0.5
+federation:
+  mode: asynchronous

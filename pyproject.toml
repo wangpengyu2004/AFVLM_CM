@@ -5,34 +5,33 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "afvlm-cm"
 version = "0.1.0"
-description = "Minimal validation framework for task-conditioned mechanisms in asynchronous federated VLM fine-tuning"
+description = "Asynchronous federated LLaVA instruction tuning under task and system heterogeneity"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "huggingface-hub>=0.27",
+  "numpy>=1.24,<3",
   "PyYAML>=6.0.2,<7",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.3,<9",
   "ruff>=0.8,<1",
 ]
-qwen = [
-  "accelerate>=1.2",
-  "bitsandbytes>=0.45; platform_system != 'Windows'",
-  "peft>=0.14",
-  "pillow>=10.4",
-  "qwen-vl-utils>=0.0.10",
-  "torch>=2.5",
-  "transformers>=4.49",
-]
 llava = [
-  "accelerate>=1.2",
-  "bitsandbytes>=0.45; platform_system != 'Windows'",
-  "peft>=0.14",
+  "accelerate>=0.21,<0.22",
+  "bitsandbytes>=0.41,<0.42; platform_system != 'Windows'",
+  "peft>=0.4,<0.5",
   "pillow>=10.4",
-  "torch>=2.5",
-  "transformers>=4.49",
+  "protobuf>=4,<6",
+  "sentencepiece>=0.1.99",
+  "torch>=2.0,<2.6",
+  "torchvision>=0.15,<0.21",
+  "transformers>=4.31,<4.32",
+  "llava @ git+https://github.com/haotian-liu/LLaVA.git",
+]
+data = [
+  "datasets>=3.0",
 ]
 plots = [
   "matplotlib>=3.9",
@@ -43,11 +42,6 @@ package-dir = {"" = "code"}
 
 [tool.setuptools.packages.find]
 where = ["code"]
-
-[tool.pytest.ini_options]
-addopts = "-q"
-testpaths = ["tests"]
-pythonpath = ["code", "."]
 
 [tool.ruff]
 line-length = 100
