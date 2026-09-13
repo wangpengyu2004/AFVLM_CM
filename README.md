@@ -183,6 +183,10 @@ bash scripts/run_baselines.sh 10
 
 ## 评估与输出
 
+项目采用常见异步联邦学习评估协议：以**成功的服务器模型更新数**作为评估间隔。每达到 `evaluation.eval_every_server_updates`，复制当前服务器联邦状态并在公共 validation 集上分别评估六个任务；评估过程不计入虚拟训练时间，也不改变训练状态。全部 TrainPlan 到达事件完成后，先执行方法的结尾处理（例如刷新 FedBuff 残余缓冲），再用最终服务器状态在公共 test 集上评估。
+
+所有存在服务器聚合的算法都以 `server_global` 为主评估结果。Pilot 仍使用任务路由，但使用当前服务器状态及同任务服务器端客户端视觉适配器的均值，不使用个性化 LoRA 替代全局主结果。Local-only 没有全局模型，因此是唯一例外：分别用每个客户端本地模型测试其所属任务的同一公共测试集，再在任务内等权平均，输出协议标记为 `client_local_mean`。
+
 训练完成后可独立复评：
 
 ```bash
@@ -192,7 +196,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
   --output runs/llava/afvlm_cm/2clients/fedasync/seed42/metrics.reproduced.json
 ```
 
-每个运行目录包含 `resolved_config.yaml`、`system_profile.reference.json`、`train_plan.json`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、`metrics.json`、`system_stats.json`、`train.log` 与 `checkpoints/final_trainable.pt`。`evaluation.eval_every_server_updates` 控制中间 validation 频率。检查点只保存联邦可训练状态、服务器/方法/调度器/随机状态及必要 metadata，不保存冻结的 7B 主干。
+每个运行目录包含 `resolved_config.yaml`、`system_profile.reference.json`、`train_plan.json`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、`metrics.json`、`system_stats.json`、`train.log` 与 `checkpoints/final_trainable.pt`。评估文件显式记录 `protocol`、`split`、`server_version`、`virtual_time` 和 `per_task`。检查点只保存联邦可训练状态、服务器/方法/调度器/随机状态及必要 metadata，不保存冻结的 7B 主干。
 
 系统统计包括 mean/median/max staleness、总/接受更新数、聚合次数、客户端/任务更新分布与虚拟训练时间；FedBuff 额外报告缓冲聚合次数、平均占用和平均等待时间；FedCompass 额外报告本地步数分配、分组完成时间与组内完成跨度。不同任务的量纲不兼容，因此不会把 accuracy、CIDEr 和 IoU 粗暴平均为一个原始分数。
 

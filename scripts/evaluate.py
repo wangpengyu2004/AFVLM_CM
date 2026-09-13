@@ -40,7 +40,16 @@ def main() -> None:
     model.load_trainable(checkpoint["federated_state"])
     method.load_state_dict(checkpoint["method_state"])
     result = {
-        "per_task": evaluate_method(model, method, checkpoint["federated_state"], tasks, "final"),
+        "protocol": method.evaluation_scope,
+        "split": config["evaluation"].get("final_split", "final"),
+        "server_version": checkpoint["server_version"],
+        "per_task": evaluate_method(
+            model,
+            method,
+            checkpoint["federated_state"],
+            tasks,
+            config["evaluation"].get("final_split", "final"),
+        ),
         "note": "No cross-task raw average is reported.",
     }
     text = json.dumps(result, ensure_ascii=False, indent=2) + "\n"

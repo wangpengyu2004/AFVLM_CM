@@ -11,6 +11,11 @@ def build_pilot_connector(
     import torch
     from torch import nn
 
+    task_client_keys = {
+        task: [client.replace("/", "__") for client in clients if client.startswith(f"{task}/")]
+        for task in tasks
+    }
+
     class ResidualAdapter(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -31,16 +36,24 @@ def build_pilot_connector(
             self.cross_task_adapters = nn.ModuleDict({task: ResidualAdapter() for task in tasks})
             self.router = nn.Linear(hidden_size, len(tasks), bias=False)
             self.current_task = tasks[0]
-            self.current_client = clients[0]
+            self.current_client: str | None = clients[0]
             self.auxiliary_losses: dict[str, Any] = {}
 
-        def set_context(self, task: str, client: str) -> None:
+        def set_context(self, task: str, client: str | None) -> None:
             self.current_task, self.current_client = task, client
 
         def forward(self, image_features: Any) -> Any:
             value = self.base_connector(image_features)
             task_value = self.task_adapters[self.current_task](value)
-            client_value = self.client_adapters[self.current_client.replace("/", "__")](value)
+            if self.current_client is None:
+                client_value = torch.stack(
+                    [
+                        self.client_adapters[key](value)
+                        for key in task_client_keys[self.current_task]
+                    ]
+                ).mean(dim=0)
+            else:
+                client_value = self.client_adapters[self.current_client.replace("/", "__")](value)
             logits = self.router(value.mean(dim=-2))
             weights = torch.softmax(logits, dim=-1)
             experts = torch.stack([self.cross_task_adapters[task](value) for task in tasks], dim=-2)

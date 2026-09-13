@@ -30,7 +30,6 @@ class Llava15Adapter(ModelAdapter):
         self.device: Any = None
         self._config: dict[str, Any] = {}
         self._pilot_connector: Any = None
-        self._pilot_eval_client: dict[str, str] = {}
 
     @staticmethod
     def _imports() -> tuple[Any, ...]:
@@ -179,17 +178,16 @@ class Llava15Adapter(ModelAdapter):
         wrapper = build_pilot_connector(base, hidden, tasks, clients, bottleneck)
         self.model.base_model.model.model.mm_projector = wrapper
         self._pilot_connector = wrapper
-        self._pilot_eval_client = {
-            task: next(client for client in clients if client.startswith(f"{task}/"))
-            for task in tasks
-        }
 
     def pilot_auxiliary_losses(self) -> dict[str, Any]:
         return dict(self._pilot_connector.auxiliary_losses) if self._pilot_connector else {}
 
-    def _set_context(self, task: str, client: str) -> None:
+    def _set_context(self, task: str, client: str | None) -> None:
         if self._pilot_connector is not None:
             self._pilot_connector.set_context(task, client)
+
+    def set_evaluation_context(self, task: str, client_id: str | None = None) -> None:
+        self._set_context(task, client_id)
 
     def _image(self, sample: Any) -> Any:
         if not sample.image:

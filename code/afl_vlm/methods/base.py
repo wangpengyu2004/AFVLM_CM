@@ -35,6 +35,7 @@ def staleness_weight(staleness: int, config: Mapping[str, Any]) -> float:
 
 class Method(ABC):
     name = "base"
+    evaluation_scope = "server_global"
     capabilities = MethodCapabilities(mode="asynchronous")
     allowed_params: set[str] = set()
 
@@ -79,6 +80,7 @@ class Method(ABC):
         return []
 
     def evaluation_states(self, global_state: LoRAState) -> Mapping[str, LoRAState]:
+        """Return non-global states only for methods whose primary scope requires them."""
         return {"global": clone_state(global_state)}
 
     def state_dict(self) -> dict[str, Any]:

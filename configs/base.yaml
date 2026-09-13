@@ -16,8 +16,11 @@ federation:
   system_profile: null
 
 evaluation:
-  split: test
+  protocol: server_global
+  interval_unit: server_updates
   eval_every_server_updates: 10
+  periodic_split: validation
+  final_split: final
   generation_max_new_tokens: 64
   grounding_iou_threshold: 0.5
 
