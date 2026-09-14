@@ -46,7 +46,23 @@ conda env create -f environment.yml
 conda activate afvlm-cm
 ```
 
-`environment.yml` 会从当前仓库安装 `llava,data,dev,plots` 全部依赖，因此必须在仓库根目录执行。LLaVA 源码固定到官方 `v1.1.3`（LLaVA-1.5 LoRA release），避免上游 `main` 更新导致实验环境漂移。该配置面向 NVIDIA GPU；请先确保宿主机 NVIDIA 驱动支持 CUDA 11.8。
+`environment.yml` 只让 Conda 求解 Python、pip、git 等基础包，CUDA 11.8 版 PyTorch 和其余 Python 依赖由文件中的 pip 阶段精确安装，避免旧版 Conda 在多个 channel 之间长时间回溯。它会从当前仓库安装 `llava,data,dev,plots` 全部依赖，因此必须在仓库根目录执行。LLaVA 源码固定到官方 `v1.1.3`（LLaVA-1.5 LoRA release），避免上游 `main` 更新导致实验环境漂移。该配置面向 Linux/NVIDIA GPU；请先确保宿主机 NVIDIA 驱动支持 CUDA 11.8。
+
+如果旧配置一直停在 `Solving environment`，可以安全地按 `Ctrl+C` 中断，拉取最新配置后重试：
+
+```bash
+git pull
+conda env create -f environment.yml
+```
+
+新版配置的 Conda 求解量很小；若本机仍使用旧的 classic solver，可按 Conda 官方建议启用 libmamba：
+
+```bash
+conda install -n base conda-libmamba-solver -y
+conda config --set solver libmamba
+conda config --set channel_priority strict
+conda env create -f environment.yml
+```
 
 如不使用 Conda，也可手动创建虚拟环境；此时需要自行安装与机器 CUDA 匹配的 PyTorch：
 
