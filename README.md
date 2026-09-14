@@ -39,24 +39,29 @@ data/AFVLM_CM/
 
 ## 安装
 
-建议使用 Linux 或具有 CUDA 的服务器环境。正式实验推荐直接使用仓库根目录的 `environment.yml`，其中固定 Python 3.10、PyTorch 2.0.1、TorchVision 0.15.2、CUDA 11.8 和 NumPy 1.26.4：
+正式实验环境面向 Linux x86_64 与 NVIDIA GPU。先创建一个干净的 Python 3.10 环境，然后只使用仓库根目录的 `requirements.txt` 安装：
 
 ```bash
-conda env create -f environment.yml
+conda create -n afvlm-cm python=3.10 pip -y
 conda activate afvlm-cm
+python -m pip install -r requirements.txt
 ```
 
-`environment.yml` 会从当前仓库安装 `llava,data,dev,plots` 全部依赖，因此必须在仓库根目录执行。LLaVA 源码固定到官方 `v1.1.3`（LLaVA-1.5 LoRA release），避免上游 `main` 更新导致实验环境漂移。该配置面向 NVIDIA GPU；请先确保宿主机 NVIDIA 驱动支持 CUDA 11.8。
-
-如不使用 Conda，也可手动创建虚拟环境；此时需要自行安装与机器 CUDA 匹配的 PyTorch：
+不使用 Conda 时，也可以用 Python 3.10 的 `venv`，安装命令仍然相同：
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[llava,data,dev]"
+python -m pip install -r requirements.txt
 ```
 
-NF4 量化需要 CUDA 和 bitsandbytes；默认配置使用非量化 bf16。为避免原始 LLaVA-1.5 与新版本 Transformers/PEFT API 漂移，可选依赖约束在原实现兼容的 Transformers 4.31 与 PEFT 0.4 系列。环境创建阶段需要联网安装依赖和 LLaVA 源码，但正式训练只读取本地模型权重，不会联网取权重。
+`requirements.txt` 已包含 CUDA 11.8 对应的 PyTorch 2.0.1/TorchVision 0.15.2、LLaVA、Transformers、PEFT、数据处理、绘图和工程检查依赖，并以 editable 模式安装当前 AFVLM-CM 包。LLaVA 源码固定到官方 `v1.1.3`，环境安装不会下载 7B/CLIP 预训练参数。请在仓库根目录运行命令，并确保宿主机 NVIDIA 驱动兼容 CUDA 11.8。NF4 量化需要 bitsandbytes；默认配置仍使用非量化 bf16。正式训练只读取本地模型权重。
+
+安装后可检查关键版本和 CUDA 可用性：
+
+```bash
+python -c "import torch, transformers, peft, llava; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), transformers.__version__, peft.__version__)"
+```
 
 ## 下载并放置模型
 
