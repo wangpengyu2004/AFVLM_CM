@@ -39,7 +39,16 @@ data/AFVLM_CM/
 
 ## 安装
 
-建议使用 Linux、WSL2 或具有 CUDA 的服务器环境。原始 LLaVA 代码通过可选依赖安装：
+建议使用 Linux 或具有 CUDA 的服务器环境。正式实验推荐直接使用仓库根目录的 `environment.yml`，其中固定 Python 3.10、PyTorch 2.0.1、TorchVision 0.15.2、CUDA 11.8 和 NumPy 1.26.4：
+
+```bash
+conda env create -f environment.yml
+conda activate afvlm-cm
+```
+
+`environment.yml` 会从当前仓库安装 `llava,data,dev,plots` 全部依赖，因此必须在仓库根目录执行。LLaVA 源码固定到官方 `v1.1.3`（LLaVA-1.5 LoRA release），避免上游 `main` 更新导致实验环境漂移。该配置面向 NVIDIA GPU；请先确保宿主机 NVIDIA 驱动支持 CUDA 11.8。
+
+如不使用 Conda，也可手动创建虚拟环境；此时需要自行安装与机器 CUDA 匹配的 PyTorch：
 
 ```bash
 python -m venv .venv
@@ -47,7 +56,7 @@ source .venv/bin/activate
 pip install -e ".[llava,data,dev]"
 ```
 
-NF4 量化需要 CUDA 和 bitsandbytes；默认配置使用非量化 bf16。为避免原始 LLaVA-1.5 与新版本 Transformers/PEFT API 漂移，可选依赖约束在原实现兼容的 Transformers 4.31 与 PEFT 0.4 系列。正式训练不会联网取权重。
+NF4 量化需要 CUDA 和 bitsandbytes；默认配置使用非量化 bf16。为避免原始 LLaVA-1.5 与新版本 Transformers/PEFT API 漂移，可选依赖约束在原实现兼容的 Transformers 4.31 与 PEFT 0.4 系列。环境创建阶段需要联网安装依赖和 LLaVA 源码，但正式训练只读取本地模型权重，不会联网取权重。
 
 ## 下载并放置模型
 
