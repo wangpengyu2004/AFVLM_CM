@@ -2,7 +2,7 @@ method:
   name: fedcompass
   params:
     min_local_steps: 2
-    max_local_steps: 40
+    max_local_steps: 10000
     group_window: 0.25
 federation:
   mode: semi_asynchronous

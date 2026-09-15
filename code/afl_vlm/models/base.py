@@ -28,6 +28,7 @@ class TrainConfig:
     gradient_hook: Any | None = None
     step_hook: Any | None = None
     context: dict[str, Any] = field(default_factory=dict)
+    planned_optimizer_steps: int = 1
     max_local_steps: int | None = None
 
 

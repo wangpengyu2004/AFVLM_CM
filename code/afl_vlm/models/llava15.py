@@ -271,24 +271,30 @@ class Llava15Adapter(ModelAdapter):
         losses, steps, hook_metadata = [], 0, {}
         self.model.train()
         self.model.zero_grad(set_to_none=True)
-        for _epoch in range(train_config.local_epochs):
+        epoch = 0
+        while train_config.max_local_steps is not None or epoch < train_config.local_epochs:
             indices = list(range(len(samples)))
             rng.shuffle(indices)
-            for offset in range(0, len(indices), train_config.batch_size):
-                batch_indices = indices[offset : offset + train_config.batch_size]
+            micro_batches = [
+                indices[offset : offset + train_config.batch_size]
+                for offset in range(0, len(indices), train_config.batch_size)
+            ]
+            for window_start in range(0, len(micro_batches), train_config.gradient_accumulation):
+                window = micro_batches[
+                    window_start : window_start + train_config.gradient_accumulation
+                ]
                 accumulated = 0.0
-                for index in batch_indices:
-                    encoded = self._encode(samples[index], train_config.max_text_length)
-                    base_loss = self.model(**encoded).loss / max(1, len(batch_indices))
-                    loss = (
-                        train_config.loss_hook(base_loss, self, encoded, train_config.context)
-                        if train_config.loss_hook
-                        else base_loss
-                    )
-                    (loss / train_config.gradient_accumulation).backward()
-                    accumulated += float(loss.detach().cpu())
-                if (offset // train_config.batch_size + 1) % train_config.gradient_accumulation:
-                    continue
+                for batch_indices in window:
+                    for index in batch_indices:
+                        encoded = self._encode(samples[index], train_config.max_text_length)
+                        base_loss = self.model(**encoded).loss / len(batch_indices)
+                        loss = (
+                            train_config.loss_hook(base_loss, self, encoded, train_config.context)
+                            if train_config.loss_hook
+                            else base_loss
+                        )
+                        (loss / len(window)).backward()
+                        accumulated += float(loss.detach().cpu())
                 for name, parameter in self.named_federated_parameters():
                     if parameter.grad is not None:
                         gradient_sum[name] = gradient_sum[name] + parameter.grad.detach().cpu()
@@ -297,11 +303,14 @@ class Llava15Adapter(ModelAdapter):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 steps += 1
-                losses.append(accumulated / len(batch_indices))
+                losses.append(accumulated / len(window))
                 if train_config.step_hook:
                     hook_metadata.update(
                         train_config.step_hook(
-                            self, steps, train_config.max_local_steps or steps, train_config.context
+                            self,
+                            steps,
+                            train_config.planned_optimizer_steps,
+                            train_config.context,
                         )
                     )
                 if (
@@ -309,6 +318,7 @@ class Llava15Adapter(ModelAdapter):
                     and steps >= train_config.max_local_steps
                 ):
                     break
+            epoch += 1
             if train_config.max_local_steps is not None and steps >= train_config.max_local_steps:
                 break
         if steps == 0:

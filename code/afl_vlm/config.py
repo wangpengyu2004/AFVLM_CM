@@ -126,6 +126,8 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
             raise ValueError(f"training.{key} must be positive")
     if float(training.get("learning_rate", 0.0)) <= 0:
         raise ValueError("training.learning_rate must be positive")
+    if int(config["federation"].get("rounds", 0)) <= 0:
+        raise ValueError("federation.rounds must be positive")
     evaluation = config["evaluation"]
     if evaluation.get("protocol") != "server_global":
         raise ValueError("evaluation.protocol must be server_global")

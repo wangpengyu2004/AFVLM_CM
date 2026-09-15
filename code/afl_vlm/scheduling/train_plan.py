@@ -34,18 +34,45 @@ def _duration(client: ClientSpec, steps: int) -> float:
     return client.base_training_cost * steps / client.speed_factor
 
 
+def optimizer_steps_for_epochs(
+    num_samples: int,
+    local_epochs: int,
+    batch_size: int,
+    gradient_accumulation: int,
+) -> int:
+    """Return the optimizer steps implied by epoch-controlled local training."""
+    values = (num_samples, local_epochs, batch_size, gradient_accumulation)
+    if any(value <= 0 for value in values):
+        raise ValueError("Sample count and local-training controls must be positive")
+    micro_batches = math.ceil(num_samples / batch_size)
+    return local_epochs * math.ceil(micro_batches / gradient_accumulation)
+
+
 def build_train_plan(
     clients: Iterable[ClientSpec],
     rounds: int,
-    base_local_steps: int,
+    local_epochs: int,
+    batch_size: int,
+    gradient_accumulation: int,
     mode: str,
     method_params: Mapping[str, Any] | None = None,
 ) -> list[ScheduledEvent]:
-    """Build method-independent async jobs or the declared scheduling variant."""
+    """Build jobs whose ordinary workload is derived only from local epochs.
+
+    ``local_steps`` is expected-work metadata for ordinary methods.  FedCompass
+    is the sole current scheduling variant that replaces it with a bounded,
+    compute-aware step allocation.
+    """
     specs = sorted(clients, key=lambda item: item.id)
     params = dict(method_params or {})
-    if rounds <= 0 or base_local_steps <= 0:
-        raise ValueError("rounds and base_local_steps must be positive")
+    if rounds <= 0:
+        raise ValueError("rounds must be positive")
+    nominal_steps = {
+        item.id: optimizer_steps_for_epochs(
+            item.num_samples, local_epochs, batch_size, gradient_accumulation
+        )
+        for item in specs
+    }
     events: list[ScheduledEvent] = []
     available = {item.id: item.initial_availability for item in specs}
     for local_round in range(rounds):
@@ -54,15 +81,15 @@ def build_train_plan(
         else:
             round_start = 0.0
         provisional: list[ScheduledEvent] = []
-        nominal = [_duration(item, base_local_steps) for item in specs]
+        nominal = [_duration(item, nominal_steps[item.id]) for item in specs]
         compass_target = max(nominal) if mode == "semi_asynchronous" else 0.0
         for client in specs:
-            steps = base_local_steps
+            steps = nominal_steps[client.id]
             if mode == "semi_asynchronous":
                 steps = round(compass_target * client.speed_factor / client.base_training_cost)
                 steps = max(
                     int(params.get("min_local_steps", 1)),
-                    min(int(params.get("max_local_steps", base_local_steps * 4)), steps),
+                    min(int(params.get("max_local_steps", max(nominal_steps.values()) * 4)), steps),
                 )
             start = (
                 round_start

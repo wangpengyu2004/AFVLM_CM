@@ -11,7 +11,6 @@ training:
 
 federation:
   rounds: 10
-  base_local_steps: 10
   mode: asynchronous
   system_profile: null
 
