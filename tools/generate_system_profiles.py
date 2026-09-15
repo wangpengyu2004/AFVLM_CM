@@ -10,7 +10,7 @@ import random
 import re
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -268,7 +268,7 @@ def create_profile(
     manifest = {
         "schema_version": 1,
         "name": name,
-        "created_utc": datetime.now(UTC).isoformat(),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_commit": _source_commit(root),
         "plan_source": reuse_plans_from or "generated_from_local_data",
         "run_seed": seed,
