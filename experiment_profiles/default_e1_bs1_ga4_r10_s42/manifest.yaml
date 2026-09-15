@@ -1,0 +1,79 @@
+schema_version: 1
+name: default_e1_bs1_ga4_r10_s42
+created_utc: '2026-09-15T16:33:22.531819+00:00'
+source_commit: d445f466012172217243722e0af0753701718e50
+plan_source: current
+run_seed: 42
+training:
+  local_epochs: 1
+  batch_size: 1
+  gradient_accumulation: 4
+  learning_rate: 2.0e-05
+  max_text_length: 512
+  optimizer: adamw
+federation:
+  rounds: 10
+settings:
+- 2
+- 5
+- 10
+methods:
+- adamasfl
+- fedadam
+- fedasmu
+- fedasync
+- fedavg
+- fedbuff
+- fedcompass
+- fedprox
+- local
+- masfl
+- ours
+- pilot
+- unifed_lora
+files_sha256:
+  configs/10clients/adamasfl.yaml: 02fec1e9411b76c8f3f20e525032b97669e612fa7a7dce4005dad4f09df80cb4
+  configs/10clients/fedadam.yaml: 67071c9afb112c197ccb1342b4d3bc5dd44627b79a23ef0282f16d808682812e
+  configs/10clients/fedasmu.yaml: b2389181bff8a9a1df0263efb11fe65b5dfcec5b2ee505c49d33205fcc097101
+  configs/10clients/fedasync.yaml: b22eeff42f559ac07be6cfbc77063ac4f6e6ef788b7aa69eafe6eced06d23e81
+  configs/10clients/fedavg.yaml: 50d0870aa7f826639c8f733adb3c35b0e98f0044b477c4890d555530dc44986f
+  configs/10clients/fedbuff.yaml: 196969114f9fa5d84644e6785e84e8bf3a4efb5eaa8a524dc7761c819cd36603
+  configs/10clients/fedcompass.yaml: de42413dc5b6f4e3b877252203a02d5047739686a4afd09b361dbf0703ed6db9
+  configs/10clients/fedprox.yaml: 7ab3b7e1f847ed99f0ddb3a0d89ed955c084cbe239110f550222df835fe4ded0
+  configs/10clients/local.yaml: 023f806239ac8231bcb596a8f44ca015c798a15f15cc5a5a75e6180737f1253c
+  configs/10clients/masfl.yaml: be76205e4e3e5f5e5ccac9f56d3254236cd226743972189d6e6e02b04d044bd4
+  configs/10clients/ours.yaml: 01b4551be68108b3a03cd672368abc53ace9ef11c7b58ca9444af792e5818cad
+  configs/10clients/pilot.yaml: c2a9dafb599ed2a91c19a3bfcf8dce9a671871542d36d5a1ce68095092719aba
+  configs/10clients/unifed_lora.yaml: 90a50c3624055c5bab3eccd91818af920e5590c5f78ffd31dfbe02aace6bc693
+  configs/2clients/adamasfl.yaml: 09ee2cef5d701233eb87e7078f39cbfadcf9a33a8227b73911e9494766f79ada
+  configs/2clients/fedadam.yaml: 5be077ebb5248635fd99ffad38f7265e04ee96f61c6422ed1c17e189d62acd47
+  configs/2clients/fedasmu.yaml: 735f040de1d24c5ea111eeb9dd93e0147e6fd2ecb9d809dd416979b21ad90aed
+  configs/2clients/fedasync.yaml: 16a188898d6c5c2a98adc5875cadf21f01cc7cd6b5eba490bed1d822c6496826
+  configs/2clients/fedavg.yaml: 41a14f2d0451a068e07ac0c7cf56526cf87fb073f0121b8d9aafbcd33ae2906c
+  configs/2clients/fedbuff.yaml: 97d3dd5dfe85808887dd4bdf48b9937efa61de0b4af32a74e384b244719f49bb
+  configs/2clients/fedcompass.yaml: ca6edb928f9681b820d76c8e733f99ead5899166daa2b7dc9305c1f387a24e2a
+  configs/2clients/fedprox.yaml: cbd791499828248ea5a51c37cfe77c636b637d08fb3ca914cb784eb49c90dd8f
+  configs/2clients/local.yaml: 76809683d9d8ad4e515c0f28a9dd3580bdd6873cfc25787ee65c288d8e844f39
+  configs/2clients/masfl.yaml: a3c3635e4e6d52d2fe1dfbaf6cbc2690dbaf6f87ce28413e65031aafcafc5aa7
+  configs/2clients/ours.yaml: 3aace97eaf4c458b7ce943e15fa2b2148f165de9a214c863edad9ee8618a7bab
+  configs/2clients/pilot.yaml: a03d520104e7a16e8cd1870d33f71d3f0ddc779b2bff9d185bf2d56e63d3a9ce
+  configs/2clients/unifed_lora.yaml: 0424f1a6e3693ad4dc2a038929bbdee74c3f295ad70187127039854a315a25d4
+  configs/5clients/adamasfl.yaml: 9931f5213c9b7b2b7bd00ccf4960fff18402901f4fd13323ae34e98c353bdd3f
+  configs/5clients/fedadam.yaml: 4557f3d7a7f8f265468343a330eb4213c093518b8e44f3ac0063638da3b8aa53
+  configs/5clients/fedasmu.yaml: 5e155c97fb9182c93827c61954a112e6aa0fc41a270ebf4ad4540ce45beeb8cf
+  configs/5clients/fedasync.yaml: da5b1ca5fde1d6f0f7f765357da34d4ae2c7a5032a9d3ee600866b7df012f75c
+  configs/5clients/fedavg.yaml: 73de3d149367e0a8be05f912e2465e7d3a3b47303c5b2cfc8eb7a40437b8735e
+  configs/5clients/fedbuff.yaml: 0b72137e7b94d0f9637c3cacd78add7a31763682c0248d62e9f9ae0ce5d6cd93
+  configs/5clients/fedcompass.yaml: ba38d2ecfb6316bcd0bc1a3c370eef1b4e46d84ba4ea0138a1db7062f84aa760
+  configs/5clients/fedprox.yaml: deb044982cb20af28406481e06a47ea364a4a0bae1dad446d3849e4cfb81ae6e
+  configs/5clients/local.yaml: 00f39f028ecac92015e8eb43afe2fdf29d3049352f3d094bbe191866e6cee185
+  configs/5clients/masfl.yaml: 30a52e3976de6d7bb9babe580bfb46d7c9b9e0f2010fb0ffe58687c3889da88a
+  configs/5clients/ours.yaml: d240e843d78ec71d4f344c3de71cc617693061ba20d1c24f0e4c66a5d1357ffd
+  configs/5clients/pilot.yaml: 4637e00daed640cd130079dd47c32d46b5d4681c6206904a35d76374899053cd
+  configs/5clients/unifed_lora.yaml: a2c1916cfa541c4be5052b8d652ff478acd7a77a67684f73647c325da484e9ba
+  plans/10clients/async_train_plan.json: 0365f1e7e1747051136bca7534385593eb46488902da450adf8418fabb38e317
+  plans/10clients/system_profile.json: 58953181fdf4afd254f84829d7694efaed794ef8ff671b2e6aad003ff06f0e57
+  plans/2clients/async_train_plan.json: 75f6db0096914a33b752e0cce66d00bfb7ef80d09aef730c9199936831e51bb9
+  plans/2clients/system_profile.json: ab2c85405da8f336ce28da05592ba26ce7ed6594f4aee096b3492db155a59011
+  plans/5clients/async_train_plan.json: de18c045bd316b3dac5e9246e57fe191f68f99a6f4bcef764891c6ac868076a6
+  plans/5clients/system_profile.json: 9c1bcc5e2087d1357a4f4391449de261406758f79c9e619a250e1a3a25934b78

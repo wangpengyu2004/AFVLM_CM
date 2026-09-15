@@ -1,0 +1,76 @@
+run:
+  seed: 42
+training:
+  local_epochs: 1
+  batch_size: 1
+  gradient_accumulation: 4
+  learning_rate: 2.0e-05
+  max_text_length: 512
+  optimizer: adamw
+federation:
+  rounds: 10
+  mode: synchronous
+  system_profile: experiment_profiles/default_e1_bs1_ga4_r10_s42/plans/10clients/system_profile.json
+  train_plan: experiment_profiles/default_e1_bs1_ga4_r10_s42/plans/10clients/async_train_plan.json
+evaluation:
+  protocol: server_global
+  interval_unit: server_updates
+  eval_every_server_updates: 10
+  periodic_split: validation
+  final_split: final
+  generation_max_new_tokens: 64
+  grounding_iou_threshold: 0.5
+output:
+  directory: runs/llava/afvlm_cm/profiles/default_e1_bs1_ga4_r10_s42/10clients/pilot/seed42
+  overwrite: false
+  save_checkpoint: true
+  event_log: true
+model:
+  adapter: llava15
+  model_path: pretrained/llava-v1.5-7b
+  vision_tower_path: pretrained/clip-vit-large-patch14-336
+  local_files_only: true
+  dtype: bf16
+  quantization: none
+  device_map: auto
+  gradient_checkpointing: true
+  conversation_template: v1
+  max_new_tokens: 64
+  mm_projector_lr: 2.0e-05
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    bias: none
+    target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    train_mm_projector: false
+dataset:
+  name: afvlm_cm
+  clients_per_task: 10
+  total_clients: 60
+  partition_root: data/AFVLM_CM/partitioned/10_clients
+  image_root: data/AFVLM_CM/dataset
+  require_images: true
+  tasks:
+  - cls
+  - caption
+  - vqa
+  - chart_vqa
+  - visual_reasoning
+  - grounding
+method:
+  name: pilot
+  params:
+    adapter_bottleneck: 64
+    difference_weight: 0.1
+    balance_weight: 0.01
+    router_z_weight: 0.001
+    text_neighbors: 3
+experiment_profile:
+  name: default_e1_bs1_ga4_r10_s42
+  immutable_snapshot: true

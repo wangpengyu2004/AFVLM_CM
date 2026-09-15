@@ -1,6 +1,6 @@
 # AFVLM-CM Implementation Report
 
-This report records the local working-tree refactor. No training, model loading, model download, Git commit, or GitHub push was performed.
+This report records the implementation scope and engineering validation. No training, model loading, or model/image download was performed as part of the implementation.
 
 ## Files added
 
@@ -83,7 +83,9 @@ This report records the local working-tree refactor. No training, model loading,
 - `plans/afvlm_cm/5clients/async_train_plan.json`
 - `plans/afvlm_cm/10clients/system_profile.json`
 - `plans/afvlm_cm/10clients/async_train_plan.json`
-- `pretrained/README.md`
+- `experiment_profiles/README.md`
+- `experiment_profiles/default_e1_bs1_ga4_r10_s42/` (39 resolved configs,
+  three system profiles, three TrainPlans, and a hash manifest)
 - `scripts/evaluate.py`
 - `scripts/run_baselines.sh`
 - `scripts/run_one.sh`
@@ -223,6 +225,14 @@ The registered methods are `local`, `fedavg`, `fedprox`, `fedadam`, `fedasync`, 
 - `unifed_lora`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh unifed_lora 2` (replace 2 with 5 or 10).
 
 - `ours`: intentionally unavailable and excluded from `scripts/run_baselines.sh`.
+
+## Versioned parameter and TrainPlan profiles
+
+`tools/generate_system_profiles.py --profile <name>` creates a new immutable
+profile instead of overwriting the canonical plans. `--reuse_plans_from <name>`
+copies a compatible old plan when only non-scheduling parameters change. Both
+single and batch runners accept the profile as an optional final argument, for
+example `bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42`.
 
 ## Paper adaptations
 

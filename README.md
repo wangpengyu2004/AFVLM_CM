@@ -123,15 +123,168 @@ configs/
     └── 10clients/   # 13 个可直接运行配置
 ```
 
-同一规模的所有方法继承相同模型、LoRA、客户端优化器、学习率、本地 epoch、batch size、随机种子、数据与评估配置。`plans/afvlm_cm/{2,5,10}clients/system_profile.json` 是固定、方法无关的速度/网络/可用性画像；`async_train_plan.json` 是普通异步方法共同重放的基础作业计划。除 FedCompass 的本地工作量分配外，异步算法不得改变这些基础条件。
+同一规模的所有方法继承相同模型、LoRA、客户端优化器、学习率、本地 epoch、batch size、随机种子、数据与评估配置。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。每个 profile 同时保存完全解析后的 39 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
 
 普通方法的本地训练量只由 `training.local_epochs` 控制，不再同时设置通用的 `base_local_steps`。TrainPlan 中记录的 `local_steps` 是根据客户端样本数、batch size、梯度累积和 `local_epochs` 推导出的预计优化器步数，只用于虚拟耗时和算法钩子，不会截断普通客户端训练。FedCompass 是唯一例外：其计算能力感知调度器必须动态分配本地迭代，因此使用 `min_local_steps` / `max_local_steps` 作为方法专属边界。
 
-修改 `local_epochs`、batch size 或梯度累积后，需要重新生成与训练量匹配的共享计划：
+仓库已保存初始快照 `default_e1_bs1_ga4_r10_s42`。查看已有 profile：
 
 ```bash
-python tools/generate_system_profiles.py
+python tools/generate_system_profiles.py --list
 ```
+
+修改参数后创建一个新 profile。若修改了 `local_epochs`、batch size、梯度累积或 rounds，必须从服务器本地数据生成新 Plan：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile e2_bs1_ga4_r10_s42
+```
+
+如果只修改学习率、模型参数或方法专属参数，且本地训练量与 rounds 没变，可以显式复用旧 Plan：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile lr1e5_alpha03 \
+  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+```
+
+profile 名称只允许字母、数字、点、下划线和连字符。同名目录默认拒绝覆盖；要保留旧实验时必须使用新名称。生成器会先检查复用 Plan 与当前 `local_epochs`、batch size、梯度累积和 rounds 是否兼容。
+
+## 从修改参数到服务器运行的完整流程
+
+以下命令均在服务器仓库根目录执行。服务器本地的 `data/`、`pretrained/`、`runs/`、`wandb/`、`outputs/` 和 `checkpoints/` 已由根目录 `.gitignore` 排除，正常的 `fetch + fast-forward merge` 不会删除或提交这些目录。不要使用 `git clean -fdx`、`git reset --hard` 或手动删除上述目录。
+
+### 1. 拉取代码并检查本地资源
+
+```bash
+cd /userhome/bcx/AFVLM_CM
+git switch main
+git fetch origin main
+git merge --ff-only origin/main
+conda activate afvlm-cm
+
+test -d data/AFVLM_CM/partitioned
+test -f pretrained/llava-v1.5-7b/config.json
+test -f pretrained/clip-vit-large-patch14-336/config.json
+```
+
+三个 `test` 命令没有输出且退出码为 0，表示路径存在。数据与权重只保存在服务器，不需要上传 GitHub。
+
+### 2. 修改配置
+
+公共训练参数在 `configs/base.yaml`，LoRA 和本地权重路径在 `configs/models/llava15_7b_lora.yaml`，算法专属参数在 `configs/methods/<method>.yaml`。例如：
+
+```bash
+nano configs/base.yaml
+nano configs/methods/fedasync.yaml
+```
+
+修改后先判断是否需要新 Plan：
+
+| 修改内容 | 是否可复用旧 Plan | 操作 |
+|---|---:|---|
+| 学习率、最大文本长度、LoRA 参数、评估间隔 | 是 | 创建新 profile 并指定 `--reuse_plans_from` |
+| FedProx `mu`、FedAsync `alpha`、FedBuff `buffer_size` 等方法参数 | 是 | 创建新 profile 并指定 `--reuse_plans_from` |
+| `local_epochs`、`batch_size`、`gradient_accumulation` | 否 | 创建新 profile，不传 `--reuse_plans_from` |
+| `federation.rounds`、随机种子或系统异构性生成规则 | 否 | 创建新 profile，不传 `--reuse_plans_from` |
+| 只把客户端档位从 2 换成 5 或 10 | 不需要修改配置 | 运行时修改第二个参数 |
+
+### 3A. 参数不影响 Plan：复用旧 Plan
+
+假设只把学习率改为 `1e-5`、FedAsync `alpha` 改为 `0.3`：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile lr1e5_alpha03 \
+  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+```
+
+该命令复用完全相同的客户端速度、网络延迟、可用时间和到达顺序，但会把当前全部配置解析后保存到新 profile，适合公平的算法参数对比。
+
+### 3B. 参数影响 Plan：生成新 Plan
+
+假设把 `local_epochs` 改为 2、`rounds` 改为 20：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile e2_bs1_ga4_r20_s42
+```
+
+此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 39 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
+
+如果需要新的随机种子，可显式指定：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile e2_bs1_ga4_r20_s123 \
+  --seed 123
+```
+
+### 4. 检查新 profile
+
+```bash
+python tools/generate_system_profiles.py --list
+python tools/validate_repository.py
+```
+
+profile 的固定内容位于：
+
+```text
+experiment_profiles/<profile>/
+├── manifest.yaml
+├── configs/{2,5,10}clients/*.yaml
+└── plans/{2,5,10}clients/
+    ├── system_profile.json
+    └── async_train_plan.json
+```
+
+`manifest.yaml` 记录创建时间、源提交、训练参数、rounds、方法清单和文件 SHA-256。不要直接编辑 profile 内部文件；参数有变化时创建新名称。若提示 `Experiment profile already exists`，说明旧实验受保护，应换一个 profile 名称。
+
+### 5. 运行单个方法或全部 baseline
+
+```bash
+# 单个方法：<method> <2|5|10> <profile>
+CUDA_VISIBLE_DEVICES=0 \
+bash scripts/run_one.sh fedasync 2 lr1e5_alpha03
+
+# 同一 profile 下依次运行全部 12 个 baseline
+CUDA_VISIBLE_DEVICES=0 \
+bash scripts/run_baselines.sh 2 lr1e5_alpha03
+```
+
+创建 profile 会为每种方法写入唯一输出路径。上述单方法结果位于：
+
+```text
+runs/llava/afvlm_cm/profiles/lr1e5_alpha03/2clients/fedasync/seed42/
+```
+
+`configs/base.yaml` 中的 `output.directory: runs/afvlm_cm` 只是公共回退值；普通实验配置会将其覆盖为方法目录，profile 配置还会进一步覆盖为上述独立目录。因此看到 `runs/llava/afvlm_cm/...` 是预期行为。
+
+### 6. 切回旧参数和旧 Plan
+
+不需要恢复或再次编辑 `configs/base.yaml`，直接把运行命令的第三个参数换回旧 profile：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42
+```
+
+正式论文实验建议始终传入第三个 profile 参数。省略第三个参数时使用当前可变的 `configs/` 与兼容目录，只适合临时调试，不适合作为最终可复现实验记录。
+
+### 7. 保存服务器上新建的实验定义到 GitHub
+
+服务器生成的 profile 可以提交，数据、权重和运行输出仍会被忽略。先检查提交范围，不要使用 `git add -A`：
+
+```bash
+git status --short
+git add configs/base.yaml \
+  configs/methods/fedasync.yaml \
+  experiment_profiles/lr1e5_alpha03
+git commit -m "chore(experiment): add lr1e5 alpha03 profile"
+git push origin main
+```
+
+将方法配置路径和 profile 名替换为本次实际内容。若服务器只负责运行、实验定义统一由电脑端维护，则无需在服务器执行这一提交步骤。
 
 本地优化器策略明确为 **reset per client job**：每个作业从其下载的联邦状态创建新的 AdamW，一、二阶矩不跨作业保留。该策略对所有比较方法一致；FedAdam 等服务器优化器状态独立保存在方法状态中。
 
@@ -162,7 +315,7 @@ FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前
 
 ## 运行单个方法
 
-接口为 `bash scripts/run_one.sh <method> <setting>`，其中 setting 为 2、5 或 10。以下是 2 clients/task 的每个正式 baseline 命令：
+接口为 `bash scripts/run_one.sh <method> <setting> [profile]`，其中 setting 为 2、5 或 10。省略 profile 时使用原始兼容配置；提供 profile 时使用对应的不可变配置快照。以下是 2 clients/task 的每个正式 baseline 命令：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh local 2
@@ -177,6 +330,19 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh masfl 2
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh adamasfl 2
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh pilot 2
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh unifed_lora 2
+```
+
+使用初始快照运行或切换回旧实验：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedavg 2 default_e1_bs1_ga4_r10_s42
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 5 default_e1_bs1_ga4_r10_s42
+```
+
+profile 结果写入独立目录，例如：
+
+```text
+runs/llava/afvlm_cm/profiles/default_e1_bs1_ga4_r10_s42/2clients/fedavg/seed42/
 ```
 
 将最后一个参数改为 5 或 10 即选择对应数据集；例如：
@@ -201,6 +367,12 @@ python scripts/run_experiment.py \
 bash scripts/run_baselines.sh 2
 bash scripts/run_baselines.sh 5
 bash scripts/run_baselines.sh 10
+```
+
+对一个保存的 profile 批量运行：
+
+```bash
+bash scripts/run_baselines.sh 2 default_e1_bs1_ga4_r10_s42
 ```
 
 ## 评估与输出
