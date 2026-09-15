@@ -24,6 +24,7 @@ from afl_vlm.scheduling.train_plan import (
     load_system_profile,
     load_train_plan,
     mean_staleness,
+    optimizer_steps_for_epochs,
 )
 
 
@@ -151,16 +152,33 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
     method.configure_model(model, profiles)
     server = FederatedServer(model, method, len(clients))
     federation = config["federation"]
+    training = config["training"]
     if method.capabilities.requires_custom_scheduler or method.capabilities.mode == "synchronous":
         plan = build_train_plan(
             profiles,
             int(federation["rounds"]),
-            int(federation["base_local_steps"]),
+            int(training["local_epochs"]),
+            int(training["batch_size"]),
+            int(training["gradient_accumulation"]),
             method.capabilities.mode,
             config["method"].get("params", {}),
         )
     else:
         plan = load_train_plan(federation["train_plan"])
+        expected_steps = {
+            item.id: optimizer_steps_for_epochs(
+                item.num_samples,
+                int(training["local_epochs"]),
+                int(training["batch_size"]),
+                int(training["gradient_accumulation"]),
+            )
+            for item in profiles
+        }
+        if any(event.local_steps != expected_steps[event.client_id] for event in plan):
+            raise ValueError(
+                "The persisted TrainPlan does not match training.local_epochs, batch_size, "
+                "and gradient_accumulation; regenerate it with tools/generate_system_profiles.py"
+            )
     records = event_records(plan)
     _write_json(output / "train_plan.json", records)
     record_by_event = {int(item["event_id"]): item for item in records}
@@ -187,7 +205,6 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
     eval_interval = int(config["evaluation"].get("eval_every_server_updates", 0))
     periodic_split = str(config["evaluation"].get("periodic_split", "validation"))
     final_split = str(config["evaluation"].get("final_split", "final"))
-    training = config["training"]
     for virtual_time, _, kind, event in timeline:
         last_virtual_time = max(last_virtual_time, virtual_time)
         if kind == "start":
@@ -207,7 +224,10 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
             learning_rate=float(training["learning_rate"]),
             max_text_length=int(training["max_text_length"]),
             seed=_seed(seed, event.client_id, event.local_round),
-            max_local_steps=event.local_steps,
+            planned_optimizer_steps=event.local_steps,
+            max_local_steps=event.local_steps
+            if method.capabilities.requires_local_step_control
+            else None,
         )
         fresh_state = (
             server.state
@@ -271,8 +291,11 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
                 "arrival_time": event.arrival_time,
                 "accepted": any(item.applied_weight > 0 for item in results),
                 "aggregation_weight": sum(item.applied_weight for item in results),
-                "assigned_local_steps": event.local_steps,
-                "local_steps": update.optimizer_steps,
+                "planned_local_steps": event.local_steps,
+                "assigned_local_steps": event.local_steps
+                if method.capabilities.requires_local_step_control
+                else None,
+                "optimizer_steps": update.optimizer_steps,
                 "speed_factor": event.speed_factor,
                 "group_id": event.group_id,
                 "result_metadata": [item.metadata for item in results],

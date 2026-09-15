@@ -5,6 +5,12 @@ LLaVA-1.5-7B parameters are never placed in an update or federated checkpoint.
 For fair comparison, every client job creates a fresh AdamW optimizer; local
 optimizer moments do not persist across jobs.
 
+For all ordinary methods, `training.local_epochs` is the sole local-work
+controller. The TrainPlan's `local_steps` value is derived from client sample
+count, batch size, gradient accumulation, and local epochs; it estimates virtual
+duration but does not truncate training. FedCompass is the intentional exception
+because bounded local-iteration allocation is part of its scheduler.
+
 Primary evaluation is always the current server federated state at a common
 server-update checkpoint and the final server state after method finalization.
 Local-only is the sole exception because no server model exists. Pilot's
@@ -34,8 +40,8 @@ the primary score.
 
 ### FedCompass (ICLR 2024)
 
-The shared scheduler derives bounded `local_steps_k` from persisted client
-speed and base training cost, then groups near-simultaneous completions for
+The shared scheduler derives bounded `local_steps_k` from each client's
+epoch-derived nominal work, persisted speed, and base training cost, then groups near-simultaneous completions for
 semi-asynchronous aggregation. It is therefore a compute-aware scheduler, not
 a renamed FedAsync decay. The implementation reuses AFVLM-CM's virtual clock
 and adapts the optimized state from a full model to LoRA.

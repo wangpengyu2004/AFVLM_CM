@@ -107,6 +107,7 @@ class MethodCapabilities:
     requires_buffer: bool = False
     requires_client_speed: bool = False
     requires_custom_scheduler: bool = False
+    requires_local_step_control: bool = False
     requires_custom_adapter: bool = False
     requires_fresh_global_during_local_training: bool = False
     requires_local_state: bool = False

@@ -9,6 +9,8 @@ import random
 import sys
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "code"))
 
@@ -67,6 +69,9 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    base_config = yaml.safe_load((args.root / "configs" / "base.yaml").read_text(encoding="utf-8"))
+    training = base_config["training"]
+    rounds = int(base_config["federation"]["rounds"])
     for setting in (2, 5, 10):
         target = args.root / "plans" / "afvlm_cm" / f"{setting}clients"
         target.mkdir(parents=True, exist_ok=True)
@@ -75,8 +80,10 @@ def main() -> None:
         )
         plan = build_train_plan(
             load_system_profile(target / "system_profile.json"),
-            rounds=10,
-            base_local_steps=10,
+            rounds=rounds,
+            local_epochs=int(training["local_epochs"]),
+            batch_size=int(training["batch_size"]),
+            gradient_accumulation=int(training["gradient_accumulation"]),
             mode="asynchronous",
         )
         (target / "async_train_plan.json").write_text(

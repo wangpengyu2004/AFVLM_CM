@@ -27,7 +27,10 @@ from afl_vlm.models.base import weighted_mean_states
 class FedCompass(Method):
     name = "fedcompass"
     capabilities = MethodCapabilities(
-        mode="semi_asynchronous", requires_client_speed=True, requires_custom_scheduler=True
+        mode="semi_asynchronous",
+        requires_client_speed=True,
+        requires_custom_scheduler=True,
+        requires_local_step_control=True,
     )
     allowed_params = {"min_local_steps", "max_local_steps", "group_window"}
 

@@ -63,6 +63,7 @@ class FederatedClient:
                     "method": method.name,
                     "base_state": clone_state(global_state),
                 },
+                planned_optimizer_steps=train_config.planned_optimizer_steps,
                 max_local_steps=train_config.max_local_steps,
             )
             result = model.local_train(self.samples, configured, self.task)

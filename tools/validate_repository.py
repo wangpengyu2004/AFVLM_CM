@@ -14,6 +14,11 @@ sys.path.insert(0, str(ROOT / "code"))
 from afl_vlm.config import load_config, validate_config  # noqa: E402
 from afl_vlm.data.afvlm_cm import scan_partitions  # noqa: E402
 from afl_vlm.methods.registry import method_names  # noqa: E402
+from afl_vlm.scheduling.train_plan import (  # noqa: E402
+    load_system_profile,
+    load_train_plan,
+    optimizer_steps_for_epochs,
+)
 
 EXPECTED_METHODS = (
     "local",
@@ -100,7 +105,7 @@ def main() -> None:
                 for section in ("run", "model", "dataset", "training", "evaluation"):
                     if candidate[section] != reference[section]:
                         errors.append(f"{method}/{setting} changes shared {section} settings")
-                for key in ("rounds", "base_local_steps", "system_profile", "train_plan"):
+                for key in ("rounds", "system_profile", "train_plan"):
                     if candidate["federation"][key] != reference["federation"][key]:
                         errors.append(f"{method}/{setting} changes shared federation.{key}")
                 expected_output = f"runs/llava/afvlm_cm/{setting}clients/{method}/seed42"
@@ -115,6 +120,22 @@ def main() -> None:
                 method_cfg = resolved[method]
                 if method_cfg["federation"]["train_plan"] != expected_plan:
                     errors.append(f"{method}/{setting} does not share the base TrainPlan")
+            profile = load_system_profile(ROOT / reference["federation"]["system_profile"])
+            plan = load_train_plan(ROOT / expected_plan)
+            training = reference["training"]
+            expected_steps = {
+                item.id: optimizer_steps_for_epochs(
+                    item.num_samples,
+                    int(training["local_epochs"]),
+                    int(training["batch_size"]),
+                    int(training["gradient_accumulation"]),
+                )
+                for item in profile
+            }
+            if len(plan) != len(profile) * int(reference["federation"]["rounds"]):
+                errors.append(f"{setting} clients/task: TrainPlan event count mismatch")
+            if any(item.local_steps != expected_steps[item.client_id] for item in plan):
+                errors.append(f"{setting} clients/task: TrainPlan does not match local_epochs")
         except Exception as exc:
             errors.append(f"dataset {setting}: {exc}")
     actual: dict[str, object] | None = None
