@@ -247,6 +247,130 @@ class Llava15Adapter(ModelAdapter):
             encoded["labels"] = labels
         return encoded
 
+    def _encode_batch(
+        self, samples: list[Any], max_length: int, include_answer: bool = True
+    ) -> dict[str, Any]:
+        """Collate samples into one dynamically padded multimodal model batch."""
+        if not samples:
+            raise ValueError("Cannot encode an empty LLaVA batch")
+        (
+            torch,
+            conversation_lib,
+            image_token,
+            image_index,
+            process_images,
+            tokenizer_image_token,
+            _,
+            _,
+            _,
+            _,
+            Image,
+            _,
+            _,
+            _,
+        ) = self._imports()
+        template = str(self._config.get("conversation_template", "v1"))
+        input_sequences: list[Any] = []
+        label_sequences: list[Any] = []
+
+        for sample in samples:
+            if not sample.image:
+                raise ValueError(f"LLaVA sample has no image: {sample.id}")
+            question = f"{image_token}\n{sample.instruction}"
+            conv = conversation_lib.conv_templates[template].copy()
+            conv.append_message(conv.roles[0], question)
+            conv.append_message(conv.roles[1], sample.answer if include_answer else None)
+            input_ids = tokenizer_image_token(
+                conv.get_prompt(), self.tokenizer, image_index, return_tensors="pt"
+            )[:max_length]
+            input_sequences.append(input_ids)
+
+            if include_answer:
+                prompt_conv = conversation_lib.conv_templates[template].copy()
+                prompt_conv.append_message(prompt_conv.roles[0], question)
+                prompt_conv.append_message(prompt_conv.roles[1], None)
+                prompt_ids = tokenizer_image_token(
+                    prompt_conv.get_prompt(),
+                    self.tokenizer,
+                    image_index,
+                    return_tensors="pt",
+                )
+                labels = input_ids.clone()
+                labels[: min(labels.shape[0], prompt_ids.shape[0])] = -100
+                label_sequences.append(labels)
+
+        sequence_length = max(sequence.shape[0] for sequence in input_sequences)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.unk_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("The LLaVA tokenizer has no usable padding token")
+
+        batch_size = len(input_sequences)
+        input_ids = torch.full(
+            (batch_size, sequence_length),
+            int(pad_token_id),
+            dtype=input_sequences[0].dtype,
+        )
+        attention_mask = torch.zeros((batch_size, sequence_length), dtype=torch.bool)
+        labels = (
+            torch.full((batch_size, sequence_length), -100, dtype=input_sequences[0].dtype)
+            if include_answer
+            else None
+        )
+        padding_side = str(getattr(self.tokenizer, "padding_side", "right"))
+        if padding_side not in {"left", "right"}:
+            raise ValueError(f"Unsupported tokenizer padding side: {padding_side}")
+        for row, sequence in enumerate(input_sequences):
+            length = sequence.shape[0]
+            target = (
+                slice(sequence_length - length, sequence_length)
+                if padding_side == "left"
+                else slice(0, length)
+            )
+            input_ids[row, target] = sequence
+            attention_mask[row, target] = True
+            if labels is not None:
+                labels[row, target] = label_sequences[row]
+
+        images: list[Any] = []
+        try:
+            for sample in samples:
+                with Image.open(sample.image) as handle:
+                    images.append(handle.convert("RGB"))
+            image_batch = process_images(images, self.image_processor, self.model.config)
+        finally:
+            for image in images:
+                image.close()
+        if isinstance(image_batch, list):
+            try:
+                image_batch = torch.stack(image_batch, dim=0)
+            except RuntimeError as exc:
+                shapes = [tuple(image.shape) for image in image_batch]
+                raise ValueError(
+                    f"Processed images cannot be stacked into one batch: {shapes}"
+                ) from exc
+        if image_batch.ndim == 3:
+            image_batch = image_batch.unsqueeze(0)
+        if image_batch.shape[0] != batch_size:
+            raise ValueError(
+                "Image processor returned a mismatched batch: "
+                f"expected {batch_size}, got {image_batch.shape[0]}"
+            )
+
+        encoded = {
+            "input_ids": input_ids.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
+            "images": image_batch.to(
+                device=self.device, dtype=next(self.model.parameters()).dtype
+            ),
+        }
+        if labels is not None:
+            encoded["labels"] = labels.to(self.device)
+        return encoded
+
     def local_train(
         self, task_batch_stream: Iterable[Any], train_config: TrainConfig, task_name: str
     ) -> TrainResult:
@@ -306,21 +430,23 @@ class Llava15Adapter(ModelAdapter):
                 ]
                 accumulated = None
                 for batch_indices in window:
-                    for index in batch_indices:
-                        encoded = self._encode(samples[index], train_config.max_text_length)
-                        base_loss = self.model(**encoded).loss / len(batch_indices)
-                        loss = (
-                            train_config.loss_hook(base_loss, self, encoded, train_config.context)
-                            if train_config.loss_hook
-                            else base_loss
-                        )
-                        (loss / len(window)).backward()
-                        detached_loss = loss.detach()
-                        accumulated = (
-                            detached_loss
-                            if accumulated is None
-                            else accumulated + detached_loss
-                        )
+                    encoded = self._encode_batch(
+                        [samples[index] for index in batch_indices],
+                        train_config.max_text_length,
+                    )
+                    base_loss = self.model(**encoded).loss
+                    loss = (
+                        train_config.loss_hook(base_loss, self, encoded, train_config.context)
+                        if train_config.loss_hook
+                        else base_loss
+                    )
+                    (loss / len(window)).backward()
+                    detached_loss = loss.detach()
+                    accumulated = (
+                        detached_loss
+                        if accumulated is None
+                        else accumulated + detached_loss
+                    )
                 if gradient_sum is not None:
                     for name, parameter in self.named_federated_parameters():
                         if parameter.grad is not None:

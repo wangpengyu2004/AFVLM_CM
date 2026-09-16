@@ -428,6 +428,8 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 
 本地进度按 optimizer step 计数，不按 gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
 
+`batch_size` 是每个 GPU worker 的真实多模态 micro-batch 大小：文本在当前 batch 内动态 padding，图像组成同一个 batch tensor，并通过一次 LLaVA forward/backward 处理。每个客户端的有效批量为 `batch_size × gradient_accumulation`；例如 `batch_size: 4`、`gradient_accumulation: 4` 对应有效批量 16。增大 `batch_size` 会提高单卡显存占用，修改后必须创建匹配的新实验 profile 和 TrainPlan。
+
 若需要把终端输出重定向到文件，建议同时打开 Python 非缓冲输出：
 
 ```bash
