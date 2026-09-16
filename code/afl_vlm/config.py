@@ -139,6 +139,9 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
         raise ValueError("evaluation.periodic_split must be validation or val")
     if evaluation.get("final_split") not in {"final", "test"}:
         raise ValueError("evaluation.final_split must be final or test")
+    output = config["output"]
+    if "progress_bar" in output and not isinstance(output["progress_bar"], bool):
+        raise ValueError("output.progress_bar must be true or false")
     method_cfg = config["method"]
     method = create_method(str(method_cfg["name"]), method_cfg.get("params", {}))
     configured_mode = str(config["federation"]["mode"])

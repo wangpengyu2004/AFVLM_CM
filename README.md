@@ -385,6 +385,40 @@ bash scripts/run_baselines.sh 10
 bash scripts/run_baselines.sh 2 default_e1_bs1_ga4_r10_s42
 ```
 
+### 命令行训练进度
+
+训练进度条默认开启，直接使用原有命令即可，不需要重新生成 system profile 或 TrainPlan：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42
+```
+
+命令行会依次显示：
+
+- 数据加载完成和 LLaVA 模型加载阶段提示；
+- `fedasync client updates`：当前已完成的客户端更新数 / TrainPlan 总更新数，并显示服务器版本、当前客户端和 staleness；
+- `local <client_id> r<round>`：当前客户端真实 optimizer step / 计划 optimizer step，并动态显示当前 loss；
+- `evaluate <task>`：定期 validation 和最终 test 时各任务已评估样本数。
+
+本地进度按 optimizer step 计数，不按 gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
+
+若需要把终端输出重定向到文件，建议同时打开 Python 非缓冲输出：
+
+```bash
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42 \
+  2>&1 | tee fedasync-2clients.log
+```
+
+如需关闭进度条，在准备创建新 profile 的基础配置中设置：
+
+```yaml
+output:
+  progress_bar: false
+```
+
+已经保存的不可变 profile 不需要补写该字段：缺省值就是 `true`。若要永久改变某个旧实验的显示选项，应创建新的配置 profile，而不是修改旧快照。
+
 ## 评估与输出
 
 项目采用常见异步联邦学习评估协议：以**成功的服务器模型更新数**作为评估间隔。每达到 `evaluation.eval_every_server_updates`，复制当前服务器联邦状态并在公共 validation 集上分别评估六个任务；评估过程不计入虚拟训练时间，也不改变训练状态。全部 TrainPlan 到达事件完成后，先执行方法的结尾处理（例如刷新 FedBuff 残余缓冲），再用最终服务器状态在公共 test 集上评估。

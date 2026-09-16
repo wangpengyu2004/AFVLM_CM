@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from tqdm.auto import tqdm
 
 from afl_vlm.config import resolved_public_config, validate_config
 from afl_vlm.data.afvlm_cm import AFVLMDataModule
@@ -95,6 +96,7 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
 
     run = config["run"]
     seed = int(run["seed"])
+    progress_enabled = bool(config["output"].get("progress_bar", True))
     random.seed(seed)
     np.random.seed(seed)
     output = Path(str(config["output"]["directory"])).resolve()
@@ -145,10 +147,19 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
         samples = data_module.get_client_train_data(item.client_id)
         clients[item.client_id] = FederatedClient(item.client_id, item.task, item.dataset, samples)
 
+    if progress_enabled:
+        tqdm.write(
+            f"[AFVLM-CM] data ready: {len(clients)} clients, "
+            f"{sum(len(client.samples) for client in clients.values())} training samples"
+        )
+        tqdm.write(f"[AFVLM-CM] loading model adapter: {config['model']['adapter']}")
     model = create_model(config["model"]["adapter"])
     model_config = dict(config["model"])
     model_config["max_text_length"] = config["training"]["max_text_length"]
+    model_config["progress_bar"] = progress_enabled
     model.load(model_config)
+    if progress_enabled:
+        tqdm.write("[AFVLM-CM] model ready; starting federated event replay")
     method.configure_model(model, profiles)
     server = FederatedServer(model, method, len(clients))
     federation = config["federation"]
@@ -205,6 +216,13 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
     eval_interval = int(config["evaluation"].get("eval_every_server_updates", 0))
     periodic_split = str(config["evaluation"].get("periodic_split", "validation"))
     final_split = str(config["evaluation"].get("final_split", "final"))
+    federation_progress = tqdm(
+        total=len(plan),
+        desc=f"{method.name} client updates",
+        unit="update",
+        dynamic_ncols=True,
+        disable=not progress_enabled,
+    )
     for virtual_time, _, kind, event in timeline:
         last_virtual_time = max(last_virtual_time, virtual_time)
         if kind == "start":
@@ -301,6 +319,13 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
                 "result_metadata": [item.metadata for item in results],
             },
         )
+        federation_progress.set_postfix(
+            server_version=server.version,
+            staleness=stale,
+            client=event.client_id,
+            refresh=False,
+        )
+        federation_progress.update(1)
         if (
             eval_interval > 0
             and server.version > 0
@@ -320,6 +345,7 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
                 },
             )
             last_evaluated_version = server.version
+    federation_progress.close()
     tail = server.finish()
     for result in tail:
         if "buffer_occupancy" in result.metadata:

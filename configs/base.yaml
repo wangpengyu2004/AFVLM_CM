@@ -28,3 +28,4 @@ output:
   overwrite: false
   save_checkpoint: true
   event_log: true
+  progress_bar: true

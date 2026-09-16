@@ -39,6 +39,7 @@ PyYAML==6.0.2
 huggingface-hub==0.27.1
 datasets==3.0.2
 matplotlib==3.9.2
+tqdm==4.66.5
 ruff==0.8.6
 
 # Install this repository as the editable `afl_vlm` package.

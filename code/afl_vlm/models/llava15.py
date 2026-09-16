@@ -7,6 +7,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from tqdm.auto import tqdm
+
 from afl_vlm.models.base import (
     LoRAState,
     ModelAdapter,
@@ -275,6 +277,18 @@ class Llava15Adapter(ModelAdapter):
             )
         optimizer = torch.optim.AdamW(parameter_groups)
         losses, steps, hook_metadata = [], 0, {}
+        client_context = train_config.context.get("client")
+        client_id = getattr(client_context, "client_id", task_name)
+        local_round = getattr(client_context, "local_round", "?")
+        progress = tqdm(
+            total=train_config.planned_optimizer_steps,
+            desc=f"local {client_id} r{local_round}",
+            unit="step",
+            position=1,
+            leave=False,
+            dynamic_ncols=True,
+            disable=not bool(self._config.get("progress_bar", True)),
+        )
         self.model.train()
         self.model.zero_grad(set_to_none=True)
         epoch = 0
@@ -310,6 +324,8 @@ class Llava15Adapter(ModelAdapter):
                 optimizer.zero_grad(set_to_none=True)
                 steps += 1
                 losses.append(accumulated / len(window))
+                progress.set_postfix(loss=f"{losses[-1]:.4f}", refresh=False)
+                progress.update(1)
                 if train_config.step_hook:
                     hook_metadata.update(
                         train_config.step_hook(
@@ -327,6 +343,7 @@ class Llava15Adapter(ModelAdapter):
             epoch += 1
             if train_config.max_local_steps is not None and steps >= train_config.max_local_steps:
                 break
+        progress.close()
         if steps == 0:
             raise RuntimeError("No optimizer step was executed; lower gradient_accumulation")
         end = self.snapshot_trainable()
@@ -344,7 +361,15 @@ class Llava15Adapter(ModelAdapter):
         self.model.eval()
         losses, predictions, references = [], [], []
         with torch.no_grad():
-            for sample in samples:
+            for sample in tqdm(
+                samples,
+                desc=f"evaluate {task_adapter.task_key}",
+                unit="sample",
+                position=1,
+                leave=False,
+                dynamic_ncols=True,
+                disable=not bool(self._config.get("progress_bar", True)),
+            ):
                 encoded = self._encode(
                     sample,
                     int(self._config.get("max_text_length", 512)),
