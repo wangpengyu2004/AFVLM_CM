@@ -116,7 +116,14 @@ class Llava15Adapter(ModelAdapter):
         )
         vision_tower = self.model.get_vision_tower()
         if not vision_tower.is_loaded:
-            vision_tower.load_model(device_map=config.get("device_map", "auto"))
+            # Official LLaVA v1.1.3 exposes load_model(self) without device_map.
+            # Load from the configured local path first, then colocate the tower
+            # with the token embeddings used by multimodal input preparation.
+            vision_tower.load_model()
+        vision_device = self.model.get_input_embeddings().weight.device
+        if vision_device.type == "meta":
+            raise RuntimeError("LLaVA input embeddings remain on the meta device after loading")
+        vision_tower.to(device=vision_device, dtype=dtype)
         self.image_processor = vision_tower.image_processor
         if quant_config is not None:
             self.model = prepare_kbit(
@@ -140,7 +147,7 @@ class Llava15Adapter(ModelAdapter):
         for name, parameter in self.model.named_parameters():
             if "mm_projector" in name:
                 parameter.requires_grad = bool(lora.get("train_mm_projector", False))
-        self.device = next(self.model.parameters()).device
+        self.device = self.model.get_input_embeddings().weight.device
 
     def named_federated_parameters(self) -> list[tuple[str, Any]]:
         if self.model is None:
@@ -224,7 +231,6 @@ class Llava15Adapter(ModelAdapter):
         encoded = {
             "input_ids": input_ids,
             "images": image,
-            "image_sizes": [self._image(sample).size],
         }
         if include_answer:
             prompt_conv = conversation_lib.conv_templates[template].copy()
