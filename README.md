@@ -278,6 +278,10 @@ runs/llava/afvlm_cm/profiles/lr1e5_alpha03/2clients/fedasync/seed42/
 bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 ```
 
+历史 profile 中保存的 `worker_queue: fifo` 不会被静默改写，仍可复现原物理调度；要使用
+EDF 必须创建新 profile。上面的新 profile 可以复用原 TrainPlan，但会从当前基础配置记录
+`plan_arrival_edf`，无需重新随机生成系统异构条件。
+
 注意：`default_e1_bs1_ga4_r10_s42` 是历史不可变的单执行器/BF16 快照。V100 八卡不要继续使用该旧 profile；按下文“八卡运行”先生成新的 FP16 profile。切回任何旧参数仍然只需替换第三个参数。
 
 正式论文实验建议始终传入第三个 profile 参数。省略第三个参数时使用当前可变的 `configs/` 与兼容目录，只适合临时调试，不适合作为最终可复现实验记录。
@@ -305,7 +309,7 @@ git push origin main
 
 worker 完成后先返回未经服务器处理的原始更新；父进程在计划的 `arrival_time` 调用权威方法实例的 `prepare_upload` 和 `on_arrival`。上传包含 `client_id`、`task`、`dataset`、`num_samples`、`base_version`、`arrival_time`、`local_state` 和 `delta`。服务器在到达时计算 `staleness = server_version - base_version`。FedASMU 的中途新鲜模型访问被建模为显式虚拟事件，不依赖某一次运行中偶然的 GPU 完成先后。
 
-默认 `runtime.arrival_policy: planned` 会按持久化虚拟到达顺序应用更新。物理并发客户端数等于当前可见 GPU 数量；某次运行的磁盘抖动或 GPU 波动只影响 wall-clock，不改变方法比较的逻辑到达条件。FedCompass 可以改变本地步数和分组，因为这是算法本身；其他方法不能通过修改 Plan 偷换系统条件。完整生命周期、特殊方法处理和任务耗时校准见 [`docs/async_runtime.md`](docs/async_runtime.md)。
+默认 `runtime.arrival_policy: planned` 会按持久化虚拟到达顺序应用更新，`runtime.worker_queue: plan_arrival_edf` 则只优化物理 GPU 执行顺序。逻辑 start 时先冻结 `base_version` 和方法产生的下载状态，在下一次计划 arrival 前把所有已经合法启动的作业放入候选堆，再优先执行计划 `arrival_time` 最早者；提前算完但尚未轮到的结果进入缓存。EDF 不重算下载版本、不提前聚合，也不允许未来 start 事件偷跑，因此某次运行的磁盘抖动或 GPU 波动只影响 wall-clock，不改变方法比较的逻辑到达条件。FedCompass 可以改变本地步数和分组，因为这是算法本身；其他方法不能通过修改 Plan 偷换系统条件。完整生命周期、特殊方法处理、方法服务器状态和任务耗时校准见 [`docs/async_runtime.md`](docs/async_runtime.md)。
 
 ### V100 八卡运行
 
@@ -313,10 +317,10 @@ worker 完成后先返回未经服务器处理的原始更新；父进程在计�
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile v100_fp16_8gpu_e1_bs1_ga4_r10_s42 \
+  --profile v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42 \
   --reuse_plans_from default_e1_bs1_ga4_r10_s42
 
-bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 ```
 
 每张 V100 会占用一份完整 7B FP16 模型及一个客户端的激活/优化器状态；这和原先 `device_map: auto` 把一个模型切到多卡不同。正常情况下无需设置 `CUDA_VISIBLE_DEVICES`。如果服务器还有其他任务、只想临时使用部分卡，可以选择性地设置该环境变量；程序会自动使用其中所有可见设备。
@@ -325,7 +329,7 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 
 ```bash
 python tools/estimate_task_compute_factors.py \
-  runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_e1_bs1_ga4_r10_s42/2clients/fedasync/seed42
+  runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42/2clients/fedasync/seed42
 ```
 
 把输出因子写入 `configs/base.yaml` 后创建不复用旧 Plan的新 profile。任务固有耗时使用 `task_compute_factors`，设备差异使用 `speed_factor`，二者分开保存。
@@ -371,14 +375,14 @@ bash scripts/run_one.sh unifed_lora 2
 使用前文创建的正式 V100 八卡快照：
 
 ```bash
-bash scripts/run_one.sh fedavg 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
-bash scripts/run_one.sh fedasync 5 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedavg 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 5 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 ```
 
 profile 结果写入独立目录，例如：
 
 ```text
-runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_e1_bs1_ga4_r10_s42/2clients/fedavg/seed42/
+runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42/2clients/fedavg/seed42/
 ```
 
 将最后一个参数改为 5 或 10 即选择对应数据集；例如：
@@ -408,7 +412,7 @@ bash scripts/run_baselines.sh 10
 对一个保存的 profile 批量运行：
 
 ```bash
-bash scripts/run_baselines.sh 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
+bash scripts/run_baselines.sh 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 ```
 
 ### 命令行训练进度
@@ -416,7 +420,7 @@ bash scripts/run_baselines.sh 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 训练进度条默认开启，直接使用原有命令即可，不需要重新生成 system profile 或 TrainPlan：
 
 ```bash
-bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 ```
 
 命令行会依次显示：
@@ -434,7 +438,7 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 
 ```bash
 PYTHONUNBUFFERED=1 \
-  bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42 \
+  bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42 \
   2>&1 | tee fedasync-2clients.log
 ```
 

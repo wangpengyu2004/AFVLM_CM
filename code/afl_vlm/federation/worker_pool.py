@@ -9,12 +9,12 @@ project's deterministic virtual event order.
 
 from __future__ import annotations
 
+import heapq
 import multiprocessing as mp
 import os
 import queue
 import time
 import traceback
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -32,7 +32,8 @@ class TrainJob:
     train_config: TrainConfig
     method_runtime_state: dict[str, Any]
     group_size: int | None
-    dispatch_wall_time: float
+    enqueued_wall_time: float
+    dispatch_wall_time: float | None = None
 
     @property
     def job_id(self) -> str:
@@ -303,9 +304,18 @@ def _worker_main(
                     {
                         "worker_id": worker_id,
                         "visible_device_id": device_id,
+                        "enqueue_wall_time": command.enqueued_wall_time,
                         "dispatch_wall_time": command.dispatch_wall_time,
                         "worker_start_wall_time": start_wall_time,
                         "worker_finish_wall_time": time.time(),
+                        "physical_queue_wait_seconds": (
+                            start_wall_time - command.enqueued_wall_time
+                        ),
+                        "dispatch_to_start_seconds": (
+                            start_wall_time - command.dispatch_wall_time
+                            if command.dispatch_wall_time is not None
+                            else None
+                        ),
                     }
                 )
                 output_queue.put(
@@ -336,7 +346,7 @@ def _worker_main(
 
 
 class ClientWorkerPool:
-    """One spawned process and one resident model replica per configured GPU."""
+    """One model replica per GPU with configurable FIFO or Plan-arrival EDF dispatch."""
 
     def __init__(
         self,
@@ -348,17 +358,24 @@ class ClientWorkerPool:
         profiles: list[ClientSpec],
         seed: int,
         start_method: str = "spawn",
+        queue_policy: str = "plan_arrival_edf",
     ) -> None:
         if not devices or len(set(devices)) != len(devices):
             raise ValueError("runtime.devices must contain unique GPU indices")
+        if queue_policy not in {"fifo", "plan_arrival_edf"}:
+            raise ValueError(f"Unsupported worker queue policy: {queue_policy}")
         self.devices = list(devices)
+        self.queue_policy = queue_policy
         self._context = mp.get_context(start_method)
         self._output = self._context.Queue()
         self._inputs = [self._context.Queue() for _ in devices]
         self._processes = []
         self._idle = set(range(len(devices)))
         self._busy: dict[int, str] = {}
-        self._pending: deque[TrainJob | EvaluationJob] = deque()
+        self._pending: list[
+            tuple[tuple[int, float, float, int], int, TrainJob | EvaluationJob]
+        ] = []
+        self._submission_sequence = 0
         for worker_id, device_id in enumerate(devices):
             process = self._context.Process(
                 target=_worker_main,
@@ -421,18 +438,48 @@ class ClientWorkerPool:
             raise RuntimeError("GPU worker 0 did not return the authoritative initial state")
         return initial_state
 
-    def submit(self, job: TrainJob | EvaluationJob, *, priority: bool = False) -> None:
-        if self._idle:
-            self._dispatch(job)
-        elif priority:
-            self._pending.appendleft(job)
+    def submit(
+        self,
+        job: TrainJob | EvaluationJob,
+        *,
+        priority: bool = False,
+        defer: bool = False,
+    ) -> None:
+        """Queue a job and optionally defer assignment until the current logical batch is staged.
+
+        Training jobs use their persisted Plan arrival as the EDF deadline.  The
+        runner defers them until every logical start preceding the next virtual
+        refresh/arrival has been queued, preventing early start-order jobs from
+        occupying all GPUs before lower-deadline candidates are visible.
+        """
+        if priority:
+            key = (0, 0.0, 0.0, 0)
+        elif isinstance(job, TrainJob) and self.queue_policy == "plan_arrival_edf":
+            key = (
+                1,
+                float(job.event.arrival_time),
+                float(job.event.start_time),
+                int(job.event.event_id),
+            )
         else:
-            self._pending.append(job)
+            key = (1, 0.0, 0.0, 0)
+        heapq.heappush(self._pending, (key, self._submission_sequence, job))
+        self._submission_sequence += 1
+        if not defer:
+            self.dispatch_pending()
+
+    def dispatch_pending(self) -> None:
+        """Fill every idle worker from the deterministic priority heap."""
+        while self._idle and self._pending:
+            _, _, job = heapq.heappop(self._pending)
+            self._dispatch(job)
 
     def _dispatch(self, job: TrainJob | EvaluationJob) -> None:
         worker_id = min(self._idle)
         self._idle.remove(worker_id)
         self._busy[worker_id] = job.job_id
+        if isinstance(job, TrainJob):
+            job.dispatch_wall_time = time.time()
         self._inputs[worker_id].put(job)
 
     def receive(self, timeout: float | None = None) -> WorkerMessage:
@@ -465,8 +512,7 @@ class ClientWorkerPool:
                     f"Worker {message.worker_id} completed {actual}, expected {expected}"
                 )
             self._idle.add(message.worker_id)
-            if self._pending:
-                self._dispatch(self._pending.popleft())
+            self.dispatch_pending()
         return message
 
     def receive_nowait(self) -> WorkerMessage:

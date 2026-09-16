@@ -155,6 +155,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     import numpy as np
 
     runtime = config["runtime"]
+    queue_policy = str(runtime.get("worker_queue", "plan_arrival_edf"))
     devices, aggregation_device = _resolve_runtime_devices(runtime)
     seed = int(config["run"]["seed"])
     random.seed(seed)
@@ -173,7 +174,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     started_at = time.time()
     (output / "train.log").write_text(
         f"AFVLM-CM run start\nmethod={method.name}\nseed={seed}\n"
-        "runtime=client_parallel\n",
+        f"runtime=client_parallel\nworker_queue={queue_policy}\n",
         encoding="utf-8",
     )
     (output / "resolved_config.yaml").write_text(
@@ -235,6 +236,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         profiles=profiles,
         seed=seed,
         start_method=str(runtime.get("start_method", "spawn")),
+        queue_policy=queue_policy,
     )
     job_progress: dict[str, Any] = {}
     completed_updates: dict[int, Any] = {}
@@ -305,6 +307,10 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(f"Unexpected worker message: {type(message).__name__}")
 
         def wait_for_update(event_id: int) -> Any:
+            # Every logical start before this persisted arrival is now staged.
+            # Release them together so the pool can choose the earliest Plan
+            # arrival instead of whichever start event was visited first.
+            pool.dispatch_pending()
             while event_id not in completed_updates:
                 handle_message(pool.receive())
             return completed_updates.pop(event_id)
@@ -332,6 +338,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         staleness_values: list[int] = []
         buffer_occupancies: list[int] = []
         buffer_waiting_times: list[float] = []
+        physical_queue_waits: list[float] = []
         client_updates: Counter[str] = Counter()
         task_updates: Counter[str] = Counter()
         last_virtual_time = 0.0
@@ -403,8 +410,9 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                         train_config=train_config,
                         method_runtime_state=nested_to_device(method_runtime_state, "cpu"),
                         group_size=group_sizes.get(event.group_id),
-                        dispatch_wall_time=time.time(),
-                    )
+                        enqueued_wall_time=time.time(),
+                    ),
+                    defer=queue_policy == "plan_arrival_edf",
                 )
                 continue
             if kind == "refresh":
@@ -421,6 +429,20 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             update = method.prepare_upload(raw_update, context)
             stale = server.version - update.base_version
             staleness_values.append(stale)
+            queue_wait = update.metadata.get("physical_queue_wait_seconds")
+            if queue_wait is not None:
+                physical_queue_waits.append(float(queue_wait))
+            record_by_event[event.event_id].update(
+                {
+                    "worker_id": update.metadata.get("worker_id"),
+                    "visible_device_id": update.metadata.get("visible_device_id"),
+                    "enqueue_wall_time": update.metadata.get("enqueue_wall_time"),
+                    "dispatch_wall_time": update.metadata.get("dispatch_wall_time"),
+                    "worker_start_wall_time": update.metadata.get("worker_start_wall_time"),
+                    "worker_finish_wall_time": update.metadata.get("worker_finish_wall_time"),
+                    "physical_queue_wait_seconds": queue_wait,
+                }
+            )
             _append(
                 output / "updates.jsonl",
                 {
@@ -436,8 +458,16 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     "sample_ids_hash": update.sample_ids_hash,
                     "worker_id": update.metadata.get("worker_id"),
                     "visible_device_id": update.metadata.get("visible_device_id"),
+                    "enqueue_wall_time": update.metadata.get("enqueue_wall_time"),
+                    "dispatch_wall_time": update.metadata.get("dispatch_wall_time"),
                     "worker_start_wall_time": update.metadata.get("worker_start_wall_time"),
                     "worker_finish_wall_time": update.metadata.get("worker_finish_wall_time"),
+                    "physical_queue_wait_seconds": update.metadata.get(
+                        "physical_queue_wait_seconds"
+                    ),
+                    "dispatch_to_start_seconds": update.metadata.get(
+                        "dispatch_to_start_seconds"
+                    ),
                 },
             )
             receive_version = server.version
@@ -474,6 +504,9 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     "task_compute_factor": event.task_compute_factor,
                     "group_id": event.group_id,
                     "worker_id": update.metadata.get("worker_id"),
+                    "physical_queue_wait_seconds": update.metadata.get(
+                        "physical_queue_wait_seconds"
+                    ),
                     "result_metadata": [item.metadata for item in results],
                 },
             )
@@ -538,10 +571,17 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         )
         stats: dict[str, Any] = {
             "runtime_backend": "client_parallel",
+            "physical_dispatch_policy": queue_policy,
             "gpu_workers": len(devices),
             "visible_device_ids": devices,
             "aggregation_device": str(aggregation_device),
             "wall_clock_seconds": time.time() - started_at,
+            "mean_physical_queue_wait_seconds": (
+                sum(physical_queue_waits) / len(physical_queue_waits)
+                if physical_queue_waits
+                else 0.0
+            ),
+            "max_physical_queue_wait_seconds": max(physical_queue_waits, default=0.0),
             "mean_staleness": mean_staleness(staleness_values),
             "median_staleness": statistics.median(staleness_values)
             if staleness_values
@@ -595,6 +635,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     },
                     "runtime": {
                         "backend": "client_parallel",
+                        "physical_dispatch_policy": queue_policy,
                         "devices": devices,
                         "worker_model_replicas": len(devices),
                     },

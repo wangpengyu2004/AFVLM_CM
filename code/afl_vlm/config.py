@@ -169,8 +169,11 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
             raise ValueError("runtime.startup_timeout_seconds must be positive")
         if runtime.get("arrival_policy", "planned") != "planned":
             raise ValueError("client_parallel currently requires runtime.arrival_policy=planned")
-        if runtime.get("worker_queue", "fifo") != "fifo":
-            raise ValueError("client_parallel currently requires runtime.worker_queue=fifo")
+        if runtime.get("worker_queue", "plan_arrival_edf") not in {
+            "fifo",
+            "plan_arrival_edf",
+        }:
+            raise ValueError("runtime.worker_queue must be fifo or plan_arrival_edf")
         if str(model.get("dtype", "fp16")) not in {"fp16", "bf16"}:
             raise ValueError("client_parallel model.dtype must be fp16 or bf16")
     method_cfg = config["method"]

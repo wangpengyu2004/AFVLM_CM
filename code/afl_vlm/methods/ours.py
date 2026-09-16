@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from typing import Any
 
@@ -44,3 +45,16 @@ class Ours(Method):
             "client_memory": self.client_memory,
         }
         raise NotImplementedError("The proposed AFVLM method has not been implemented yet.")
+
+    def state_dict(self) -> dict[str, Any]:
+        """Checkpoint future method-owned memory without defining its algorithm."""
+        return {
+            "params": copy.deepcopy(self.params),
+            "server_memory": copy.deepcopy(self.server_memory),
+            "client_memory": copy.deepcopy(self.client_memory),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        super().load_state_dict(state)
+        self.server_memory = copy.deepcopy(dict(state.get("server_memory", {})))
+        self.client_memory = copy.deepcopy(dict(state.get("client_memory", {})))

@@ -8,7 +8,7 @@ runtime:
   start_method: spawn
   startup_timeout_seconds: 1800
   arrival_policy: planned
-  worker_queue: fifo
+  worker_queue: plan_arrival_edf
 
 training:
   local_epochs: 1
