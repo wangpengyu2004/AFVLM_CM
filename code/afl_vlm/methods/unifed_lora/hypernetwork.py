@@ -7,7 +7,12 @@ from typing import Any
 
 class LoRAHypernetwork:
     def __init__(
-        self, descriptor_size: int, hidden_size: int, learning_rate: float, seed: int
+        self,
+        descriptor_size: int,
+        hidden_size: int,
+        learning_rate: float,
+        seed: int,
+        device: Any = "cpu",
     ) -> None:
         import torch
 
@@ -18,26 +23,37 @@ class LoRAHypernetwork:
             torch.nn.Tanh(),
             torch.nn.Linear(hidden_size, 1),
             torch.nn.Tanh(),
-        )
+        ).to(device)
         self.optimizer = torch.optim.Adam(self.module.parameters(), lr=learning_rate)
 
-    def gate(self, descriptor: list[float]) -> float:
-        tensor = self.torch.tensor(descriptor, dtype=self.torch.float32)
-        return float(self.module(tensor).detach().item())
+    def gate(self, descriptor: list[float]) -> Any:
+        tensor = self.torch.tensor(
+            descriptor,
+            dtype=self.torch.float32,
+            device=next(self.module.parameters()).device,
+        )
+        return self.module(tensor).detach().squeeze()
 
-    def fit(self, descriptor: list[float], target: float) -> float:
-        tensor = self.torch.tensor(descriptor, dtype=self.torch.float32)
+    def fit(self, descriptor: list[float], target: Any) -> Any:
+        tensor = self.torch.tensor(
+            descriptor,
+            dtype=self.torch.float32,
+            device=next(self.module.parameters()).device,
+        )
         prediction = self.module(tensor).squeeze()
-        loss = (prediction - float(target)) ** 2
+        target_tensor = (
+            target.detach().to(device=prediction.device, dtype=prediction.dtype)
+            if hasattr(target, "detach")
+            else self.torch.tensor(float(target), device=prediction.device)
+        )
+        loss = (prediction - target_tensor) ** 2
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        return float(loss.detach())
+        return loss.detach()
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "module": {
-                key: value.detach().cpu() for key, value in self.module.state_dict().items()
-            },
+            "module": {key: value.detach() for key, value in self.module.state_dict().items()},
             "optimizer": self.optimizer.state_dict(),
         }

@@ -18,6 +18,7 @@ class ClientSpec:
     network_delay: float
     initial_availability: float
     base_training_cost: float
+    task_compute_factor: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,7 @@ class ScheduledEvent:
     network_delay: float
     local_steps: int
     group_id: int | None = None
+    task_compute_factor: float = 1.0
 
 
 @dataclass(slots=True)
@@ -111,3 +113,4 @@ class MethodCapabilities:
     requires_custom_adapter: bool = False
     requires_fresh_global_during_local_training: bool = False
     requires_local_state: bool = False
+    requires_mean_gradient: bool = False

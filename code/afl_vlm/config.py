@@ -128,6 +128,11 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
         raise ValueError("training.learning_rate must be positive")
     if int(config["federation"].get("rounds", 0)) <= 0:
         raise ValueError("federation.rounds must be positive")
+    task_costs = config["federation"].get("task_compute_factors", {})
+    if task_costs and set(task_costs) != set(expected):
+        raise ValueError("federation.task_compute_factors must contain all six task IDs")
+    if any(float(value) <= 0 for value in task_costs.values()):
+        raise ValueError("federation.task_compute_factors values must be positive")
     evaluation = config["evaluation"]
     if evaluation.get("protocol") != "server_global":
         raise ValueError("evaluation.protocol must be server_global")
@@ -142,6 +147,32 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
     output = config["output"]
     if "progress_bar" in output and not isinstance(output["progress_bar"], bool):
         raise ValueError("output.progress_bar must be true or false")
+    runtime = config.get("runtime", {"backend": "serial"})
+    backend = str(runtime.get("backend", "serial"))
+    if backend not in {"serial", "client_parallel"}:
+        raise ValueError("runtime.backend must be serial or client_parallel")
+    if backend == "client_parallel":
+        devices = runtime.get("devices")
+        if devices != "all":
+            if not isinstance(devices, list) or not devices:
+                raise ValueError("runtime.devices must be 'all' or a non-empty GPU index list")
+            if any(not isinstance(item, int) or item < 0 for item in devices):
+                raise ValueError("runtime.devices must contain non-negative integers")
+            if len(set(devices)) != len(devices):
+                raise ValueError("runtime.devices must not contain duplicates")
+        aggregation_device = str(runtime.get("aggregation_device", "auto"))
+        if aggregation_device != "auto" and not aggregation_device.startswith("cuda:"):
+            raise ValueError("runtime.aggregation_device must be auto or cuda:<index>")
+        if runtime.get("start_method", "spawn") != "spawn":
+            raise ValueError("client_parallel requires runtime.start_method=spawn for CUDA safety")
+        if float(runtime.get("startup_timeout_seconds", 1800)) <= 0:
+            raise ValueError("runtime.startup_timeout_seconds must be positive")
+        if runtime.get("arrival_policy", "planned") != "planned":
+            raise ValueError("client_parallel currently requires runtime.arrival_policy=planned")
+        if runtime.get("worker_queue", "fifo") != "fifo":
+            raise ValueError("client_parallel currently requires runtime.worker_queue=fifo")
+        if str(model.get("dtype", "fp16")) not in {"fp16", "bf16"}:
+            raise ValueError("client_parallel model.dtype must be fp16 or bf16")
     method_cfg = config["method"]
     method = create_method(str(method_cfg["name"]), method_cfg.get("params", {}))
     configured_mode = str(config["federation"]["mode"])

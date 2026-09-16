@@ -71,9 +71,16 @@ class FedASMU(Method):
     ) -> dict[str, Any]:
         client = context["client"]
         target = max(1, round(total_steps * float(self.params.get("refresh_fraction", 0.5))))
-        if step != target or client.fresh_global_state is None:
+        if step != target:
             return {}
-        global_round = max(1, int(client.fresh_global_version or client.base_version) + 1)
+        fresh_state = client.fresh_global_state
+        fresh_version = client.fresh_global_version
+        provider = context.get("fresh_state_provider")
+        if provider is not None:
+            fresh_state, fresh_version = provider()
+        if fresh_state is None:
+            return {}
+        global_round = max(1, int(fresh_version or client.base_version) + 1)
         age = max(1, global_round - client.base_version + 1)
         coeffs = self.local_coefficients.setdefault(
             client.client_id,
@@ -87,12 +94,25 @@ class FedASMU(Method):
         mu = float(self.params.get("mu_beta", 1.0))
         beta = mu * phi / (1.0 + mu * phi)
         current = model.snapshot_trainable()
-        adjusted = add_scaled(current, subtract(client.fresh_global_state, current), beta)
+        adjusted = add_scaled(current, subtract(fresh_state, current), beta)
         model.load_trainable(adjusted)
         return {
             "fresh_adjustment_step": step,
-            "fresh_global_version": client.fresh_global_version,
+            "fresh_global_version": fresh_version,
             "beta": beta,
+        }
+
+    def client_runtime_state(self, context: Any) -> dict[str, Any]:
+        coefficients = self.local_coefficients.get(context.client_id)
+        return {
+            "local_coefficients": {context.client_id: dict(coefficients)}
+            if coefficients is not None
+            else {},
+        }
+
+    def load_client_runtime_state(self, state: Mapping[str, Any], context: Any) -> None:
+        self.local_coefficients = {
+            key: dict(value) for key, value in state.get("local_coefficients", {}).items()
         }
 
     def prepare_upload(self, update: Update, context: Any) -> Update:

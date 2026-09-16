@@ -52,7 +52,9 @@ def _write_text_lf(path: Path, content: str) -> None:
         stream.write(content)
 
 
-def build(root: Path, setting: int, seed: int) -> dict[str, Any]:
+def build(
+    root: Path, setting: int, seed: int, task_compute_factors: dict[str, float]
+) -> dict[str, Any]:
     partition = root / "data" / "AFVLM_CM" / "partitioned" / f"{setting}_clients"
     clients = []
     for task, dataset in TASK_DATASETS.items():
@@ -71,6 +73,7 @@ def build(root: Path, setting: int, seed: int) -> dict[str, Any]:
                     "network_delay": round(rng.uniform(0.05, 0.5), 6),
                     "initial_availability": round(rng.uniform(0.0, 1.0), 6),
                     "base_training_cost": round(rng.uniform(0.8, 1.2), 6),
+                    "task_compute_factor": float(task_compute_factors[task]),
                 }
             )
     expected = 6 * setting
@@ -98,6 +101,7 @@ def _client_specs(payload: dict[str, Any]) -> list[ClientSpec]:
             network_delay=float(item["network_delay"]),
             initial_availability=float(item["initial_availability"]),
             base_training_cost=float(item["base_training_cost"]),
+            task_compute_factor=float(item.get("task_compute_factor", 1.0)),
         )
         for item in payload["clients"]
     ]
@@ -186,6 +190,14 @@ def create_profile(
     base_config = yaml.safe_load((root / "configs" / "base.yaml").read_text(encoding="utf-8"))
     training = dict(base_config["training"])
     rounds = int(base_config["federation"]["rounds"])
+    task_compute_factors = {
+        task: float(value)
+        for task, value in base_config["federation"].get(
+            "task_compute_factors", {task: 1.0 for task in TASK_DATASETS}
+        ).items()
+    }
+    if set(task_compute_factors) != set(TASK_DATASETS):
+        raise ValueError("task_compute_factors must contain all six task IDs")
     plans: dict[int, tuple[bytes, bytes]] = {}
     for setting in SETTINGS:
         if reuse_plans_from:
@@ -204,8 +216,19 @@ def create_profile(
             plan_bytes = plan_path.read_bytes()
             clients = _client_specs(json.loads(system_bytes))
             plan = load_train_plan(plan_path)
+            saved_task_costs = {
+                item.task: item.task_compute_factor for item in clients
+            }
+            if any(
+                saved_task_costs.get(task, 1.0) != factor
+                for task, factor in task_compute_factors.items()
+            ):
+                raise ValueError(
+                    "The reused system profile has different task compute factors; "
+                    "create the profile without --reuse_plans_from"
+                )
         else:
-            system_payload = build(root, setting, seed)
+            system_payload = build(root, setting, seed, task_compute_factors)
             clients = _client_specs(system_payload)
             plan = build_train_plan(
                 clients,
@@ -274,6 +297,8 @@ def create_profile(
         "run_seed": seed,
         "training": training,
         "federation": {"rounds": rounds},
+        "task_compute_factors": task_compute_factors,
+        "runtime": copy.deepcopy(base_config.get("runtime", {"backend": "serial"})),
         "settings": list(SETTINGS),
         "methods": list(methods),
         "files_sha256": hashes,

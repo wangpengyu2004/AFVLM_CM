@@ -42,6 +42,11 @@ class UniFedLoRA(Method):
         super().__init__(params)
         self.hypernetwork: LoRAHypernetwork | None = None
         self.rounds: dict[int, list[Update]] = defaultdict(list)
+        self.server_device: Any = "cpu"
+
+    def configure_server(self, initial_state: dict[str, Any], clients: list[Any]) -> None:
+        first = next(iter(initial_state.values()))
+        self.server_device = getattr(first, "device", "cpu")
 
     def _network(self) -> LoRAHypernetwork:
         if self.hypernetwork is None:
@@ -52,6 +57,7 @@ class UniFedLoRA(Method):
                 int(self.params.get("hidden_size", 32)),
                 float(self.params.get("hyper_lr", 1e-3)),
                 int(self.params.get("seed", 2026)),
+                self.server_device,
             )
         return self.hypernetwork
 
@@ -75,11 +81,16 @@ class UniFedLoRA(Method):
         losses = []
         for item in bucket:
             for key in item.delta:
-                target = min(
-                    1.0,
-                    state_norm({key: item.delta[key]})
-                    / max(1e-12, state_norm({key: item.base_state[key]})),
-                )
+                if hasattr(item.delta[key], "detach"):
+                    delta_norm = item.delta[key].detach().float().norm()
+                    base_norm = item.base_state[key].detach().float().norm().clamp_min(1e-12)
+                    target = (delta_norm / base_norm).clamp(max=1.0)
+                else:
+                    target = min(
+                        1.0,
+                        state_norm({key: item.delta[key]})
+                        / max(1e-12, state_norm({key: item.base_state[key]})),
+                    )
                 descriptor = [
                     *task_descriptor(item.task, configured=self.params.get("task_descriptors")),
                     *parameter_descriptor(key),
@@ -94,7 +105,9 @@ class UniFedLoRA(Method):
                 1.0,
                 [item.update_id for item in bucket],
                 metadata={
-                    "hypernetwork_loss": sum(losses) / len(losses),
+                    "hypernetwork_loss": float((sum(losses) / len(losses)).item())
+                    if hasattr(losses[0], "item")
+                    else sum(losses) / len(losses),
                     "backbone_heterogeneity": False,
                 },
             )

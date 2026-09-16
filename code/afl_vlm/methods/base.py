@@ -46,7 +46,13 @@ class Method(ABC):
             raise ValueError(f"Unknown parameter(s) for {self.name}: {sorted(unknown)}")
 
     def configure_model(self, model: Any, clients: list[Any]) -> None:
-        """Install an algorithm-specific model extension after the base model loads."""
+        """Install worker/model-side extensions after a model replica loads."""
+        return None
+
+    def configure_server(
+        self, initial_state: LoRAState, clients: list[Any]
+    ) -> None:
+        """Initialize server-only algorithm state without requiring a GPU model."""
         return None
 
     def validate_runtime(self) -> None:
@@ -71,6 +77,22 @@ class Method(ABC):
 
     def prepare_upload(self, update: Update, context: ClientContext) -> Update:
         return update
+
+    def client_runtime_state(self, context: ClientContext) -> dict[str, Any]:
+        """Export only state required by local hooks for one dispatched job.
+
+        Server aggregation buffers and optimizer state remain authoritative in the
+        parent process.  GPU workers receive this minimal snapshot and never call
+        :meth:`on_arrival`.
+        """
+        return {}
+
+    def load_client_runtime_state(
+        self, state: Mapping[str, Any], context: ClientContext
+    ) -> None:
+        """Install a dispatch-time local-hook snapshot inside one worker."""
+        if state:
+            raise ValueError(f"Method {self.name} does not accept client runtime state")
 
     @abstractmethod
     def on_arrival(self, update: Update, server_context: ServerContext) -> list[ServerMutation]:

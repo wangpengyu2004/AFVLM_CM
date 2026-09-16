@@ -23,7 +23,6 @@ from afl_vlm.models.base import (
     add_scaled,
     clone_state,
     scale_state,
-    state_norm,
     subtract,
     weighted_mean_states,
     zeros_like,
@@ -32,7 +31,10 @@ from afl_vlm.models.base import (
 
 class _MasFL(Method):
     capabilities = MethodCapabilities(
-        mode="asynchronous", requires_staleness=True, requires_local_state=True
+        mode="asynchronous",
+        requires_staleness=True,
+        requires_local_state=True,
+        requires_mean_gradient=True,
     )
     allowed_params = {
         "beta",
@@ -63,17 +65,42 @@ class _MasFL(Method):
         beta = float(self.params.get("beta", 0.9))
         local = self.client_controls[client.client_id]
         eps = float(self.params.get("normalize_epsilon", 1e-12))
+        device_controls = context.setdefault("masfl_device_controls", {})
         direction = {}
         for name, parameter in model.named_federated_parameters():
-            old_c = local[name].to(parameter.device, dtype=parameter.dtype)
-            global_c = self.global_control[name].to(parameter.device, dtype=parameter.dtype)
-            old_g = self.momentum[name].to(parameter.device, dtype=parameter.dtype)
+            controls = device_controls.get(name)
+            if controls is None:
+                controls = (
+                    local[name].to(parameter.device, dtype=parameter.dtype),
+                    self.global_control[name].to(parameter.device, dtype=parameter.dtype),
+                    self.momentum[name].to(parameter.device, dtype=parameter.dtype),
+                )
+                device_controls[name] = controls
+            old_c, global_c, old_g = controls
             direction[name] = beta * (parameter.grad - old_c + global_c) + (1.0 - beta) * old_g
         if self.adaptive:
-            norm = state_norm(direction)
-            direction = scale_state(direction, 1.0 / max(eps, norm))
+            norm_squared = None
+            for value in direction.values():
+                term = value.detach().float().square().sum()
+                norm_squared = term if norm_squared is None else norm_squared + term
+            norm = norm_squared.sqrt().clamp_min(eps)
+            direction = scale_state(direction, norm.reciprocal())
         for name, parameter in model.named_federated_parameters():
             parameter.grad.copy_(direction[name])
+
+    def client_runtime_state(self, context: Any) -> dict[str, Any]:
+        return {
+            "client_control": clone_state(self.client_controls[context.client_id]),
+            "global_control": clone_state(self.global_control),
+            "momentum": clone_state(self.momentum),
+        }
+
+    def load_client_runtime_state(self, state: Mapping[str, Any], context: Any) -> None:
+        self.client_controls = {
+            context.client_id: clone_state(state["client_control"]),
+        }
+        self.global_control = clone_state(state["global_control"])
+        self.momentum = clone_state(state["momentum"])
 
     def _flush(self, context: ServerContext) -> ServerMutation:
         updates, self.buffer = self.buffer, []

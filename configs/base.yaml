@@ -1,6 +1,15 @@
 run:
   seed: 42
 
+runtime:
+  backend: client_parallel
+  devices: all
+  aggregation_device: auto
+  start_method: spawn
+  startup_timeout_seconds: 1800
+  arrival_policy: planned
+  worker_queue: fifo
+
 training:
   local_epochs: 1
   batch_size: 1
@@ -13,6 +22,14 @@ federation:
   rounds: 10
   mode: asynchronous
   system_profile: null
+  # Intrinsic per-task cost, separate from device speed. Calibrate before final profiles.
+  task_compute_factors:
+    cls: 1.0
+    caption: 1.0
+    vqa: 1.0
+    chart_vqa: 1.0
+    visual_reasoning: 1.0
+    grounding: 1.0
 
 evaluation:
   protocol: server_global

@@ -29,7 +29,6 @@ class FederatedClient:
         group_id: int | None = None,
         group_size: int | None = None,
     ) -> Update:
-        physical_server_state = model.snapshot_trainable()
         context = ClientContext(
             client_id=self.id,
             task=self.task,
@@ -45,40 +44,71 @@ class FederatedClient:
             fresh_global_version=fresh_global_version,
         )
         start_state = method.prepare_download(clone_state(global_state), context)
+        update = self.train_prepared(
+            model=model,
+            method=method,
+            global_state=global_state,
+            start_state=start_state,
+            context=context,
+            train_config=train_config,
+            group_id=group_id,
+            group_size=group_size,
+        )
+        return method.prepare_upload(update, context)
+
+    def train_prepared(
+        self,
+        model: Any,
+        method: Any,
+        global_state: Mapping[str, Any],
+        start_state: Mapping[str, Any],
+        context: ClientContext,
+        train_config: TrainConfig,
+        group_id: int | None = None,
+        group_size: int | None = None,
+        fresh_state_provider: Any | None = None,
+    ) -> Update:
+        """Train one already-dispatched package without touching server-owned state.
+
+        The parent process must call ``prepare_download`` before dispatch and
+        ``prepare_upload`` after this raw update returns.  This mirrors the
+        pack/train/unpack boundary used by established asynchronous FL runtimes.
+        """
         model.load_trainable(start_state)
         model._set_context(self.task, self.id)
-        try:
-            configured = TrainConfig(
-                local_epochs=train_config.local_epochs,
-                batch_size=train_config.batch_size,
-                gradient_accumulation=train_config.gradient_accumulation,
-                learning_rate=train_config.learning_rate,
-                max_text_length=train_config.max_text_length,
-                seed=train_config.seed,
-                loss_hook=method.local_loss,
-                gradient_hook=method.transform_gradients,
-                step_hook=method.local_step,
-                context={
-                    "client": context,
-                    "method": method.name,
-                    "base_state": clone_state(global_state),
-                },
-                planned_optimizer_steps=train_config.planned_optimizer_steps,
-                max_local_steps=train_config.max_local_steps,
-            )
-            result = model.local_train(self.samples, configured, self.task)
-            local_state = add_scaled(start_state, result.delta, 1.0)
-        finally:
-            model.load_trainable(physical_server_state)
+        configured = TrainConfig(
+            local_epochs=train_config.local_epochs,
+            batch_size=train_config.batch_size,
+            gradient_accumulation=train_config.gradient_accumulation,
+            learning_rate=train_config.learning_rate,
+            max_text_length=train_config.max_text_length,
+            seed=train_config.seed,
+            loss_hook=method.local_loss,
+            gradient_hook=method.transform_gradients,
+            step_hook=method.local_step,
+            progress_hook=train_config.progress_hook,
+            collect_mean_gradient=train_config.collect_mean_gradient,
+            context={
+                "client": context,
+                "method": method.name,
+                "base_state": clone_state(global_state),
+                "fresh_state_provider": fresh_state_provider,
+            },
+            planned_optimizer_steps=train_config.planned_optimizer_steps,
+            max_local_steps=train_config.max_local_steps,
+        )
+        loaded_start_state = model.snapshot_trainable()
+        result = model.local_train(self.samples, configured, self.task)
+        local_state = add_scaled(loaded_start_state, result.delta, 1.0)
         update = Update(
-            update_id=f"{self.id}-r{local_round}",
+            update_id=f"{self.id}-r{context.local_round}",
             client_id=self.id,
             task=self.task,
             dataset=self.dataset,
             num_samples=len(self.samples),
-            local_round=local_round,
-            base_version=base_version,
-            arrival_time=arrival_time,
+            local_round=context.local_round,
+            base_version=context.base_version,
+            arrival_time=context.arrival_time,
             base_state=clone_state(global_state),
             local_state=clone_state(local_state),
             delta=subtract(local_state, global_state),
@@ -96,4 +126,4 @@ class FederatedClient:
                 "federated_parameter_scope": "lora_and_configured_modules",
             },
         )
-        return method.prepare_upload(update, context)
+        return update

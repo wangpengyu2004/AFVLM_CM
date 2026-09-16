@@ -10,10 +10,20 @@ from afl_vlm.models.base import clone_state
 
 
 class FederatedServer:
-    def __init__(self, model: Any, method: Any, expected_clients: int) -> None:
+    def __init__(
+        self,
+        model: Any | None,
+        method: Any,
+        expected_clients: int,
+        initial_state: dict[str, Any] | None = None,
+    ) -> None:
         self.model, self.method, self.expected_clients = model, method, expected_clients
         self.version = 0
-        self.state_store = StateStore(model.snapshot_trainable())
+        if initial_state is None:
+            if model is None:
+                raise ValueError("A model or an explicit initial_state is required")
+            initial_state = model.snapshot_trainable()
+        self.state_store = StateStore(initial_state)
         self.received_updates = 0
         self.accepted_updates = 0
 
@@ -54,7 +64,8 @@ class FederatedServer:
         if mutation.increment_version:
             self.version += 1
             self.state_store.put(self.version, mutation.new_state)
-            self.model.load_trainable(clone_state(mutation.new_state))
+            if self.model is not None:
+                self.model.load_trainable(clone_state(mutation.new_state))
         self.accepted_updates += (
             len(mutation.contributing_update_ids) if mutation.applied_weight > 0 else 0
         )

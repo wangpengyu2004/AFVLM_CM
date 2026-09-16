@@ -27,6 +27,8 @@ class TrainConfig:
     loss_hook: Any | None = None
     gradient_hook: Any | None = None
     step_hook: Any | None = None
+    progress_hook: Any | None = None
+    collect_mean_gradient: bool = False
     context: dict[str, Any] = field(default_factory=dict)
     planned_optimizer_steps: int = 1
     max_local_steps: int | None = None
@@ -49,6 +51,35 @@ def clone_state(state: Mapping[str, ScalarOrTensor]) -> LoRAState:
         else:
             result[name] = copy.deepcopy(value)
     return result
+
+
+def state_to_device(
+    state: Mapping[str, ScalarOrTensor], device: Any, dtype: Any | None = None
+) -> LoRAState:
+    """Move a trainable state once at a runtime boundary."""
+    result: LoRAState = {}
+    for name, value in state.items():
+        if hasattr(value, "to"):
+            kwargs = {"device": device}
+            if dtype is not None:
+                kwargs["dtype"] = dtype
+            result[name] = value.detach().to(**kwargs)
+        else:
+            result[name] = copy.deepcopy(value)
+    return result
+
+
+def nested_to_device(value: Any, device: Any) -> Any:
+    """Move tensors inside method/checkpoint containers without changing structure."""
+    if hasattr(value, "detach") and hasattr(value, "to"):
+        return value.detach().to(device=device)
+    if isinstance(value, Mapping):
+        return {key: nested_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [nested_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(nested_to_device(item, device) for item in value)
+    return copy.deepcopy(value)
 
 
 def _binary_value(left: ScalarOrTensor, right: ScalarOrTensor, fn: Any) -> ScalarOrTensor:
@@ -140,21 +171,60 @@ def _flat_values(value: ScalarOrTensor) -> Iterable[float]:
         yield float(value)
 
 
+def _sum_squares(
+    value: ScalarOrTensor, tensor_totals: dict[str, Any]
+) -> float:
+    if isinstance(value, list):
+        return sum(_sum_squares(item, tensor_totals) for item in value)
+    if hasattr(value, "detach"):
+        term = value.detach().float().square().sum()
+        key = str(term.device)
+        tensor_totals[key] = tensor_totals.get(key, 0.0) + term
+        return 0.0
+    scalar = float(value)
+    return scalar * scalar
+
+
+def _dot_value(
+    left: ScalarOrTensor,
+    right: ScalarOrTensor,
+    tensor_totals: dict[str, Any],
+) -> float:
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            raise ValueError("State vectors have different lengths")
+        return sum(
+            _dot_value(a, b, tensor_totals)
+            for a, b in zip(left, right, strict=True)
+        )
+    if hasattr(left, "detach") and hasattr(right, "detach"):
+        if left.shape != right.shape:
+            raise ValueError("State tensors have different shapes")
+        term = (left.detach().float() * right.detach().float()).sum()
+        key = str(term.device)
+        tensor_totals[key] = tensor_totals.get(key, 0.0) + term
+        return 0.0
+    return float(left) * float(right)
+
+
 def state_norm(state: Mapping[str, ScalarOrTensor]) -> float:
-    return math.sqrt(
-        sum(value * value for key in sorted(state) for value in _flat_values(state[key]))
+    tensor_totals: dict[str, Any] = {}
+    scalar_total = sum(
+        _sum_squares(state[key], tensor_totals) for key in sorted(state)
     )
+    total = scalar_total + sum(float(value.item()) for value in tensor_totals.values())
+    return math.sqrt(total)
 
 
 def state_dot(left: Mapping[str, ScalarOrTensor], right: Mapping[str, ScalarOrTensor]) -> float:
     """Return the Euclidean inner product of two compatible trainable states."""
     if set(left) != set(right):
         raise ValueError("State keys differ")
-    return sum(
-        a * b
-        for key in sorted(left)
-        for a, b in zip(_flat_values(left[key]), _flat_values(right[key]), strict=True)
+    tensor_totals: dict[str, Any] = {}
+    scalar_total = sum(
+        _dot_value(left[key], right[key], tensor_totals) for key in sorted(left)
     )
+    return scalar_total + sum(float(value.item()) for value in tensor_totals.values())
 
 
 def state_cosine(left: Mapping[str, ScalarOrTensor], right: Mapping[str, ScalarOrTensor]) -> float:

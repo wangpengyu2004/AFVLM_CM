@@ -2,7 +2,7 @@
 
 AFVLM-CM 是用于论文实验的异步联邦视觉语言模型指令微调框架，研究固定任务客户端下的任务异构与系统异构：每个客户端永久属于一个任务，客户端速度、可用时间和网络延迟不同，但不存在持续学习或任务增量流。
 
-正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。一个进程中只保留一份冻结的 7B 主干；逻辑客户端通过装载各自训练起点的 LoRA/显式允许模块状态顺序训练。冻结主干不会上传、聚合或写入联邦检查点。
+正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。默认运行时自动发现全部可见 GPU，并为每张卡创建一个独立 worker；每个 worker 常驻一份完整的冻结 7B 主干并训练不同客户端。权威服务器的 LoRA 聚合、FedAdam 矩状态以及方法状态默认放在第一张可见 GPU，CPU 只负责调度、进程通信、日志和数据加载。冻结主干不会上传、聚合或写入联邦检查点。
 
 ## 已检测的数据
 
@@ -55,7 +55,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` 已包含 CUDA 11.8 对应的 PyTorch 2.0.1/TorchVision 0.15.2、LLaVA、Transformers、PEFT、数据处理、绘图和工程检查依赖，并以 editable 模式安装当前 AFVLM-CM 包。LLaVA 源码固定到官方 `v1.1.3`，通过体积固定的 release archive 安装而不是执行 `git clone`，可避免训练服务器连接 GitHub git 服务超时。环境安装不会下载 7B/CLIP 预训练参数。请在仓库根目录运行命令，并确保宿主机 NVIDIA 驱动兼容 CUDA 11.8。NF4 量化需要 bitsandbytes；默认配置仍使用非量化 bf16。正式训练只读取本地模型权重。
+`requirements.txt` 已包含 CUDA 11.8 对应的 PyTorch 2.0.1/TorchVision 0.15.2、LLaVA、Transformers、PEFT、数据处理、绘图和工程检查依赖，并以 editable 模式安装当前 AFVLM-CM 包。LLaVA 源码固定到官方 `v1.1.3`，通过体积固定的 release archive 安装而不是执行 `git clone`，可避免训练服务器连接 GitHub git 服务超时。环境安装不会下载 7B/CLIP 预训练参数。请在仓库根目录运行命令，并确保宿主机 NVIDIA 驱动兼容 CUDA 11.8。NF4 量化需要 bitsandbytes；Tesla V100 正式配置使用非量化 FP16。正式训练只读取本地模型权重。
 
 安装后可检查关键版本和 CUDA 可用性：
 
@@ -195,7 +195,9 @@ nano configs/methods/fedasync.yaml
 |---|---:|---|
 | 学习率、最大文本长度、LoRA 参数、评估间隔 | 是 | 创建新 profile 并指定 `--reuse_plans_from` |
 | FedProx `mu`、FedAsync `alpha`、FedBuff `buffer_size` 等方法参数 | 是 | 创建新 profile 并指定 `--reuse_plans_from` |
+| GPU 数量、FP16/BF16、运行时 backend | 是 | 创建新 profile 并指定 `--reuse_plans_from` |
 | `local_epochs`、`batch_size`、`gradient_accumulation` | 否 | 创建新 profile，不传 `--reuse_plans_from` |
+| 六个 `task_compute_factors` | 否 | 创建新 profile，不传 `--reuse_plans_from` |
 | `federation.rounds`、随机种子或系统异构性生成规则 | 否 | 创建新 profile，不传 `--reuse_plans_from` |
 | 只把客户端档位从 2 换成 5 或 10 | 不需要修改配置 | 运行时修改第二个参数 |
 
@@ -254,11 +256,9 @@ experiment_profiles/<profile>/
 
 ```bash
 # 单个方法：<method> <2|5|10> <profile>
-CUDA_VISIBLE_DEVICES=0 \
 bash scripts/run_one.sh fedasync 2 lr1e5_alpha03
 
 # 同一 profile 下依次运行全部 12 个 baseline
-CUDA_VISIBLE_DEVICES=0 \
 bash scripts/run_baselines.sh 2 lr1e5_alpha03
 ```
 
@@ -275,9 +275,10 @@ runs/llava/afvlm_cm/profiles/lr1e5_alpha03/2clients/fedasync/seed42/
 不需要恢复或再次编辑 `configs/base.yaml`，直接把运行命令的第三个参数换回旧 profile：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 ```
+
+注意：`default_e1_bs1_ga4_r10_s42` 是历史不可变的单执行器/BF16 快照。V100 八卡不要继续使用该旧 profile；按下文“八卡运行”先生成新的 FP16 profile。切回任何旧参数仍然只需替换第三个参数。
 
 正式论文实验建议始终传入第三个 profile 参数。省略第三个参数时使用当前可变的 `configs/` 与兼容目录，只适合临时调试，不适合作为最终可复现实验记录。
 
@@ -300,9 +301,34 @@ git push origin main
 
 ## 异步语义
 
-运行器先用虚拟时钟构造 TrainPlan，再按开始/到达事件重放。客户端在 `start_time` 下载当时的 `base_version` 和 LoRA 快照；即使服务器随后更新，该作业仍从旧快照训练。上传包含 `client_id`、`task`、`dataset`、`num_samples`、`base_version`、`arrival_time`、`local_state` 和 `delta`。服务器在到达时计算 `staleness = server_version - base_version`。
+运行器按常见异步联邦框架拆分为权威 Server/Method、虚拟时钟 Scheduler、Dispatcher、每张可见 GPU 一个常驻 Client Trainer 和 Aggregator。TrainPlan 只保存开始时间、到达时间、客户端速度、网络延迟、本地工作量和可选调度组，**不保存全局模型或指定客户端必须下载哪个参数版本**。运行器在 `start_time` 读取当时的 `base_version`，再调用该方法自己的 `prepare_download`：普通方法下载全局 LoRA，Local-only 下载客户端本地状态，Pilot 下载个性化状态，UniFed-LoRA 下载任务条件化状态，MasFL/AdaMasFL 同时冻结本地控制变量。即使服务器随后更新，该作业也仍从已冻结的 dispatch package 训练。
 
-这是连续事件式异步协议，不等同于 FLGo 在同一时钟 tick 汇总同时返回模型的具体实现。两者都具有旧版本训练和异步到达，但本项目用持久化虚拟时间隔离系统异构，保证方法间使用完全相同的到达条件。普通异步方法训练中不会获得新全局模型；只有声明专属能力的 FedASMU 可执行一次中途新鲜模型调整。
+worker 完成后先返回未经服务器处理的原始更新；父进程在计划的 `arrival_time` 调用权威方法实例的 `prepare_upload` 和 `on_arrival`。上传包含 `client_id`、`task`、`dataset`、`num_samples`、`base_version`、`arrival_time`、`local_state` 和 `delta`。服务器在到达时计算 `staleness = server_version - base_version`。FedASMU 的中途新鲜模型访问被建模为显式虚拟事件，不依赖某一次运行中偶然的 GPU 完成先后。
+
+默认 `runtime.arrival_policy: planned` 会按持久化虚拟到达顺序应用更新。物理并发客户端数等于当前可见 GPU 数量；某次运行的磁盘抖动或 GPU 波动只影响 wall-clock，不改变方法比较的逻辑到达条件。FedCompass 可以改变本地步数和分组，因为这是算法本身；其他方法不能通过修改 Plan 偷换系统条件。完整生命周期、特殊方法处理和任务耗时校准见 [`docs/async_runtime.md`](docs/async_runtime.md)。
+
+### V100 八卡运行
+
+当前可编辑配置已经设置 `runtime.backend: client_parallel`、`runtime.devices: all`、GPU 服务器聚合和 `model.dtype: fp16`。程序会使用当前进程可见的全部 GPU，不需要在普通运行命令中指定卡号。历史 profile 不会自动继承这些修改，因此先创建新的不可变多卡 profile：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile v100_fp16_8gpu_e1_bs1_ga4_r10_s42 \
+  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
+```
+
+每张 V100 会占用一份完整 7B FP16 模型及一个客户端的激活/优化器状态；这和原先 `device_map: auto` 把一个模型切到多卡不同。正常情况下无需设置 `CUDA_VISIBLE_DEVICES`。如果服务器还有其他任务、只想临时使用部分卡，可以选择性地设置该环境变量；程序会自动使用其中所有可见设备。
+
+若某些任务每个 optimizer step 本来就更慢，先完成一轮运行，再执行：
+
+```bash
+python tools/estimate_task_compute_factors.py \
+  runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_e1_bs1_ga4_r10_s42/2clients/fedasync/seed42
+```
+
+把输出因子写入 `configs/base.yaml` 后创建不复用旧 Plan的新 profile。任务固有耗时使用 `task_compute_factors`，设备差异使用 `speed_factor`，二者分开保存。
 
 ## 方法
 
@@ -328,40 +354,40 @@ FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前
 接口为 `bash scripts/run_one.sh <method> <setting> [profile]`，其中 setting 为 2、5 或 10。省略 profile 时使用原始兼容配置；提供 profile 时使用对应的不可变配置快照。以下是 2 clients/task 的每个正式 baseline 命令：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh local 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedavg 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedprox 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedadam 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedbuff 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedcompass 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasmu 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh masfl 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh adamasfl 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh pilot 2
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh unifed_lora 2
+bash scripts/run_one.sh local 2
+bash scripts/run_one.sh fedavg 2
+bash scripts/run_one.sh fedprox 2
+bash scripts/run_one.sh fedadam 2
+bash scripts/run_one.sh fedasync 2
+bash scripts/run_one.sh fedbuff 2
+bash scripts/run_one.sh fedcompass 2
+bash scripts/run_one.sh fedasmu 2
+bash scripts/run_one.sh masfl 2
+bash scripts/run_one.sh adamasfl 2
+bash scripts/run_one.sh pilot 2
+bash scripts/run_one.sh unifed_lora 2
 ```
 
-使用初始快照运行或切换回旧实验：
+使用前文创建的正式 V100 八卡快照：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedavg 2 default_e1_bs1_ga4_r10_s42
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 5 default_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedavg 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 5 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 ```
 
 profile 结果写入独立目录，例如：
 
 ```text
-runs/llava/afvlm_cm/profiles/default_e1_bs1_ga4_r10_s42/2clients/fedavg/seed42/
+runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_e1_bs1_ga4_r10_s42/2clients/fedavg/seed42/
 ```
 
 将最后一个参数改为 5 或 10 即选择对应数据集；例如：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedcompass 5
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh adamasfl 10
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh pilot 5
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh unifed_lora 10
+bash scripts/run_one.sh fedcompass 5
+bash scripts/run_one.sh adamasfl 10
+bash scripts/run_one.sh pilot 5
+bash scripts/run_one.sh unifed_lora 10
 ```
 
 直接使用完整配置的等价命令为：
@@ -382,7 +408,7 @@ bash scripts/run_baselines.sh 10
 对一个保存的 profile 批量运行：
 
 ```bash
-bash scripts/run_baselines.sh 2 default_e1_bs1_ga4_r10_s42
+bash scripts/run_baselines.sh 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 ```
 
 ### 命令行训练进度
@@ -390,14 +416,14 @@ bash scripts/run_baselines.sh 2 default_e1_bs1_ga4_r10_s42
 训练进度条默认开启，直接使用原有命令即可，不需要重新生成 system profile 或 TrainPlan：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42
 ```
 
 命令行会依次显示：
 
-- 数据加载完成和 LLaVA 模型加载阶段提示；
-- `fedasync client updates`：当前已完成的客户端更新数 / TrainPlan 总更新数，并显示服务器版本、当前客户端和 staleness；
-- `local <client_id> r<round>`：当前客户端真实 optimizer step / 计划 optimizer step，并动态显示当前 loss；
+- 元数据扫描完成以及所有可见 GPU worker 分别就绪的提示；
+- `fedasync virtual arrivals`：当前已应用的虚拟到达数 / TrainPlan 总更新数，并显示服务器版本、当前客户端和 staleness；
+- `GPU<n> <client_id>`：每张卡当前客户端的真实 optimizer step / 计划 optimizer step，并动态显示 loss；
 - `evaluate <task>`：定期 validation 和最终 test 时各任务已评估样本数。
 
 本地进度按 optimizer step 计数，不按 gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
@@ -405,8 +431,8 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10
 若需要把终端输出重定向到文件，建议同时打开 Python 非缓冲输出：
 
 ```bash
-PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 \
-  bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42 \
+PYTHONUNBUFFERED=1 \
+  bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_e1_bs1_ga4_r10_s42 \
   2>&1 | tee fedasync-2clients.log
 ```
 
@@ -428,15 +454,15 @@ output:
 训练完成后可独立复评：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
+python scripts/evaluate.py \
   --config configs/experiments/llava/afvlm_cm/2clients/fedasync.yaml \
   --checkpoint runs/llava/afvlm_cm/2clients/fedasync/seed42/checkpoints/final_trainable.pt \
   --output runs/llava/afvlm_cm/2clients/fedasync/seed42/metrics.reproduced.json
 ```
 
-每个运行目录包含 `resolved_config.yaml`、`system_profile.reference.json`、`train_plan.json`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、`metrics.json`、`system_stats.json`、`train.log` 与 `checkpoints/final_trainable.pt`。评估文件显式记录 `protocol`、`split`、`server_version`、`virtual_time` 和 `per_task`。检查点只保存联邦可训练状态、服务器/方法/调度器/随机状态及必要 metadata，不保存冻结的 7B 主干。
+每个运行目录包含 `resolved_config.yaml`、`system_profile.reference.json`、`train_plan.json`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、`metrics.json`、`system_stats.json`、`train.log` 与 `checkpoints/final_trainable.pt`。评估文件显式记录 `protocol`、`split`、`server_version`、`virtual_time` 和 `per_task`。并行更新日志还记录 worker/GPU 与真实开始、完成时间。检查点只保存联邦可训练状态、服务器/方法/调度器/随机状态及必要 metadata，不保存冻结的 7B 主干。
 
-系统统计包括 mean/median/max staleness、总/接受更新数、聚合次数、客户端/任务更新分布与虚拟训练时间；FedBuff 额外报告缓冲聚合次数、平均占用和平均等待时间；FedCompass 额外报告本地步数分配、分组完成时间与组内完成跨度。不同任务的量纲不兼容，因此不会把 accuracy、CIDEr 和 IoU 粗暴平均为一个原始分数。
+系统统计包括 mean/median/max staleness、总/接受更新数、聚合次数、客户端/任务更新分布、虚拟训练时间、真实 wall-clock 时间和 GPU worker 数；FedBuff 额外报告缓冲聚合次数、平均占用和平均等待时间；FedCompass 额外报告本地步数分配、分组完成时间与组内完成跨度。不同任务的量纲不兼容，因此不会把 accuracy、CIDEr 和 IoU 粗暴平均为一个原始分数。
 
 数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。
 

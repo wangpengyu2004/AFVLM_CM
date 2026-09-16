@@ -161,8 +161,9 @@ class Llava15Adapter(ModelAdapter):
         ]
 
     def snapshot_trainable(self) -> LoRAState:
+        """Return FP32 trainable state on the model's current device."""
         return {
-            name: parameter.detach().cpu().clone()
+            name: parameter.detach().float().clone()
             for name, parameter in self.named_federated_parameters()
         }
 
@@ -254,11 +255,11 @@ class Llava15Adapter(ModelAdapter):
         if not samples:
             raise ValueError("Local training received no samples")
         rng = random.Random(train_config.seed)
-        torch.manual_seed(train_config.seed)
+        torch.random.default_generator.manual_seed(train_config.seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(train_config.seed)
+            torch.cuda.manual_seed(train_config.seed)
         start = self.snapshot_trainable()
-        gradient_sum = zeros_like(start)
+        gradient_sum = zeros_like(start) if train_config.collect_mean_gradient else None
         parameter_groups = [
             {
                 "params": [
@@ -303,7 +304,7 @@ class Llava15Adapter(ModelAdapter):
                 window = micro_batches[
                     window_start : window_start + train_config.gradient_accumulation
                 ]
-                accumulated = 0.0
+                accumulated = None
                 for batch_indices in window:
                     for index in batch_indices:
                         encoded = self._encode(samples[index], train_config.max_text_length)
@@ -314,18 +315,32 @@ class Llava15Adapter(ModelAdapter):
                             else base_loss
                         )
                         (loss / len(window)).backward()
-                        accumulated += float(loss.detach().cpu())
-                for name, parameter in self.named_federated_parameters():
-                    if parameter.grad is not None:
-                        gradient_sum[name] = gradient_sum[name] + parameter.grad.detach().cpu()
+                        detached_loss = loss.detach()
+                        accumulated = (
+                            detached_loss
+                            if accumulated is None
+                            else accumulated + detached_loss
+                        )
+                if gradient_sum is not None:
+                    for name, parameter in self.named_federated_parameters():
+                        if parameter.grad is not None:
+                            gradient_sum[name] = (
+                                gradient_sum[name] + parameter.grad.detach().float()
+                            )
                 if train_config.gradient_hook:
                     train_config.gradient_hook(self, train_config.context)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 steps += 1
-                losses.append(accumulated / len(window))
+                if accumulated is None:
+                    raise RuntimeError("Gradient accumulation window produced no loss")
+                losses.append(float((accumulated / len(window)).item()))
                 progress.set_postfix(loss=f"{losses[-1]:.4f}", refresh=False)
                 progress.update(1)
+                if train_config.progress_hook:
+                    train_config.progress_hook(
+                        steps, train_config.planned_optimizer_steps, losses[-1]
+                    )
                 if train_config.step_hook:
                     hook_metadata.update(
                         train_config.step_hook(
@@ -351,7 +366,9 @@ class Llava15Adapter(ModelAdapter):
             delta=subtract(end, start),
             losses=losses,
             optimizer_steps=steps,
-            mean_gradient=scale_state(gradient_sum, 1.0 / steps),
+            mean_gradient=scale_state(gradient_sum, 1.0 / steps)
+            if gradient_sum is not None
+            else None,
             extra=hook_metadata,
         )
 

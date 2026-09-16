@@ -103,9 +103,13 @@ class FedProx(_RoundAggregator):
     def local_loss(self, base_loss: Any, model: Any, batch: Any, context: Mapping[str, Any]) -> Any:
         mu = float(self.params.get("mu", 0.01))
         anchor = context["base_state"]
+        device_anchor = context.setdefault("fedprox_device_anchor", {})
         penalty = None
         for name, parameter in model.named_federated_parameters():
-            reference = anchor[name].to(parameter.device, dtype=parameter.dtype)
+            reference = device_anchor.get(name)
+            if reference is None:
+                reference = anchor[name].to(parameter.device, dtype=parameter.dtype)
+                device_anchor[name] = reference
             value = (parameter - reference).pow(2).sum()
             penalty = value if penalty is None else penalty + value
         return base_loss + 0.5 * mu * penalty

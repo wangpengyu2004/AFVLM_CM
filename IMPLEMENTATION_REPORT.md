@@ -211,18 +211,18 @@ official COCO HTTP host and is shared by AOKVQA and Grounding.
 
 The registered methods are `local`, `fedavg`, `fedprox`, `fedadam`, `fedasync`, `fedbuff`, `fedcompass`, `fedasmu`, `masfl`, `adamasfl`, `pilot`, `unifed_lora`, and the unimplemented `ours` placeholder.
 
-- `local`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh local 2` (replace 2 with 5 or 10).
-- `fedavg`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedavg 2` (replace 2 with 5 or 10).
-- `fedprox`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedprox 2` (replace 2 with 5 or 10).
-- `fedadam`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedadam 2` (replace 2 with 5 or 10).
-- `fedasync`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasync 2` (replace 2 with 5 or 10).
-- `fedbuff`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedbuff 2` (replace 2 with 5 or 10).
-- `fedcompass`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedcompass 2` (replace 2 with 5 or 10).
-- `fedasmu`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh fedasmu 2` (replace 2 with 5 or 10).
-- `masfl`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh masfl 2` (replace 2 with 5 or 10).
-- `adamasfl`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh adamasfl 2` (replace 2 with 5 or 10).
-- `pilot`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh pilot 2` (replace 2 with 5 or 10).
-- `unifed_lora`: `CUDA_VISIBLE_DEVICES=0 bash scripts/run_one.sh unifed_lora 2` (replace 2 with 5 or 10).
+- `local`: `bash scripts/run_one.sh local 2` (replace 2 with 5 or 10).
+- `fedavg`: `bash scripts/run_one.sh fedavg 2` (replace 2 with 5 or 10).
+- `fedprox`: `bash scripts/run_one.sh fedprox 2` (replace 2 with 5 or 10).
+- `fedadam`: `bash scripts/run_one.sh fedadam 2` (replace 2 with 5 or 10).
+- `fedasync`: `bash scripts/run_one.sh fedasync 2` (replace 2 with 5 or 10).
+- `fedbuff`: `bash scripts/run_one.sh fedbuff 2` (replace 2 with 5 or 10).
+- `fedcompass`: `bash scripts/run_one.sh fedcompass 2` (replace 2 with 5 or 10).
+- `fedasmu`: `bash scripts/run_one.sh fedasmu 2` (replace 2 with 5 or 10).
+- `masfl`: `bash scripts/run_one.sh masfl 2` (replace 2 with 5 or 10).
+- `adamasfl`: `bash scripts/run_one.sh adamasfl 2` (replace 2 with 5 or 10).
+- `pilot`: `bash scripts/run_one.sh pilot 2` (replace 2 with 5 or 10).
+- `unifed_lora`: `bash scripts/run_one.sh unifed_lora 2` (replace 2 with 5 or 10).
 
 - `ours`: intentionally unavailable and excluded from `scripts/run_baselines.sh`.
 

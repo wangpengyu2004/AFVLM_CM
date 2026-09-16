@@ -174,10 +174,22 @@ def main() -> None:
                     errors.append(f"{setting} clients/task: detected total {len(clients)}")
             reference = resolved["fedavg"]
             for method, candidate in resolved.items():
-                for section in ("run", "model", "dataset", "training", "evaluation"):
+                for section in (
+                    "run",
+                    "runtime",
+                    "model",
+                    "dataset",
+                    "training",
+                    "evaluation",
+                ):
                     if candidate[section] != reference[section]:
                         errors.append(f"{method}/{setting} changes shared {section} settings")
-                for key in ("rounds", "system_profile", "train_plan"):
+                for key in (
+                    "rounds",
+                    "system_profile",
+                    "train_plan",
+                    "task_compute_factors",
+                ):
                     if candidate["federation"][key] != reference["federation"][key]:
                         errors.append(f"{method}/{setting} changes shared federation.{key}")
                 expected_output = f"runs/llava/afvlm_cm/{setting}clients/{method}/seed42"

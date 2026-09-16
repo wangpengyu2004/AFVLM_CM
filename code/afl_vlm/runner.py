@@ -16,8 +16,9 @@ from afl_vlm.config import resolved_public_config, validate_config
 from afl_vlm.data.afvlm_cm import AFVLMDataModule
 from afl_vlm.federation.client import FederatedClient
 from afl_vlm.federation.server import FederatedServer
+from afl_vlm.federation.types import ClientContext
 from afl_vlm.methods.registry import create_method
-from afl_vlm.models.base import TrainConfig, state_norm
+from afl_vlm.models.base import TrainConfig, clone_state, state_norm
 from afl_vlm.models.registry import create_model
 from afl_vlm.scheduling.train_plan import (
     build_train_plan,
@@ -89,6 +90,16 @@ def evaluate_method(
 
 
 def execute(config: dict[str, Any]) -> dict[str, Any]:
+    """Select the configured execution backend without changing method semantics."""
+    backend = str(config.get("runtime", {}).get("backend", "serial"))
+    if backend == "client_parallel":
+        from afl_vlm.parallel_runner import execute_parallel
+
+        return execute_parallel(config)
+    return execute_serial(config)
+
+
+def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     validate_config(config)
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()
@@ -162,6 +173,7 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
         tqdm.write("[AFVLM-CM] model ready; starting federated event replay")
     method.configure_model(model, profiles)
     server = FederatedServer(model, method, len(clients))
+    method.configure_server(server.state, profiles)
     federation = config["federation"]
     training = config["training"]
     if method.capabilities.requires_custom_scheduler or method.capabilities.mode == "synchronous":
@@ -190,6 +202,14 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
                 "The persisted TrainPlan does not match training.local_epochs, batch_size, "
                 "and gradient_accumulation; regenerate it with tools/generate_system_profiles.py"
             )
+        task_costs = {item.id: item.task_compute_factor for item in profiles}
+        if any(
+            abs(event.task_compute_factor - task_costs[event.client_id]) > 1e-12
+            for event in plan
+        ):
+            raise ValueError(
+                "The persisted TrainPlan does not match the system profile task compute factors"
+            )
     records = event_records(plan)
     _write_json(output / "train_plan.json", records)
     record_by_event = {int(item["event_id"]): item for item in records}
@@ -197,14 +217,22 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
     for item in plan:
         if item.group_id is not None:
             group_sizes[item.group_id] += 1
-    downloads: dict[int, int] = {}
-    download_states: dict[int, dict[str, Any]] = {}
-    active_snapshot_references: dict[int, int] = defaultdict(int)
+    job_contexts: dict[int, ClientContext] = {}
+    job_base_states: dict[int, dict[str, Any]] = {}
+    job_start_states: dict[int, dict[str, Any]] = {}
+    job_method_states: dict[int, dict[str, Any]] = {}
+    logical_fresh_states: dict[int, tuple[dict[str, Any], int]] = {}
     timeline = []
     for event in plan:
-        timeline.extend(
-            ((event.start_time, 1, "start", event), (event.arrival_time, 0, "arrival", event))
-        )
+        timeline.append((event.start_time, 2, "start", event))
+        if method.capabilities.requires_fresh_global_during_local_training:
+            refresh_fraction = float(
+                config["method"].get("params", {}).get("refresh_fraction", 0.5)
+            )
+            refresh_time = event.start_time + refresh_fraction * event.estimated_train_time
+            timeline.append((refresh_time, 1, "refresh", event))
+            record_by_event[event.event_id]["fresh_request_time"] = refresh_time
+        timeline.append((event.arrival_time, 0, "arrival", event))
     timeline.sort(key=lambda item: (item[0], item[1], item[3].client_id, item[3].local_round))
     staleness_values: list[int] = []
     buffer_occupancies: list[int] = []
@@ -226,13 +254,35 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
     for virtual_time, _, kind, event in timeline:
         last_virtual_time = max(last_virtual_time, virtual_time)
         if kind == "start":
-            downloads[event.event_id] = server.version
+            base_version = server.version
+            context = ClientContext(
+                client_id=event.client_id,
+                task=event.task,
+                dataset=event.dataset,
+                num_samples=len(clients[event.client_id].samples),
+                local_round=event.local_round,
+                base_version=base_version,
+                arrival_time=event.arrival_time,
+                seed=_seed(seed, event.client_id, event.local_round),
+            )
+            base_state = server.state
+            job_contexts[event.event_id] = context
+            job_base_states[event.event_id] = base_state
+            job_start_states[event.event_id] = method.prepare_download(
+                clone_state(base_state), context
+            )
+            job_method_states[event.event_id] = method.client_runtime_state(context)
             record_by_event[event.event_id]["base_version"] = server.version
-            download_states.setdefault(server.version, server.state)
-            active_snapshot_references[server.version] += 1
+            record_by_event[event.event_id]["download_policy"] = method.name
             continue
-        base_version = downloads[event.event_id]
-        base_state = download_states[base_version]
+        if kind == "refresh":
+            logical_fresh_states[event.event_id] = (server.state, server.version)
+            record_by_event[event.event_id]["fresh_global_version"] = server.version
+            continue
+        context = job_contexts.pop(event.event_id)
+        base_version = context.base_version
+        base_state = job_base_states.pop(event.event_id)
+        start_state = job_start_states.pop(event.event_id)
         stale = server.version - base_version
         staleness_values.append(stale)
         train_config = TrainConfig(
@@ -241,34 +291,32 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
             gradient_accumulation=int(training["gradient_accumulation"]),
             learning_rate=float(training["learning_rate"]),
             max_text_length=int(training["max_text_length"]),
-            seed=_seed(seed, event.client_id, event.local_round),
+            seed=context.seed,
+            collect_mean_gradient=method.capabilities.requires_mean_gradient,
             planned_optimizer_steps=event.local_steps,
             max_local_steps=event.local_steps
             if method.capabilities.requires_local_step_control
             else None,
         )
-        fresh_state = (
-            server.state
-            if method.capabilities.requires_fresh_global_during_local_training
-            else None
+        client_method = create_method(method.name, method.params)
+        client_method.load_client_runtime_state(
+            job_method_states.pop(event.event_id), context
         )
-        update = clients[event.client_id].train(
-            model,
-            method,
-            base_state,
-            base_version,
-            event.local_round,
-            event.arrival_time,
-            train_config,
-            fresh_state,
-            server.version if fresh_state is not None else None,
-            event.group_id,
-            group_sizes[event.group_id] if event.group_id is not None else None,
+        fresh_snapshot = logical_fresh_states.pop(event.event_id, None)
+        update = clients[event.client_id].train_prepared(
+            model=model,
+            method=client_method,
+            global_state=base_state,
+            start_state=start_state,
+            context=context,
+            train_config=train_config,
+            group_id=event.group_id,
+            group_size=group_sizes.get(event.group_id),
+            fresh_state_provider=(lambda snapshot=fresh_snapshot: snapshot)
+            if fresh_snapshot is not None
+            else None,
         )
-        active_snapshot_references[base_version] -= 1
-        if active_snapshot_references[base_version] == 0:
-            del active_snapshot_references[base_version]
-            del download_states[base_version]
+        update = method.prepare_upload(update, context)
         _append(
             output / "updates.jsonl",
             {
@@ -315,6 +363,7 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
                 else None,
                 "optimizer_steps": update.optimizer_steps,
                 "speed_factor": event.speed_factor,
+                "task_compute_factor": event.task_compute_factor,
                 "group_id": event.group_id,
                 "result_metadata": [item.metadata for item in results],
             },

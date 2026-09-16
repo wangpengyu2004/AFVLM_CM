@@ -25,13 +25,19 @@ def load_system_profile(path: str | Path) -> list[ClientSpec]:
             network_delay=float(item["network_delay"]),
             initial_availability=float(item["initial_availability"]),
             base_training_cost=float(item["base_training_cost"]),
+            task_compute_factor=float(item.get("task_compute_factor", 1.0)),
         )
         for item in payload["clients"]
     ]
 
 
 def _duration(client: ClientSpec, steps: int) -> float:
-    return client.base_training_cost * steps / client.speed_factor
+    return (
+        client.base_training_cost
+        * client.task_compute_factor
+        * steps
+        / client.speed_factor
+    )
 
 
 def optimizer_steps_for_epochs(
@@ -86,7 +92,11 @@ def build_train_plan(
         for client in specs:
             steps = nominal_steps[client.id]
             if mode == "semi_asynchronous":
-                steps = round(compass_target * client.speed_factor / client.base_training_cost)
+                steps = round(
+                    compass_target
+                    * client.speed_factor
+                    / (client.base_training_cost * client.task_compute_factor)
+                )
                 steps = max(
                     int(params.get("min_local_steps", 1)),
                     min(int(params.get("max_local_steps", max(nominal_steps.values()) * 4)), steps),
@@ -111,6 +121,7 @@ def build_train_plan(
                     estimated_train_time=train_time,
                     network_delay=client.network_delay,
                     local_steps=steps,
+                    task_compute_factor=client.task_compute_factor,
                 )
             )
         provisional.sort(key=lambda item: (item.arrival_time, item.client_id))
@@ -162,6 +173,7 @@ def event_records(events: list[ScheduledEvent]) -> list[dict[str, Any]]:
             "local_steps": item.local_steps,
             "group_id": item.group_id,
             "group_size": group_sizes.get(item.group_id) if item.group_id is not None else None,
+            "task_compute_factor": item.task_compute_factor,
         }
         for item in events
     ]
