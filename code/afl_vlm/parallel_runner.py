@@ -168,6 +168,8 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         and not config["output"].get("overwrite", False)
     ):
         raise FileExistsError(f"Output directory is not empty: {output}")
+    data_module = AFVLMDataModule(config["dataset"])
+    preflight = data_module.preflight_validate()
     output.mkdir(parents=True, exist_ok=True)
     for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
         (output / name).write_text("", encoding="utf-8")
@@ -182,7 +184,6 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         encoding="utf-8",
     )
 
-    data_module = AFVLMDataModule(config["dataset"])
     partitions = list(data_module.clients.values())
     profiles = load_system_profile(config["federation"]["system_profile"])
     profile_path = Path(str(config["federation"]["system_profile"])).resolve()
@@ -219,6 +220,10 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     model_config["max_text_length"] = config["training"]["max_text_length"]
     model_config["progress_bar"] = False
     if progress_enabled:
+        tqdm.write(
+            f"[AFVLM-CM] annotation preflight passed: {preflight['files']} files, "
+            f"{preflight['records']} records"
+        )
         tqdm.write(
             f"[AFVLM-CM] metadata ready: {len(partitions)} clients, "
             f"{sum(item.num_samples for item in partitions)} training samples"

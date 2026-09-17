@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "code"))
 
 from afl_vlm.config import load_config, validate_config  # noqa: E402
-from afl_vlm.data.afvlm_cm import scan_partitions  # noqa: E402
+from afl_vlm.data.afvlm_cm import AFVLMDataModule  # noqa: E402
 from afl_vlm.methods.registry import method_names  # noqa: E402
 from afl_vlm.scheduling.train_plan import (  # noqa: E402
     load_system_profile,
@@ -169,9 +169,13 @@ def main() -> None:
         cfg = resolved["fedavg"]
         try:
             if data_available:
-                _, clients = scan_partitions(cfg["dataset"])
+                data_module = AFVLMDataModule(cfg["dataset"])
+                preflight = data_module.preflight_validate()
+                clients = list(data_module.clients.values())
                 if len(clients) != 6 * setting:
                     errors.append(f"{setting} clients/task: detected total {len(clients)}")
+                if preflight["validation"] <= 0 or preflight["test"] <= 0:
+                    errors.append(f"{setting} clients/task: empty validation or test split")
             reference = resolved["fedavg"]
             for method, candidate in resolved.items():
                 for section in (

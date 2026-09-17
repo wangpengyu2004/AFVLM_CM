@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "code"))
 
 from afl_vlm.config import load_config, validate_config  # noqa: E402
-from afl_vlm.data.afvlm_cm import scan_partitions  # noqa: E402
+from afl_vlm.data.afvlm_cm import AFVLMDataModule  # noqa: E402
 from afl_vlm.methods.registry import create_method  # noqa: E402
 from afl_vlm.models.registry import create_model  # noqa: E402
 from afl_vlm.runner import evaluate_method  # noqa: E402
@@ -28,7 +28,9 @@ def main() -> None:
     os.chdir(ROOT)
     config = load_config(args.config)
     validate_config(config)
-    tasks, _ = scan_partitions(config["dataset"])
+    data_module = AFVLMDataModule(config["dataset"])
+    data_module.preflight_validate()
+    tasks = data_module.tasks
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()
     model = create_model(config["model"]["adapter"])

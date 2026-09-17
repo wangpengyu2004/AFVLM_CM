@@ -155,23 +155,101 @@ class AFVLMTaskAdapter(TaskAdapter):
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):
             raise ValueError(f"Expected a JSON list: {path}")
+        for index, record in enumerate(payload):
+            if not isinstance(record, dict):
+                raise ValueError(f"Expected an object at {path}[{index}]")
         return payload
 
-    def _sample(self, record: Mapping[str, Any], split: str, index: int) -> Sample:
-        conversations = record.get("conversations") or []
-        if len(conversations) < 2:
-            raise ValueError(f"AFVLM-CM record has no user/assistant pair: {record}")
-        image = resolve_image_path(
-            record,
-            {"image_root": self.image_root, "require_images": self.require_images},
+    @staticmethod
+    def _required_text(value: Any, field: str) -> str:
+        if not isinstance(value, (str, int, float, bool)):
+            raise ValueError(f"{field} must be a scalar value")
+        text = str(value).strip()
+        if not text:
+            raise ValueError(f"{field} must not be empty")
+        return text
+
+    def _instruction_answer(self, record: Mapping[str, Any]) -> tuple[str, str]:
+        """Read both official AFVLM-CM annotation representations.
+
+        FCIT-derived partitions mix LLaVA ``conversations`` records with flat
+        ``text``/``answer`` evaluation records. Grounding test records use
+        ``answer_bbox`` for the normalized target box. Multi-turn grounding
+        conversations remain one benchmark record; every turn is validated,
+        while the existing single-pair Sample interface consumes its first
+        user/assistant pair.
+        """
+        if "conversations" in record:
+            conversations = record["conversations"]
+            if not isinstance(conversations, list) or len(conversations) < 2:
+                raise ValueError("conversations must contain at least one user/assistant pair")
+            if len(conversations) % 2:
+                raise ValueError("conversations must contain complete user/assistant pairs")
+            values: list[str] = []
+            for index, message in enumerate(conversations):
+                if not isinstance(message, Mapping):
+                    raise ValueError(f"conversations[{index}] must be an object")
+                role = str(message.get("from", message.get("role", ""))).lower().strip()
+                allowed = {"human", "user"} if index % 2 == 0 else {"gpt", "assistant"}
+                if role not in allowed:
+                    expected = "user/human" if index % 2 == 0 else "assistant/gpt"
+                    raise ValueError(f"conversations[{index}] must have role {expected}")
+                values.append(
+                    self._required_text(message.get("value"), f"conversations[{index}].value")
+                )
+            return values[0].replace("<image>", "").strip(), values[1]
+
+        if "text" in record:
+            instruction = self._required_text(record["text"], "text")
+            answer_key = "answer_bbox" if "answer_bbox" in record else "answer"
+            if answer_key not in record:
+                raise ValueError("flat annotation must contain answer or answer_bbox")
+            answer = self._required_text(record[answer_key], answer_key)
+            return instruction.replace("<image>", "").strip(), answer
+
+        raise ValueError(
+            "record must use conversations or the flat text + answer/answer_bbox format"
         )
+
+    def _validated_record(
+        self,
+        record: Mapping[str, Any],
+        *,
+        canonicalize_image: bool = True,
+    ) -> tuple[str, str, Path]:
+        instruction, answer = self._instruction_answer(record)
+        image_value = record.get("image")
+        if not isinstance(image_value, str) or not image_value.strip():
+            raise ValueError("image must be a non-empty relative path")
+        if canonicalize_image:
+            image = resolve_image_path(
+                record,
+                {"image_root": self.image_root, "require_images": self.require_images},
+            )
+        else:
+            relative = image_value.replace("\\", "/")
+            while relative.startswith("./"):
+                relative = relative[2:]
+            relative_path = Path(relative)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise ValueError(f"Image path escapes image_root: {relative}")
+            image = self.image_root / relative_path
+            if self.require_images and not image.is_file():
+                raise FileNotFoundError(
+                    f"Missing image: {image}. Run tools/download_afvlm_cm_images.py "
+                    "for the required source."
+                )
+        return instruction, answer, image
+
+    def _sample(self, record: Mapping[str, Any], split: str, index: int) -> Sample:
+        instruction, answer, image = self._validated_record(record)
         sample_id = str(record.get("id") or record.get("question_id") or index)
         sample = Sample(
             id=f"{self.task_key}:{split}:{sample_id}:{index}",
             task_name=self.task_key,
             image=str(image),
-            instruction=str(conversations[0].get("value", "")).replace("<image>", "").strip(),
-            answer=str(conversations[1].get("value", "")).strip(),
+            instruction=instruction,
+            answer=answer,
             split=split,
             metadata={
                 "dataset": self.dataset_name,
@@ -181,6 +259,21 @@ class AFVLMTaskAdapter(TaskAdapter):
         )
         self._by_id[sample.id] = sample
         return sample
+
+    def validate_file(self, path: str | Path, split: str) -> int:
+        """Validate every annotation and image path without retaining samples."""
+        source = Path(path).resolve()
+        records = self._records(source)
+        for index, record in enumerate(records):
+            try:
+                self._validated_record(record, canonicalize_image=False)
+            except (FileNotFoundError, ValueError) as exc:
+                error_type = FileNotFoundError if isinstance(exc, FileNotFoundError) else ValueError
+                raise error_type(
+                    f"Invalid AFVLM-CM {self.task_key}/{split} annotation "
+                    f"at {source}[{index}]: {exc}"
+                ) from exc
+        return len(records)
 
     def load_file(self, path: str | Path, split: str = "train") -> list[Sample]:
         source = Path(path).resolve()
@@ -313,6 +406,21 @@ class AFVLMDataModule:
 
     def get_client_num_samples(self, client_id: str) -> int:
         return self.clients[client_id].num_samples
+
+    def preflight_validate(self) -> dict[str, int]:
+        """Validate all train/validation/test records before loading LLaVA."""
+        counts = {"files": 0, "train": 0, "validation": 0, "test": 0}
+        for partition in self.clients.values():
+            counts["train"] += self.tasks[partition.task].validate_file(
+                partition.train_file, "train"
+            )
+            counts["files"] += 1
+        for adapter in self.tasks.values():
+            for split, filename in (("validation", "val.json"), ("test", "test.json")):
+                counts[split] += adapter.validate_file(adapter.partition_dir / filename, split)
+                counts["files"] += 1
+        counts["records"] = counts["train"] + counts["validation"] + counts["test"]
+        return counts
 
     def get_task_val_data(self, task: str) -> list[Sample]:
         return self.tasks[task].load_split("validation")

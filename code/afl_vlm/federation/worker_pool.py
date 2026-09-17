@@ -376,6 +376,7 @@ class ClientWorkerPool:
             tuple[tuple[int, float, float, int], int, TrainJob | EvaluationJob]
         ] = []
         self._submission_sequence = 0
+        self._queues_closed = False
         for worker_id, device_id in enumerate(devices):
             process = self._context.Process(
                 target=_worker_main,
@@ -526,17 +527,40 @@ class ClientWorkerPool:
     def shutdown(self) -> None:
         if self._busy or self._pending:
             raise RuntimeError("Cannot cleanly stop GPU workers while jobs remain")
-        for worker_id in sorted(self._idle):
-            self._inputs[worker_id].put(ShutdownWorker())
-        for process in self._processes:
-            process.join(timeout=30)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=10)
+        try:
+            for worker_id in sorted(self._idle):
+                self._inputs[worker_id].put(ShutdownWorker())
+            for process in self._processes:
+                process.join(timeout=30)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10)
+        finally:
+            self._close_queues(cancel_pending=False)
 
     def abort(self) -> None:
-        for process in self._processes:
-            if process.is_alive():
-                process.terminate()
-        for process in self._processes:
-            process.join(timeout=10)
+        try:
+            for process in self._processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in self._processes:
+                process.join(timeout=10)
+        finally:
+            self._busy.clear()
+            self._pending.clear()
+            self._idle.clear()
+            self._close_queues(cancel_pending=True)
+
+    def _close_queues(self, *, cancel_pending: bool) -> None:
+        """Release multiprocessing feeder threads and semaphore handles exactly once."""
+        if self._queues_closed:
+            return
+        queues = [*self._inputs, self._output]
+        for item in queues:
+            if cancel_pending:
+                item.cancel_join_thread()
+            item.close()
+        if not cancel_pending:
+            for item in queues:
+                item.join_thread()
+        self._queues_closed = True
