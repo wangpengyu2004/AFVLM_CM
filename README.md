@@ -351,13 +351,13 @@ python tools/estimate_task_compute_factors.py \
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
-- `ours`：仅注册未来接口；当前调用会抛出 `NotImplementedError: The proposed AFVLM method has not been implemented yet.`
+- `ours`：敏感性感知异步 LoRA 整合；使用 LoRA group sensitivity、功能性陈旧度、按任务历史敏感性记忆和逐组精度融合。默认 `module_gate`，并支持 `rank_gate`、`adam_v` 消融。
 
 FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前固定任务客户端的强制 baseline；FedAST 的原问题是并行训练多个联邦模型，也不作为当前主 baseline。注册表保留后续扩展能力。
 
 ## 运行单个方法
 
-接口为 `bash scripts/run_one.sh <method> <setting> [profile]`，其中 setting 为 2、5 或 10。省略 profile 时使用原始兼容配置；提供 profile 时使用对应的不可变配置快照。以下是 2 clients/task 的每个正式 baseline 命令：
+接口为 `bash scripts/run_one.sh <method> <setting> [profile]`，其中 setting 为 2、5 或 10。省略 profile 时使用原始兼容配置；提供 profile 时使用对应的不可变配置快照。以下是 2 clients/task 的全部正式 baseline 及提出方法命令：
 
 ```bash
 bash scripts/run_one.sh local 2
@@ -372,7 +372,20 @@ bash scripts/run_one.sh masfl 2
 bash scripts/run_one.sh adamasfl 2
 bash scripts/run_one.sh pilot 2
 bash scripts/run_one.sh unifed_lora 2
+bash scripts/run_one.sh ours 2
 ```
+
+`ours` 的默认主配置使用 `module_gate` sensitivity。推荐为正式实验生成独立的不可变 profile：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile ours_module_gate_e1_bs1_ga4_r10_s42
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash scripts/run_one.sh ours 2 ours_module_gate_e1_bs1_ga4_r10_s42
+```
+
+如需 `rank_gate` 或 `adam_v` 消融，修改准备实验所用的 `configs/methods/ours.yaml`，并生成名称中明确包含 estimator 的新 profile；不要修改已保存的 profile。完整参数与公式见 `docs/ours.md`。
 
 使用前文创建的正式 V100 八卡快照：
 
@@ -394,6 +407,7 @@ bash scripts/run_one.sh fedcompass 5
 bash scripts/run_one.sh adamasfl 10
 bash scripts/run_one.sh pilot 5
 bash scripts/run_one.sh unifed_lora 10
+bash scripts/run_one.sh ours 2
 ```
 
 直接使用完整配置的等价命令为：
@@ -403,7 +417,7 @@ python scripts/run_experiment.py \
   --config configs/experiments/llava/afvlm_cm/2clients/fedasync.yaml
 ```
 
-批量运行全部 12 个 baseline（默认不包括尚未实现的 `ours`）：
+批量运行全部 12 个 baseline（`ours` 是待比较的提出方法，因此不加入 baseline 批处理）：
 
 ```bash
 bash scripts/run_baselines.sh 2
@@ -472,7 +486,7 @@ python scripts/evaluate.py \
 
 系统统计包括 mean/median/max staleness、总/接受更新数、聚合次数、客户端/任务更新分布、虚拟训练时间、真实 wall-clock 时间和 GPU worker 数；FedBuff 额外报告缓冲聚合次数、平均占用和平均等待时间；FedCompass 额外报告本地步数分配、分组完成时间与组内完成跨度。不同任务的量纲不兼容，因此不会把 accuracy、CIDEr 和 IoU 粗暴平均为一个原始分数。
 
-数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。
+数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。提出方法的公式、三种 sensitivity estimator、配置和运行流程见 `docs/ours.md`。
 
 ## 静态工程检查
 
@@ -499,7 +513,7 @@ ruff check code scripts tools
 - 当前训练入口保存可独立复评的最终联邦检查点，但尚未提供从任意中间异步事件恢复并继续训练的 CLI；这需要同时恢复仍在途的客户端作业快照。
 - Flickr30k 指令当前每条只有一个参考答案；内置 CIDEr 使用标准 1--4 gram TF-IDF 余弦构造，但与拥有五参考标注的官方 COCO caption scorer 不能宣称数值完全等价。
 - Pilot 的联合阶段适配和 FedASMU 的确定性刷新策略必须在论文中按上述差异披露。
-- `ours` 故意没有算法实现，也不在 baseline 批处理里。
+- `ours` 已实现，但其 sensitivity 是局部二次精度代理，并非完整 Hessian 或真实任务泛化重要性；当前只支持 LoRA-only 联邦状态。`ours` 不在 baseline 批处理里，应使用独立命令运行。
 
 ## 主要论文与数据来源
 

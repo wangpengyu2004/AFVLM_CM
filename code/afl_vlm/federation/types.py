@@ -114,3 +114,4 @@ class MethodCapabilities:
     requires_fresh_global_during_local_training: bool = False
     requires_local_state: bool = False
     requires_mean_gradient: bool = False
+    requires_group_sensitivity: bool = False

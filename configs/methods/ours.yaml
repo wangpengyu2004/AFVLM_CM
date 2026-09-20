@@ -1,5 +1,26 @@
 method:
   name: ours
-  params: {}
+  params:
+    # Main paper setting. Ablations: rank_gate, adam_v.
+    sensitivity_estimator: module_gate
+    sensitivity_beta: 0.95
+    adam_beta2: 0.999
+    sensitivity_floor: 0.000001
+    sensitivity_ceiling: 1000.0
+    # Functional staleness rho = exp(-gamma * min(delta, delta_max)).
+    gamma: 1.0
+    delta_max: 10.0
+    # Precision-weighted online consolidation.
+    lambda_history: 1.0
+    memory_beta: 0.9
+    omega_prior: 1.0
+    alpha_max: 0.9
+    epsilon_update: 0.000000000001
+    epsilon_precision: 0.000000000001
+    min_update_energy: 0.000000000001
+    min_optimizer_steps: 1
+    quality_weighting: constant
+    # null means equal fixed weight over all task IDs in the system profile.
+    task_weights: null
 federation:
   mode: asynchronous

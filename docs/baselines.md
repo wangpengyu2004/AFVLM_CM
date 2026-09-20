@@ -93,9 +93,11 @@ dimensions does not require changing the dataset.
 
 Paper: [UniFed-LoRA: Exploiting Semantic Task Correlation for Heterogeneous Multimodal Federated Fine-Tuning](https://openaccess.thecvf.com/content/CVPR2026W/FedVision/html/Milasheuski_UniFed-LoRA_Exploiting_Semantic_Task_Correlation_for_Heterogeneous_Multimodal_Federated_Fine-Tuning_CVPRW_2026_paper.html).
 
-## Proposed method placeholder
+## Proposed method
 
-`ours` is registered to reserve access to client/task/data/update/version/
-staleness/arrival/sample metadata and future server/client memory hooks. It
-always raises `NotImplementedError: The proposed AFVLM method has not been
-implemented yet.` and is excluded from baseline batches.
+`ours` implements sensitivity-aware asynchronous LoRA consolidation. Clients
+estimate module/rank/Adam-v LoRA sensitivity during normal backward passes;
+the server uses functional staleness, task-balanced historical sensitivity,
+and group-wise precision fusion. The default paper setting is Module-Gate.
+It is excluded from baseline batches because it is the proposed method, not
+because it is unavailable. Full equations and commands are in `docs/ours.md`.

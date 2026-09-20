@@ -69,10 +69,10 @@ FLGo 在通信时先为客户端打包服务器消息、再把客户端回复交
 `server_memory/client_memory` 都应由父进程中的 Method 实例持有，而不是放到 GPU worker。
 
 需要随最终 checkpoint 保存的额外状态必须进入 `state_dict()`，可恢复状态还必须实现
-`load_state_dict()`。`ours` 占位类已经为 `server_memory` 和 `client_memory` 预留序列化，
-但仍会按设计抛出 `NotImplementedError`，没有虚构具体算法。当前项目保存最终服务器和
-方法状态，尚未提供从中途事件游标恢复未完成训练的入口；实现断点续训时还需要恢复
-pending jobs、完成缓存、虚拟时间游标和随机数状态。
+`load_state_dict()`。`ours` 已把按任务、按 LoRA group 的历史敏感性与任务权重作为父进程
+方法状态保存；客户端 worker 只接收本次 sensitivity 收集所需的 group/reset metadata。
+当前项目保存最终服务器和方法状态，尚未提供从中途事件游标恢复未完成训练的入口；
+实现断点续训时还需要恢复 pending jobs、完成缓存、虚拟时间游标和随机数状态。
 
 ## 逻辑时间与真实 GPU 时间
 

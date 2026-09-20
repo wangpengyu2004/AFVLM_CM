@@ -95,6 +95,8 @@ This report records the implementation scope and engineering validation. No trai
 - `tools/validate_repository.py`
 - `docs/AFVLM_CM.md`
 - `docs/baselines.md`
+- `docs/ours.md`
+- `tests/test_ours_method.py`
 - `IMPLEMENTATION_REPORT.md`
 
 ## Files modified
@@ -209,7 +211,7 @@ official COCO HTTP host and is shared by AOKVQA and Grounding.
 
 ## Supported methods and commands
 
-The registered methods are `local`, `fedavg`, `fedprox`, `fedadam`, `fedasync`, `fedbuff`, `fedcompass`, `fedasmu`, `masfl`, `adamasfl`, `pilot`, `unifed_lora`, and the unimplemented `ours` placeholder.
+The registered methods are `local`, `fedavg`, `fedprox`, `fedadam`, `fedasync`, `fedbuff`, `fedcompass`, `fedasmu`, `masfl`, `adamasfl`, `pilot`, `unifed_lora`, and the implemented proposed method `ours`.
 
 - `local`: `bash scripts/run_one.sh local 2` (replace 2 with 5 or 10).
 - `fedavg`: `bash scripts/run_one.sh fedavg 2` (replace 2 with 5 or 10).
@@ -224,7 +226,7 @@ The registered methods are `local`, `fedavg`, `fedprox`, `fedadam`, `fedasync`, 
 - `pilot`: `bash scripts/run_one.sh pilot 2` (replace 2 with 5 or 10).
 - `unifed_lora`: `bash scripts/run_one.sh unifed_lora 2` (replace 2 with 5 or 10).
 
-- `ours`: intentionally unavailable and excluded from `scripts/run_baselines.sh`.
+- `ours`: `bash scripts/run_one.sh ours 2` (replace 2 with 5 or 10). It is excluded from `scripts/run_baselines.sh` because that script runs comparison baselines only.
 
 ## Versioned parameter and TrainPlan profiles
 

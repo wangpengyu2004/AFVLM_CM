@@ -143,11 +143,12 @@ def main() -> None:
     from afl_vlm.methods.registry import create_method
 
     try:
-        create_method("ours", {}).validate_runtime()
-        errors.append("ours must remain an unavailable placeholder")
-    except NotImplementedError as exc:
-        if str(exc) != "The proposed AFVLM method has not been implemented yet.":
-            errors.append(f"ours placeholder message changed: {exc}")
+        ours = create_method("ours", {})
+        ours.validate_runtime()
+        if not ours.capabilities.requires_group_sensitivity:
+            errors.append("ours must declare grouped sensitivity collection")
+    except Exception as exc:
+        errors.append(f"ours method validation failed: {exc}")
     experiments = sorted(
         (ROOT / "configs" / "experiments" / "llava" / "afvlm_cm").glob("*clients/*.yaml")
     )

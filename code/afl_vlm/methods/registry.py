@@ -41,4 +41,4 @@ def method_names() -> tuple[str, ...]:
 
 def method_capabilities() -> dict[str, Any]:
     _load_builtins()
-    return {name: cls({}).capabilities for name, cls in METHOD_REGISTRY.items() if name != "ours"}
+    return {name: cls({}).capabilities for name, cls in METHOD_REGISTRY.items()}
