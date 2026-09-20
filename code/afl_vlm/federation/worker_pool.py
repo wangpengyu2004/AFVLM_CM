@@ -157,9 +157,7 @@ def _evaluate_states(
         status(f"evaluating {client_id} ({split})")
         model.load_trainable(state)
         model.set_evaluation_context(task, client_id)
-        by_task.setdefault(task, []).append(
-            model.evaluate(tasks[task], sample_ids[task], "final")
-        )
+        by_task.setdefault(task, []).append(model.evaluate(tasks[task], sample_ids[task], "final"))
     return {
         task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
         for task, rows in by_task.items()
@@ -267,9 +265,7 @@ def _worker_main(
                     nonlocal request_counter
                     request_counter += 1
                     request_id = f"{job_id}:fresh:{request_counter}"
-                    output_queue.put(
-                        FreshStateRequest(worker_id, scheduled_event_id, request_id)
-                    )
+                    output_queue.put(FreshStateRequest(worker_id, scheduled_event_id, request_id))
                     response = command_queue.get()
                     if not isinstance(response, FreshStateResponse):
                         raise RuntimeError(
@@ -278,8 +274,7 @@ def _worker_main(
                         )
                     if response.request_id != request_id:
                         raise RuntimeError(
-                            "Fresh-state response mismatch: "
-                            f"{response.request_id} != {request_id}"
+                            f"Fresh-state response mismatch: {response.request_id} != {request_id}"
                         )
                     return state_to_device(response.state, worker_device), response.version
 
@@ -496,9 +491,7 @@ class ClientWorkerPool:
                     if process.exitcode not in {None, 0}
                 ]
                 if failed:
-                    raise RuntimeError(
-                        f"GPU worker process exited unexpectedly: {failed}"
-                    ) from exc
+                    raise RuntimeError(f"GPU worker process exited unexpectedly: {failed}") from exc
                 if timeout is not None:
                     raise
         if isinstance(message, TrainCompleted | EvaluationCompleted):

@@ -82,9 +82,7 @@ class AFVLMPreflightTests(unittest.TestCase):
                     ],
                 )
                 answer = (
-                    {"answer_bbox": "[0.1,0.2,0.3,0.4]"}
-                    if task == "grounding"
-                    else {"answer": "A"}
+                    {"answer_bbox": "[0.1,0.2,0.3,0.4]"} if task == "grounding" else {"answer": "A"}
                 )
                 _write(
                     task_root / "test.json",
@@ -131,9 +129,7 @@ class AFVLMPreflightTests(unittest.TestCase):
             )
             _write(path, [record])
 
-            with self.assertRaisesRegex(
-                ValueError, r"grounding/validation.*val\.json\[0\].*role"
-            ):
+            with self.assertRaisesRegex(ValueError, r"grounding/validation.*val\.json\[0\].*role"):
                 adapter.validate_file(path, "validation")
 
 

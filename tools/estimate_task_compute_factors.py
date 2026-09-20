@@ -35,15 +35,12 @@ def main() -> None:
         seconds_per_step[str(row["task"])].append((float(finish) - float(start)) / steps)
     if not seconds_per_step:
         parser.error("No parallel worker timing records were found")
-    task_medians = {
-        task: statistics.median(values) for task, values in seconds_per_step.items()
-    }
+    task_medians = {task: statistics.median(values) for task, values in seconds_per_step.items()}
     reference = statistics.median(task_medians.values())
     payload = {
         "federation": {
             "task_compute_factors": {
-                task: round(value / reference, 6)
-                for task, value in sorted(task_medians.items())
+                task: round(value / reference, 6) for task, value in sorted(task_medians.items())
             }
         },
         "measurement": {

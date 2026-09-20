@@ -49,9 +49,7 @@ class Method(ABC):
         """Install worker/model-side extensions after a model replica loads."""
         return None
 
-    def configure_server(
-        self, initial_state: LoRAState, clients: list[Any]
-    ) -> None:
+    def configure_server(self, initial_state: LoRAState, clients: list[Any]) -> None:
         """Initialize server-only algorithm state without requiring a GPU model."""
         return None
 
@@ -87,9 +85,7 @@ class Method(ABC):
         """
         return {}
 
-    def load_client_runtime_state(
-        self, state: Mapping[str, Any], context: ClientContext
-    ) -> None:
+    def load_client_runtime_state(self, state: Mapping[str, Any], context: ClientContext) -> None:
         """Install a dispatch-time local-hook snapshot inside one worker."""
         if state:
             raise ValueError(f"Method {self.name} does not accept client runtime state")

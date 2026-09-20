@@ -192,9 +192,9 @@ def create_profile(
     rounds = int(base_config["federation"]["rounds"])
     task_compute_factors = {
         task: float(value)
-        for task, value in base_config["federation"].get(
-            "task_compute_factors", {task: 1.0 for task in TASK_DATASETS}
-        ).items()
+        for task, value in base_config["federation"]
+        .get("task_compute_factors", {task: 1.0 for task in TASK_DATASETS})
+        .items()
     }
     if set(task_compute_factors) != set(TASK_DATASETS):
         raise ValueError("task_compute_factors must contain all six task IDs")
@@ -216,9 +216,7 @@ def create_profile(
             plan_bytes = plan_path.read_bytes()
             clients = _client_specs(json.loads(system_bytes))
             plan = load_train_plan(plan_path)
-            saved_task_costs = {
-                item.task: item.task_compute_factor for item in clients
-            }
+            saved_task_costs = {item.task: item.task_compute_factor for item in clients}
             if any(
                 saved_task_costs.get(task, 1.0) != factor
                 for task, factor in task_compute_factors.items()

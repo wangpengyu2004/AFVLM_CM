@@ -209,8 +209,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             )
         task_costs = {item.id: item.task_compute_factor for item in profiles}
         if any(
-            abs(event.task_compute_factor - task_costs[event.client_id]) > 1e-12
-            for event in plan
+            abs(event.task_compute_factor - task_costs[event.client_id]) > 1e-12 for event in plan
         ):
             raise ValueError(
                 "The persisted TrainPlan does not match the system profile task compute factors"
@@ -304,9 +303,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             else None,
         )
         client_method = create_method(method.name, method.params)
-        client_method.load_client_runtime_state(
-            job_method_states.pop(event.event_id), context
-        )
+        client_method.load_client_runtime_state(job_method_states.pop(event.event_id), context)
         fresh_snapshot = logical_fresh_states.pop(event.event_id, None)
         update = clients[event.client_id].train_prepared(
             model=model,

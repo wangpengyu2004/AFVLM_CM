@@ -363,9 +363,7 @@ class Llava15Adapter(ModelAdapter):
         encoded = {
             "input_ids": input_ids.to(self.device),
             "attention_mask": attention_mask.to(self.device),
-            "images": image_batch.to(
-                device=self.device, dtype=next(self.model.parameters()).dtype
-            ),
+            "images": image_batch.to(device=self.device, dtype=next(self.model.parameters()).dtype),
         }
         if labels is not None:
             encoded["labels"] = labels.to(self.device)
@@ -443,9 +441,7 @@ class Llava15Adapter(ModelAdapter):
                     (loss / len(window)).backward()
                     detached_loss = loss.detach()
                     accumulated = (
-                        detached_loss
-                        if accumulated is None
-                        else accumulated + detached_loss
+                        detached_loss if accumulated is None else accumulated + detached_loss
                     )
                 if gradient_sum is not None:
                     for name, parameter in self.named_federated_parameters():

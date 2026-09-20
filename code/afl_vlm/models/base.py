@@ -171,9 +171,7 @@ def _flat_values(value: ScalarOrTensor) -> Iterable[float]:
         yield float(value)
 
 
-def _sum_squares(
-    value: ScalarOrTensor, tensor_totals: dict[str, Any]
-) -> float:
+def _sum_squares(value: ScalarOrTensor, tensor_totals: dict[str, Any]) -> float:
     if isinstance(value, list):
         return sum(_sum_squares(item, tensor_totals) for item in value)
     if hasattr(value, "detach"):
@@ -193,10 +191,7 @@ def _dot_value(
     if isinstance(left, list) and isinstance(right, list):
         if len(left) != len(right):
             raise ValueError("State vectors have different lengths")
-        return sum(
-            _dot_value(a, b, tensor_totals)
-            for a, b in zip(left, right, strict=True)
-        )
+        return sum(_dot_value(a, b, tensor_totals) for a, b in zip(left, right, strict=True))
     if hasattr(left, "detach") and hasattr(right, "detach"):
         if left.shape != right.shape:
             raise ValueError("State tensors have different shapes")
@@ -209,9 +204,7 @@ def _dot_value(
 
 def state_norm(state: Mapping[str, ScalarOrTensor]) -> float:
     tensor_totals: dict[str, Any] = {}
-    scalar_total = sum(
-        _sum_squares(state[key], tensor_totals) for key in sorted(state)
-    )
+    scalar_total = sum(_sum_squares(state[key], tensor_totals) for key in sorted(state))
     total = scalar_total + sum(float(value.item()) for value in tensor_totals.values())
     return math.sqrt(total)
 
@@ -221,9 +214,7 @@ def state_dot(left: Mapping[str, ScalarOrTensor], right: Mapping[str, ScalarOrTe
     if set(left) != set(right):
         raise ValueError("State keys differ")
     tensor_totals: dict[str, Any] = {}
-    scalar_total = sum(
-        _dot_value(left[key], right[key], tensor_totals) for key in sorted(left)
-    )
+    scalar_total = sum(_dot_value(left[key], right[key], tensor_totals) for key in sorted(left))
     return scalar_total + sum(float(value.item()) for value in tensor_totals.values())
 
 

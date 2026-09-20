@@ -103,10 +103,7 @@ def _build_plan(config: dict[str, Any], method: Any, profiles: list[Any]) -> lis
             "and gradient_accumulation; regenerate it with tools/generate_system_profiles.py"
         )
     task_costs = {item.id: item.task_compute_factor for item in profiles}
-    if any(
-        abs(event.task_compute_factor - task_costs[event.client_id]) > 1e-12
-        for event in plan
-    ):
+    if any(abs(event.task_compute_factor - task_costs[event.client_id]) > 1e-12 for event in plan):
         raise ValueError(
             "The persisted TrainPlan does not match the system profile task compute factors"
         )
@@ -162,11 +159,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     np.random.seed(seed)
     progress_enabled = bool(config["output"].get("progress_bar", True))
     output = Path(str(config["output"]["directory"])).resolve()
-    if (
-        output.exists()
-        and any(output.iterdir())
-        and not config["output"].get("overwrite", False)
-    ):
+    if output.exists() and any(output.iterdir()) and not config["output"].get("overwrite", False):
         raise FileExistsError(f"Output directory is not empty: {output}")
     data_module = AFVLMDataModule(config["dataset"])
     preflight = data_module.preflight_validate()
@@ -228,9 +221,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             f"[AFVLM-CM] metadata ready: {len(partitions)} clients, "
             f"{sum(item.num_samples for item in partitions)} training samples"
         )
-        tqdm.write(
-            f"[AFVLM-CM] starting {len(devices)} persistent LLaVA workers on GPUs {devices}"
-        )
+        tqdm.write(f"[AFVLM-CM] starting {len(devices)} persistent LLaVA workers on GPUs {devices}")
         tqdm.write(f"[AFVLM-CM] server aggregation device: {aggregation_device}")
     pool = ClientWorkerPool(
         devices=devices,
@@ -331,9 +322,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 if method.evaluation_scope == "client_local_mean"
                 else {"global": server.state}
             )
-            worker_states = {
-                key: state_to_device(state, "cpu") for key, state in states.items()
-            }
+            worker_states = {key: state_to_device(state, "cpu") for key, state in states.items()}
             pool.submit(EvaluationJob(job_id, worker_states, split), priority=True)
             while job_id not in completed_evaluations:
                 handle_message(pool.receive())
@@ -470,9 +459,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     "physical_queue_wait_seconds": update.metadata.get(
                         "physical_queue_wait_seconds"
                     ),
-                    "dispatch_to_start_seconds": update.metadata.get(
-                        "dispatch_to_start_seconds"
-                    ),
+                    "dispatch_to_start_seconds": update.metadata.get("dispatch_to_start_seconds"),
                 },
             )
             receive_version = server.version
@@ -588,9 +575,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             ),
             "max_physical_queue_wait_seconds": max(physical_queue_waits, default=0.0),
             "mean_staleness": mean_staleness(staleness_values),
-            "median_staleness": statistics.median(staleness_values)
-            if staleness_values
-            else None,
+            "median_staleness": statistics.median(staleness_values) if staleness_values else None,
             "max_staleness": max(staleness_values, default=0),
             "update_count": server.received_updates,
             "accepted_update_count": server.accepted_updates,

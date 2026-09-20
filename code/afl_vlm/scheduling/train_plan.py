@@ -32,12 +32,7 @@ def load_system_profile(path: str | Path) -> list[ClientSpec]:
 
 
 def _duration(client: ClientSpec, steps: int) -> float:
-    return (
-        client.base_training_cost
-        * client.task_compute_factor
-        * steps
-        / client.speed_factor
-    )
+    return client.base_training_cost * client.task_compute_factor * steps / client.speed_factor
 
 
 def optimizer_steps_for_epochs(
