@@ -92,6 +92,7 @@ This report records the implementation scope and engineering validation. No trai
 - `tools/download_afvlm_cm_images.py`
 - `tools/download_models.py`
 - `tools/generate_system_profiles.py`
+- `tools/validate_afvlm_cm_data.py`
 - `tools/validate_repository.py`
 - `docs/AFVLM_CM.md`
 - `docs/baselines.md`

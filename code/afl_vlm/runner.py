@@ -118,7 +118,6 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     ):
         raise FileExistsError(f"Output directory is not empty: {output}")
     data_module = AFVLMDataModule(config["dataset"])
-    preflight = data_module.preflight_validate()
     output.mkdir(parents=True, exist_ok=True)
     for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
         (output / name).write_text("", encoding="utf-8")
@@ -160,10 +159,6 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         clients[item.client_id] = FederatedClient(item.client_id, item.task, item.dataset, samples)
 
     if progress_enabled:
-        tqdm.write(
-            f"[AFVLM-CM] annotation preflight passed: {preflight['files']} files, "
-            f"{preflight['records']} records"
-        )
         tqdm.write(
             f"[AFVLM-CM] data ready: {len(clients)} clients, "
             f"{sum(len(client.samples) for client in clients.values())} training samples"

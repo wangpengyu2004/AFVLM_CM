@@ -6,7 +6,7 @@ import json
 import math
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,15 +33,22 @@ def resolve_image_path(
     relative = str(value).replace("\\", "/")
     while relative.startswith("./"):
         relative = relative[2:]
-    image_root = Path(str(dataset_config["image_root"])).resolve()
-    image = (image_root / relative).resolve()
-    if not image.is_relative_to(image_root):
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
         raise ValueError(f"Image path escapes image_root: {relative}")
-    if bool(dataset_config.get("require_images", True)) and not image.is_file():
-        raise FileNotFoundError(
-            f"Missing image: {image}. Run tools/download_afvlm_cm_images.py "
-            "for the required source."
-        )
+    image_root = Path(str(dataset_config["image_root"]))
+    image = image_root / relative_path
+    if bool(dataset_config.get("require_images", True)):
+        resolved_root = image_root.resolve()
+        resolved_image = image.resolve()
+        if not resolved_image.is_relative_to(resolved_root):
+            raise ValueError(f"Image path escapes image_root through a symlink: {relative}")
+        if not resolved_image.is_file():
+            raise FileNotFoundError(
+                f"Missing image: {resolved_image}. Run tools/download_afvlm_cm_images.py "
+                "for the required source."
+            )
+        return resolved_image
     return image
 
 
@@ -216,6 +223,7 @@ class AFVLMTaskAdapter(TaskAdapter):
         record: Mapping[str, Any],
         *,
         canonicalize_image: bool = True,
+        verify_image: bool = False,
     ) -> tuple[str, str, Path]:
         instruction, answer = self._instruction_answer(record)
         image_value = record.get("image")
@@ -224,7 +232,10 @@ class AFVLMTaskAdapter(TaskAdapter):
         if canonicalize_image:
             image = resolve_image_path(
                 record,
-                {"image_root": self.image_root, "require_images": self.require_images},
+                {
+                    "image_root": self.image_root,
+                    "require_images": self.require_images and verify_image,
+                },
             )
         else:
             relative = image_value.replace("\\", "/")
@@ -234,7 +245,7 @@ class AFVLMTaskAdapter(TaskAdapter):
             if relative_path.is_absolute() or ".." in relative_path.parts:
                 raise ValueError(f"Image path escapes image_root: {relative}")
             image = self.image_root / relative_path
-            if self.require_images and not image.is_file():
+            if verify_image and self.require_images and not image.is_file():
                 raise FileNotFoundError(
                     f"Missing image: {image}. Run tools/download_afvlm_cm_images.py "
                     "for the required source."
@@ -260,19 +271,38 @@ class AFVLMTaskAdapter(TaskAdapter):
         self._by_id[sample.id] = sample
         return sample
 
-    def validate_file(self, path: str | Path, split: str) -> int:
-        """Validate every annotation and image path without retaining samples."""
+    def validate_file(
+        self,
+        path: str | Path,
+        split: str,
+        *,
+        verify_images: bool = True,
+        image_origins: dict[Path, str] | None = None,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> int:
+        """Validate every annotation and optionally collect/check its image path."""
         source = Path(path).resolve()
         records = self._records(source)
         for index, record in enumerate(records):
             try:
-                self._validated_record(record, canonicalize_image=False)
+                _, _, image = self._validated_record(
+                    record,
+                    canonicalize_image=False,
+                    verify_image=verify_images,
+                )
+                if image_origins is not None:
+                    image_origins.setdefault(
+                        image,
+                        f"{self.task_key}/{split} at {source}[{index}]",
+                    )
             except (FileNotFoundError, ValueError) as exc:
                 error_type = FileNotFoundError if isinstance(exc, FileNotFoundError) else ValueError
                 raise error_type(
                     f"Invalid AFVLM-CM {self.task_key}/{split} annotation "
                     f"at {source}[{index}]: {exc}"
                 ) from exc
+            if progress_callback is not None:
+                progress_callback()
         return len(records)
 
     def load_file(self, path: str | Path, split: str = "train") -> list[Sample]:
@@ -407,19 +437,76 @@ class AFVLMDataModule:
     def get_client_num_samples(self, client_id: str) -> int:
         return self.clients[client_id].num_samples
 
-    def preflight_validate(self) -> dict[str, int]:
-        """Validate all train/validation/test records before loading LLaVA."""
+    def preflight_validate(self, *, progress: bool = False) -> dict[str, int]:
+        """Explicitly validate all records and unique images without loading LLaVA."""
         counts = {"files": 0, "train": 0, "validation": 0, "test": 0}
-        for partition in self.clients.values():
-            counts["train"] += self.tasks[partition.task].validate_file(
-                partition.train_file, "train"
+        required_images: dict[Path, str] = {}
+        annotation_bar = None
+        if progress:
+            from tqdm.auto import tqdm
+
+            annotation_bar = tqdm(
+                desc="validate AFVLM-CM annotations",
+                unit="record",
+                dynamic_ncols=True,
             )
-            counts["files"] += 1
-        for adapter in self.tasks.values():
-            for split, filename in (("validation", "val.json"), ("test", "test.json")):
-                counts[split] += adapter.validate_file(adapter.partition_dir / filename, split)
+        advance = annotation_bar.update if annotation_bar is not None else None
+        try:
+            for partition in self.clients.values():
+                adapter = self.tasks[partition.task]
+                counts["train"] += adapter.validate_file(
+                    partition.train_file,
+                    "train",
+                    verify_images=False,
+                    image_origins=required_images if adapter.require_images else None,
+                    progress_callback=(lambda: advance(1)) if advance is not None else None,
+                )
                 counts["files"] += 1
+            for adapter in self.tasks.values():
+                for split, filename in (("validation", "val.json"), ("test", "test.json")):
+                    counts[split] += adapter.validate_file(
+                        adapter.partition_dir / filename,
+                        split,
+                        verify_images=False,
+                        image_origins=required_images if adapter.require_images else None,
+                        progress_callback=(lambda: advance(1)) if advance is not None else None,
+                    )
+                    counts["files"] += 1
+        finally:
+            if annotation_bar is not None:
+                annotation_bar.close()
+
+        image_bar = None
+        if progress:
+            from tqdm.auto import tqdm
+
+            image_bar = tqdm(
+                total=len(required_images),
+                desc="validate unique AFVLM-CM images",
+                unit="image",
+                dynamic_ncols=True,
+            )
+        try:
+            image_root = Path(str(self.config["image_root"])).resolve()
+            for image, origin in required_images.items():
+                resolved_image = image.resolve()
+                if not resolved_image.is_relative_to(image_root):
+                    raise ValueError(
+                        f"Image path referenced by {origin} escapes image_root through a "
+                        f"symlink: {image}"
+                    )
+                if not resolved_image.is_file():
+                    raise FileNotFoundError(
+                        f"Missing image referenced by {origin}: {resolved_image}. "
+                        "Run tools/download_afvlm_cm_images.py for the required source."
+                    )
+                if image_bar is not None:
+                    image_bar.update(1)
+        finally:
+            if image_bar is not None:
+                image_bar.close()
         counts["records"] = counts["train"] + counts["validation"] + counts["test"]
+        counts["unique_images"] = len(required_images)
         return counts
 
     def get_task_val_data(self, task: str) -> list[Sample]:

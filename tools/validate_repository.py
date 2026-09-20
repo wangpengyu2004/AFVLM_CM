@@ -171,12 +171,14 @@ def main() -> None:
         try:
             if data_available:
                 data_module = AFVLMDataModule(cfg["dataset"])
-                preflight = data_module.preflight_validate()
                 clients = list(data_module.clients.values())
                 if len(clients) != 6 * setting:
                     errors.append(f"{setting} clients/task: detected total {len(clients)}")
-                if preflight["validation"] <= 0 or preflight["test"] <= 0:
-                    errors.append(f"{setting} clients/task: empty validation or test split")
+                partition_root = Path(str(cfg["dataset"]["partition_root"]))
+                for task in cfg["dataset"]["tasks"]:
+                    for filename in ("val.json", "test.json"):
+                        if not (partition_root / task / filename).is_file():
+                            errors.append(f"{setting} clients/task: missing {task}/{filename}")
             reference = resolved["fedavg"]
             for method, candidate in resolved.items():
                 for section in (

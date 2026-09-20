@@ -107,8 +107,34 @@ class AFVLMPreflightTests(unittest.TestCase):
                     "validation": 6,
                     "test": 6,
                     "records": 18,
+                    "unique_images": 1,
                 },
             )
+
+    def test_normal_sample_loading_does_not_precheck_image_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = AFVLMTaskAdapter(
+                "vqa",
+                {"partition_dir": root, "image_root": root, "require_images": True},
+            )
+
+            sample = adapter._sample(_conversation("missing.jpg"), "train", 0)
+
+            self.assertEqual(Path(sample.image), root / "missing.jpg")
+
+    def test_explicit_validation_still_reports_missing_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = AFVLMTaskAdapter(
+                "vqa",
+                {"partition_dir": root, "image_root": root, "require_images": True},
+            )
+            path = root / "client_0.json"
+            _write(path, [_conversation("missing.jpg")])
+
+            with self.assertRaisesRegex(FileNotFoundError, "Missing image"):
+                adapter.validate_file(path, "train")
 
     def test_preflight_reports_late_malformed_conversation_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

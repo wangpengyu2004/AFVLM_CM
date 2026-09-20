@@ -29,7 +29,6 @@ def main() -> None:
     config = load_config(args.config)
     validate_config(config)
     data_module = AFVLMDataModule(config["dataset"])
-    data_module.preflight_validate()
     tasks = data_module.tasks
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()

@@ -31,7 +31,17 @@ data/AFVLM_CM/
 
 每个任务目录包含原有的 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 记录只读分区的静态完整性摘要。
 
-数据读取器兼容该 benchmark 实际存在的三种标注形式：LLaVA `conversations`、扁平的 `text + answer`，以及 Grounding 测试集的 `text + answer_bbox`。每次训练或独立评估都会在加载 LLaVA 前预检当前设置下的全部 `client_N.json`、`val.json`、`test.json` 记录、对话角色和图片相对路径；任一错误会直接报告任务、split、文件和记录下标，避免运行数小时后才在周期评估阶段失败。
+数据读取器兼容该 benchmark 实际存在的三种标注形式：LLaVA `conversations`、扁平的 `text + answer`，以及 Grounding 测试集的 `text + answer_bbox`。正常训练和独立评估不会在启动时全量扫描图片；样本真正进入 batch 时才读取对应图片。需要检查数据时，显式运行独立工具，它会验证当前设置下的全部 `client_N.json`、`val.json`、`test.json`，并对去重后的图片路径逐一检查：
+
+```bash
+python tools/validate_afvlm_cm_data.py --setting 2
+python tools/validate_afvlm_cm_data.py --setting 5
+python tools/validate_afvlm_cm_data.py --setting 10
+# 或一次检查三档
+python tools/validate_afvlm_cm_data.py --all
+```
+
+检查工具显示注解记录和唯一图片两个进度条；任一错误会报告任务、split、文件和记录位置。该工具只读取数据，不修改指令文件或图片。
 
 三个数据配置为：
 
@@ -495,6 +505,7 @@ python scripts/evaluate.py \
 ```bash
 python -m compileall -q code scripts tools
 python tools/validate_repository.py
+python tools/validate_afvlm_cm_data.py --setting 2  # 可选的全量数据/图片检查
 ruff check code scripts tools
 ```
 
