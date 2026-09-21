@@ -29,6 +29,7 @@ from afl_vlm.federation.worker_pool import (
     ClientWorkerPool,
     EvaluationCompleted,
     EvaluationJob,
+    EvaluationProgress,
     FreshStateRequest,
     TrainCompleted,
     TrainJob,
@@ -230,6 +231,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         queue_policy=queue_policy,
     )
     job_progress: dict[str, Any] = {}
+    evaluation_progress: dict[str, Any] = {}
     completed_updates: dict[int, Any] = {}
     completed_evaluations: dict[str, dict[str, Any]] = {}
     logical_fresh_states: dict[int, tuple[dict[str, Any], int]] = {}
@@ -273,6 +275,23 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     bar.update(max(0, message.current - bar.n))
                     bar.set_postfix(loss=f"{message.loss:.4f}", refresh=False)
                 return
+            if isinstance(message, EvaluationProgress):
+                if progress_enabled:
+                    bar = evaluation_progress.get(message.job_id)
+                    if bar is None:
+                        bar = tqdm(
+                            total=message.total,
+                            desc=f"evaluate {message.label}",
+                            unit="sample",
+                            dynamic_ncols=True,
+                            leave=False,
+                            position=len(devices) + 1,
+                        )
+                        evaluation_progress[message.job_id] = bar
+                    else:
+                        bar.set_description(f"evaluate {message.label}", refresh=False)
+                    bar.update(max(0, message.current - bar.n))
+                return
             if isinstance(message, FreshStateRequest):
                 snapshot = logical_fresh_states.get(message.event_id)
                 if snapshot is None:
@@ -288,6 +307,9 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     bar.close()
                 return
             if isinstance(message, EvaluationCompleted):
+                bar = evaluation_progress.pop(message.job_id, None)
+                if bar is not None:
+                    bar.close()
                 completed_evaluations[message.job_id] = message.metrics
                 return
             if isinstance(message, WorkerFailed):
@@ -642,6 +664,8 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         return {"metrics": metrics, "system": stats, "output": str(output)}
     except BaseException:
         for bar in job_progress.values():
+            bar.close()
+        for bar in evaluation_progress.values():
             bar.close()
         pool.abort()
         raise

@@ -256,7 +256,13 @@ class ModelAdapter(ABC):
         """Train locally and return an update relative to the loaded state."""
 
     @abstractmethod
-    def evaluate(self, task_adapter: Any, sample_ids: list[str], mode: str) -> MetricDict:
+    def evaluate(
+        self,
+        task_adapter: Any,
+        sample_ids: list[str],
+        mode: str,
+        progress_hook: Any | None = None,
+    ) -> MetricDict:
         """Evaluate the current state on a task-specific adapter."""
 
     def set_evaluation_context(self, task: str, client_id: str | None = None) -> None:

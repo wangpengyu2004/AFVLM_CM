@@ -494,13 +494,19 @@ class Llava15Adapter(ModelAdapter):
             extra=hook_metadata,
         )
 
-    def evaluate(self, task_adapter: Any, sample_ids: list[str], mode: str) -> dict[str, float]:
+    def evaluate(
+        self,
+        task_adapter: Any,
+        sample_ids: list[str],
+        mode: str,
+        progress_hook: Any | None = None,
+    ) -> dict[str, float]:
         torch = self._imports()[0]
         samples = task_adapter.samples_by_id(sample_ids)
         self.model.eval()
         losses, predictions, references = [], [], []
         with torch.no_grad():
-            for sample in tqdm(
+            iterator = tqdm(
                 samples,
                 desc=f"evaluate {task_adapter.task_key}",
                 unit="sample",
@@ -508,7 +514,8 @@ class Llava15Adapter(ModelAdapter):
                 leave=False,
                 dynamic_ncols=True,
                 disable=not bool(self._config.get("progress_bar", True)),
-            ):
+            )
+            for completed, sample in enumerate(iterator, start=1):
                 encoded = self._encode(
                     sample,
                     int(self._config.get("max_text_length", 512)),
@@ -526,6 +533,8 @@ class Llava15Adapter(ModelAdapter):
                         ).strip()
                     )
                     references.append(sample.answer)
+                if progress_hook is not None:
+                    progress_hook(completed, len(samples))
         return (
             {"loss": sum(losses) / len(losses)}
             if mode == "probe"

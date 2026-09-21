@@ -84,6 +84,15 @@ class WorkerProgress:
 
 
 @dataclass(slots=True)
+class EvaluationProgress:
+    worker_id: int
+    job_id: str
+    label: str
+    current: int
+    total: int
+
+
+@dataclass(slots=True)
 class FreshStateRequest:
     worker_id: int
     event_id: int
@@ -116,6 +125,7 @@ WorkerMessage = (
     WorkerReady
     | WorkerStatus
     | WorkerProgress
+    | EvaluationProgress
     | FreshStateRequest
     | TrainCompleted
     | EvaluationCompleted
@@ -138,18 +148,38 @@ def _evaluate_states(
     states: Mapping[str, LoRAState],
     split: str,
     status: Any,
+    progress: Any,
 ) -> dict[str, Any]:
     tasks = data_module.tasks
     sample_ids = {
         task: [sample.id for sample in adapter.load_split(split)] for task, adapter in tasks.items()
     }
+    total = (
+        sum(len(ids) for ids in sample_ids.values())
+        if set(states) == {"global"}
+        else sum(len(sample_ids[client_id.split("/", 1)[0]]) for client_id in states)
+    )
+    completed = 0
+
+    def evaluate_one(label: str, adapter: Any, ids: list[str]) -> dict[str, float]:
+        nonlocal completed
+        offset = completed
+        metrics = model.evaluate(
+            adapter,
+            ids,
+            "final",
+            progress_hook=lambda current, _task_total: progress(label, offset + current, total),
+        )
+        completed += len(ids)
+        return metrics
+
     if set(states) == {"global"}:
         model.load_trainable(states["global"])
         metrics = {}
         for task, adapter in tasks.items():
             status(f"evaluating {task} ({split})")
             model.set_evaluation_context(task, None)
-            metrics[task] = model.evaluate(adapter, sample_ids[task], "final")
+            metrics[task] = evaluate_one(task, adapter, sample_ids[task])
         return metrics
     by_task: dict[str, list[dict[str, float]]] = {}
     for client_id, state in states.items():
@@ -157,7 +187,7 @@ def _evaluate_states(
         status(f"evaluating {client_id} ({split})")
         model.load_trainable(state)
         model.set_evaluation_context(task, client_id)
-        by_task.setdefault(task, []).append(model.evaluate(tasks[task], sample_ids[task], "final"))
+        by_task.setdefault(task, []).append(evaluate_one(client_id, tasks[task], sample_ids[task]))
     return {
         task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
         for task, rows in by_task.items()
@@ -323,6 +353,7 @@ def _worker_main(
                 continue
             if isinstance(command, EvaluationJob):
                 current_job = command.job_id
+                evaluation_job_id = command.job_id
                 metrics = _evaluate_states(
                     model,
                     data_module,
@@ -332,6 +363,15 @@ def _worker_main(
                     },
                     command.split,
                     lambda message: output_queue.put(WorkerStatus(worker_id, message)),
+                    lambda label, current, total, job_id=evaluation_job_id: output_queue.put(
+                        EvaluationProgress(
+                            worker_id,
+                            job_id,
+                            label,
+                            current,
+                            total,
+                        )
+                    ),
                 )
                 output_queue.put(EvaluationCompleted(worker_id, command.job_id, metrics))
                 continue

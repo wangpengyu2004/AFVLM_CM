@@ -454,7 +454,7 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 - 元数据扫描完成以及所有可见 GPU worker 分别就绪的提示；
 - `fedasync virtual arrivals`：当前已应用的虚拟到达数 / TrainPlan 总更新数，并显示服务器版本、当前客户端和 staleness；
 - `GPU<n> <client_id>`：每张卡当前客户端的真实 optimizer step / 计划 optimizer step，并动态显示 loss；
-- `evaluate <task>`：定期 validation 和最终 test 时各任务已评估样本数。
+- `evaluate <task>`：定期 validation 和最终 test 时各任务已评估样本数。8 卡并行模式由主进程显示一条跨任务的总评估进度，任务切换时更新名称，不会让多个 GPU worker 同时写终端。
 
 本地进度按 optimizer step 计数，不按 gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
 
