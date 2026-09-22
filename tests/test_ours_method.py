@@ -135,6 +135,21 @@ class OursMethodTests(unittest.TestCase):
         self.assertAlmostEqual(mutation.metadata["module_alphas"][MODULE], 0.5)
         self.assertAlmostEqual(method.task_memory["vqa"][MODULE], 0.05)
         self.assertEqual(method.task_memory["cls"], {MODULE: 0.0})
+        diagnostics = mutation.metadata["ours_diagnostics"]
+        self.assertEqual(diagnostics["schema_version"], 1)
+        self.assertTrue(diagnostics["aggregation"]["accepted"])
+        self.assertEqual(
+            diagnostics["sensitivity"]["rank_by_module"][MODULE], [1.0, 1.0]
+        )
+        self.assertEqual(
+            diagnostics["sensitivity"]["observations_by_module"][MODULE], 2
+        )
+        self.assertAlmostEqual(
+            diagnostics["memory"]["task_memory_before"][MODULE], 0.0
+        )
+        self.assertAlmostEqual(
+            diagnostics["memory"]["task_memory_after"][MODULE], 0.05
+        )
 
     def test_functional_staleness_reduces_reliability_and_module_alpha(self) -> None:
         fresh = self.configured()
@@ -153,6 +168,23 @@ class OursMethodTests(unittest.TestCase):
         self.assertEqual(mutation.applied_weight, 0.0)
         self.assertFalse(mutation.increment_version)
         self.assertEqual(mutation.metadata["rejected"], "no_effective_update")
+        diagnostics = mutation.metadata["ours_diagnostics"]
+        self.assertFalse(diagnostics["aggregation"]["accepted"])
+        self.assertEqual(
+            diagnostics["aggregation"]["rejection_reason"], "no_effective_update"
+        )
+        self.assertEqual(
+            diagnostics["memory"]["task_memory_before"],
+            diagnostics["memory"]["task_memory_after"],
+        )
+
+    def test_sensitivity_observations_are_validated(self) -> None:
+        method = self.configured()
+        changed = update()
+        changed.metadata["sensitivity_observations"] = {MODULE: -1}
+
+        with self.assertRaisesRegex(ValueError, "observation count"):
+            method.prepare_upload(changed, None)
 
     def test_functionally_equal_but_parameter_changed_update_is_not_noop(self) -> None:
         method = self.configured()

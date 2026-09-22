@@ -532,6 +532,45 @@ python tools/estimate_task_compute_factors.py \
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
 - `ours`：Rank-Gate 敏感度感知异步 LoRA 聚合；使用 rank 级有效 LoRA 功能陈旧度、任务模块记忆和模块级共享 A/B 精度融合，不增加训练参数、不使用 SVD 或 rank 对齐。
 
+### 观察 `ours` 是否正常工作
+
+`ours` 的每次服务端到达都会在该行 `events.jsonl` 的
+`result_metadata[].ours_diagnostics` 中记录完整的版本化诊断信息。记录只由 `ours`
+生成，不改变其他方法的日志、训练状态或聚合路径。主要字段包括：
+
+- `sensitivity.rank_by_module`：每个 LoRA module 的完整 rank sensitivity；
+- `sensitivity.module_by_module`、观测次数、零值/截断比例和 top rank/module；
+- `functional_staleness`：版本陈旧度、server drift、local update、相对功能陈旧度和可靠度；
+- `aggregation.module_alpha_by_module`：每个模块实际使用的共享 A/B 聚合系数；
+- `memory`：当前任务记忆和跨任务历史精度在聚合前后的值；
+- rejected update 的拒绝原因和未变化的 memory。
+
+训练过程中可以直接查看最后一条记录：
+
+```bash
+tail -n 1 runs/llava/afvlm_cm/profiles/<profile>/2clients/ours/seed42/events.jsonl
+```
+
+训练中途或结束后可将嵌套记录导出为便于画图的 update/module CSV：
+
+```bash
+python tools/export_ours_diagnostics.py \
+  runs/llava/afvlm_cm/profiles/<profile>/2clients/ours/seed42
+```
+
+需要把完整 rank sensitivity 展开为一行一个 rank 时使用：
+
+```bash
+python tools/export_ours_diagnostics.py \
+  runs/llava/afvlm_cm/profiles/<profile>/2clients/ours/seed42 \
+  --include-ranks
+```
+
+默认输出到运行目录下的 `ours_diagnostics/`：
+`ours_update_diagnostics.csv`、`ours_module_diagnostics.csv`，以及可选的
+`ours_rank_diagnostics.csv`。CSV 是派生分析文件，可以随时重新生成；权威原始记录始终是
+`events.jsonl`。
+
 FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前固定任务客户端的强制 baseline；FedAST 的原问题是并行训练多个联邦模型，也不作为当前主 baseline。注册表保留后续扩展能力。
 
 ## 运行单个方法

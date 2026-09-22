@@ -403,6 +403,72 @@ def _parameter_delta_norm(state: Mapping[str, Any]) -> float:
     return math.sqrt(max(_as_float(total), 0.0))
 
 
+def _numeric_summary(values: Sequence[float], clip_max: float | None = None) -> dict[str, Any]:
+    """Build JSON-safe diagnostics without adding a numerical dependency."""
+
+    numbers = [float(value) for value in values]
+    if not numbers:
+        return {
+            "count": 0,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "max": None,
+            "zero_fraction": None,
+            "clipped_fraction": None,
+        }
+    mean = math.fsum(numbers) / len(numbers)
+    variance = math.fsum((value - mean) ** 2 for value in numbers) / len(numbers)
+    return {
+        "count": len(numbers),
+        "mean": mean,
+        "std": math.sqrt(max(variance, 0.0)),
+        "min": min(numbers),
+        "max": max(numbers),
+        "zero_fraction": sum(value == 0.0 for value in numbers) / len(numbers),
+        "clipped_fraction": (
+            sum(value >= clip_max for value in numbers) / len(numbers)
+            if clip_max is not None
+            else None
+        ),
+    }
+
+
+def _sensitivity_diagnostics(
+    rank_sensitivity: Mapping[str, Sequence[float]],
+    module_sensitivity: Mapping[str, float],
+    observations: Mapping[str, int],
+    clip_max: float,
+) -> dict[str, Any]:
+    rank_rows = [
+        {"module": module, "rank": index, "sensitivity": float(value)}
+        for module, values in sorted(rank_sensitivity.items())
+        for index, value in enumerate(values)
+    ]
+    top_ranks = sorted(
+        rank_rows,
+        key=lambda item: (-item["sensitivity"], item["module"], item["rank"]),
+    )[:10]
+    top_modules = [
+        {"module": module, "sensitivity": float(value)}
+        for module, value in sorted(
+            module_sensitivity.items(), key=lambda item: (-item[1], item[0])
+        )[:10]
+    ]
+    return {
+        "rank_by_module": copy.deepcopy(dict(rank_sensitivity)),
+        "module_by_module": copy.deepcopy(dict(module_sensitivity)),
+        "observations_by_module": dict(observations),
+        "rank_summary": _numeric_summary(
+            [item["sensitivity"] for item in rank_rows], clip_max=clip_max
+        ),
+        "module_summary": _numeric_summary(list(module_sensitivity.values())),
+        "observation_summary": _numeric_summary(list(observations.values())),
+        "top_ranks": top_ranks,
+        "top_modules": top_modules,
+    }
+
+
 @register_method("ours")
 class Ours(Method):
     """Rank-Gate sensitivity-aware asynchronous LoRA aggregation."""
@@ -568,9 +634,12 @@ class Ours(Method):
     def _validate_client_update(self, update: Update) -> None:
         rank_raw = update.metadata.get("rank_sensitivity")
         module_raw = update.metadata.get("module_sensitivity")
+        observation_raw = update.metadata.get("sensitivity_observations")
         metadata_raw = update.metadata.get("lora_metadata")
         if not isinstance(rank_raw, Mapping) or not isinstance(module_raw, Mapping):
             raise ValueError("Rank-Gate update requires rank and module sensitivity")
+        if not isinstance(observation_raw, Mapping):
+            raise ValueError("Rank-Gate update requires sensitivity observation counts")
         if not isinstance(metadata_raw, Mapping):
             raise ValueError("Rank-Gate update requires LoRA metadata")
         metadata = {
@@ -596,7 +665,12 @@ class Ours(Method):
 
         rank_sensitivity: dict[str, list[float]] = {}
         module_sensitivity: dict[str, float] = {}
-        if set(rank_raw) != set(metadata) or set(module_raw) != set(metadata):
+        observations: dict[str, int] = {}
+        if (
+            set(rank_raw) != set(metadata)
+            or set(module_raw) != set(metadata)
+            or set(observation_raw) != set(metadata)
+        ):
             raise ValueError("Sensitivity modules do not match LoRA modules")
         for name, item in metadata.items():
             values = _sensitivity_values(rank_raw[name])
@@ -610,10 +684,18 @@ class Ours(Method):
                 raise ValueError(f"Invalid module sensitivity for {name}")
             if not math.isclose(module_value, expected_mean, rel_tol=1e-5, abs_tol=1e-7):
                 raise ValueError(f"Module sensitivity is not the rank mean for {name}")
+            observation_value = observation_raw[name]
+            if isinstance(observation_value, bool):
+                raise ValueError(f"Invalid sensitivity observation count for {name}")
+            observation_count = int(observation_value)
+            if observation_count < 0 or observation_count != float(observation_value):
+                raise ValueError(f"Invalid sensitivity observation count for {name}")
             rank_sensitivity[name] = values
             module_sensitivity[name] = module_value
+            observations[name] = observation_count
         update.metadata["rank_sensitivity"] = rank_sensitivity
         update.metadata["module_sensitivity"] = module_sensitivity
+        update.metadata["sensitivity_observations"] = observations
         update.metadata["lora_metadata"] = metadata
         update.metadata["sensitivity_valid"] = bool(update.metadata.get("sensitivity_valid", False))
         update.metadata["_rank_gate_validated"] = True
@@ -676,6 +758,7 @@ class Ours(Method):
             raise ValueError("Update base_version cannot exceed server version")
         rank_sensitivity = update.metadata["rank_sensitivity"]
         module_sensitivity = update.metadata["module_sensitivity"]
+        observations = update.metadata["sensitivity_observations"]
         drift, local, relative = compute_functional_staleness(
             update.base_state,
             server_context.global_state,
@@ -685,6 +768,64 @@ class Ours(Method):
             eps=self._value("eps", 1e-12),
         )
         parameter_norm = _parameter_delta_norm(update.delta)
+        task_memory_before = {
+            module: float(self.task_memory[update.task][module])
+            for module in sorted(self._server_metadata)
+        }
+        historical_precision_before = {
+            module: self._historical_precision(module)
+            for module in sorted(self._server_metadata)
+        }
+        diagnostics = {
+            "schema_version": 1,
+            "client": {
+                "update_id": update.update_id,
+                "client_id": update.client_id,
+                "task": update.task,
+                "local_round": update.local_round,
+                "base_version": update.base_version,
+                "receive_version": server_context.version,
+                "arrival_time": update.arrival_time,
+                "num_samples": update.num_samples,
+                "optimizer_steps": update.optimizer_steps,
+            },
+            "sensitivity": {
+                "valid": bool(update.metadata["sensitivity_valid"]),
+                **_sensitivity_diagnostics(
+                    rank_sensitivity,
+                    module_sensitivity,
+                    observations,
+                    clip_max=self._value("sensitivity_clip_max", 10.0),
+                ),
+            },
+            "functional_staleness": {
+                "version_staleness": version_staleness,
+                "server_drift": drift,
+                "local_update": local,
+                "parameter_delta_norm": parameter_norm,
+                "relative_staleness": relative,
+                "reliability": None,
+            },
+            "aggregation": {
+                "accepted": False,
+                "rejection_reason": None,
+                "module_alpha_by_module": {},
+                "alpha_summary": _numeric_summary([]),
+            },
+            "memory": {
+                "task": update.task,
+                "task_memory_before": task_memory_before,
+                "task_memory_after": dict(task_memory_before),
+                "historical_precision_before": historical_precision_before,
+                "historical_precision_after": dict(historical_precision_before),
+                "task_memory_before_summary": _numeric_summary(
+                    list(task_memory_before.values())
+                ),
+                "task_memory_after_summary": _numeric_summary(
+                    list(task_memory_before.values())
+                ),
+            },
+        }
         common = {
             "version_staleness": version_staleness,
             "server_drift": drift,
@@ -692,18 +833,22 @@ class Ours(Method):
             "parameter_delta_norm": parameter_norm,
             "relative_staleness": relative,
             "sensitivity_valid": update.metadata["sensitivity_valid"],
+            "ours_diagnostics": diagnostics,
         }
         if any(not math.isfinite(value) for value in (drift, local, relative, parameter_norm)):
+            diagnostics["aggregation"]["rejection_reason"] = "non_finite_update"
             return self._reject(update, server_context, "non_finite_update", common)
-        minimum = self._value("min_update_energy", 1e-16)
-        if local < minimum and parameter_norm < minimum:
-            return self._reject(update, server_context, "no_effective_update", common)
-
         reliability = staleness_reliability(
             relative,
             gamma=self._value("gamma", 1.0),
             delta_max=self._value("delta_max", 10.0),
         )
+        diagnostics["functional_staleness"]["reliability"] = reliability
+        minimum = self._value("min_update_energy", 1e-16)
+        if local < minimum and parameter_norm < minimum:
+            diagnostics["aggregation"]["rejection_reason"] = "no_effective_update"
+            return self._reject(update, server_context, "no_effective_update", common)
+
         alphas = {
             module: compute_module_alpha(
                 module_sensitivity=module_sensitivity[module],
@@ -725,6 +870,30 @@ class Ours(Method):
                 history_beta * task_memory.get(module, 0.0)
                 + (1.0 - history_beta) * reliability * sensitivity
             )
+
+        task_memory_after = {
+            module: float(self.task_memory[update.task][module])
+            for module in sorted(self._server_metadata)
+        }
+        historical_precision_after = {
+            module: self._historical_precision(module)
+            for module in sorted(self._server_metadata)
+        }
+        diagnostics["aggregation"] = {
+            "accepted": True,
+            "rejection_reason": None,
+            "module_alpha_by_module": dict(alphas),
+            "alpha_summary": _numeric_summary(list(alphas.values())),
+        }
+        diagnostics["memory"].update(
+            {
+                "task_memory_after": task_memory_after,
+                "historical_precision_after": historical_precision_after,
+                "task_memory_after_summary": _numeric_summary(
+                    list(task_memory_after.values())
+                ),
+            }
+        )
 
         alpha_values = list(alphas.values())
         metadata = {
