@@ -2,7 +2,7 @@
 
 AFVLM-CM 是用于论文实验的异步联邦视觉语言模型指令微调框架，研究固定任务客户端下的任务异构与系统异构：每个客户端永久属于一个任务，客户端速度、可用时间和网络延迟不同，但不存在持续学习或任务增量流。
 
-正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。默认运行时自动发现全部可见 GPU，并按方法能力选择物理执行器：普通 local-epoch 方法与 `ours` 使用全部 GPU 对同一客户端做 DDP，依赖特殊 optimizer-step 轨迹、动态本地步数、中途刷新或动态 adapter 的方法保留“一卡一个客户端”worker pool。两条路径都按同一虚拟 TrainPlan 冻结 base version 并按计划到达顺序聚合。冻结 7B 主干不会上传、聚合或写入联邦检查点。
+正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。LoRA 仅作用于语言模型侧：即使 `q_proj/k_proj/v_proj` 名称同时匹配 CLIP，冻结的 vision tower/vision resampler 参数也会从优化器、DDP 归约和联邦状态中排除。默认运行时自动发现全部可见 GPU，并按方法能力选择物理执行器：普通 local-epoch 方法与 `ours` 使用全部 GPU 对同一客户端做 DDP，依赖特殊 optimizer-step 轨迹、动态本地步数、中途刷新或动态 adapter 的方法保留“一卡一个客户端”worker pool。两条路径都按同一虚拟 TrainPlan 冻结 base version 并按计划到达顺序聚合。冻结 7B 主干不会上传、聚合或写入联邦检查点。
 
 ## 已检测的数据
 

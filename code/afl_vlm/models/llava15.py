@@ -22,6 +22,14 @@ from afl_vlm.models.base import (
 )
 from afl_vlm.models.registry import register_model
 
+_FROZEN_MULTIMODAL_BRANCHES = ("vision_tower", "vision_resampler")
+
+
+def _is_frozen_multimodal_parameter(name: str) -> bool:
+    """Return whether a parameter belongs to LLaVA's frozen visual branch."""
+    components = name.split(".")
+    return any(branch in components for branch in _FROZEN_MULTIMODAL_BRANCHES)
+
 
 @register_model("llava15")
 class Llava15Adapter(ModelAdapter):
@@ -172,7 +180,15 @@ class Llava15Adapter(ModelAdapter):
         )
         self.model = get_peft_model(self.model, peft)
         for name, parameter in self.model.named_parameters():
-            if "mm_projector" in name:
+            if _is_frozen_multimodal_parameter(name):
+                # q/k/v_proj also occur inside CLIP.  PEFT's suffix matching
+                # therefore installs LoRA there unless we explicitly restore
+                # the original LLaVA frozen-vision contract.  Those adapters
+                # cannot receive gradients because CLIPVisionTower.forward is
+                # no_grad; excluding them also keeps DDP and federation scoped
+                # to the language-side LoRA parameters.
+                parameter.requires_grad_(False)
+            elif "mm_projector" in name:
                 parameter.requires_grad = bool(lora.get("train_mm_projector", False))
         self.device = self.model.get_input_embeddings().weight.device
 
