@@ -25,6 +25,7 @@ class Pilot(Method):
     name = "pilot"
     capabilities = MethodCapabilities(
         mode="synchronous",
+        supports_client_ddp=False,
         requires_task_id=True,
         requires_custom_adapter=True,
         requires_local_state=True,

@@ -3,6 +3,8 @@ run:
 
 runtime:
   backend: client_parallel
+  # DDP-capable methods use all visible GPUs for one client; step-sensitive methods keep workers.
+  executor_policy: capability
   devices: all
   aggregation_device: auto
   start_method: spawn

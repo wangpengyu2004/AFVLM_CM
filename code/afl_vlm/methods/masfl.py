@@ -32,6 +32,7 @@ from afl_vlm.models.base import (
 class _MasFL(Method):
     capabilities = MethodCapabilities(
         mode="asynchronous",
+        supports_client_ddp=False,
         requires_staleness=True,
         requires_local_state=True,
         requires_mean_gradient=True,

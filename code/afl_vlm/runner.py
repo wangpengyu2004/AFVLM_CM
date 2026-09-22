@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import statistics
 from collections import Counter, defaultdict
@@ -26,6 +27,7 @@ from afl_vlm.scheduling.train_plan import (
     load_system_profile,
     load_train_plan,
     mean_staleness,
+    optimizer_steps_for_distributed_epochs,
     optimizer_steps_for_epochs,
 )
 
@@ -39,17 +41,21 @@ def _seed(seed: int, *parts: Any) -> int:
 
 
 def _write_json(path: Path, payload: Any) -> None:
+    if os.environ.get("AFVLM_PRIMARY_PROCESS", "1") != "1":
+        return
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
     )
 
 
 def _append(path: Path, payload: Any) -> None:
+    if os.environ.get("AFVLM_PRIMARY_PROCESS", "1") != "1":
+        return
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
 
 
-def evaluate_method(
+def _evaluate_method_primary(
     model: Any, method: Any, server_state: dict[str, Any], tasks: dict[str, Any], split: str
 ) -> dict[str, Any]:
     """Run the conventional primary evaluation for one server checkpoint.
@@ -89,6 +95,22 @@ def evaluate_method(
         model.load_trainable(original)
 
 
+def evaluate_method(
+    model: Any, method: Any, server_state: dict[str, Any], tasks: dict[str, Any], split: str
+) -> dict[str, Any]:
+    """Evaluate on DDP rank zero and broadcast the immutable metric object."""
+    import torch
+
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if not distributed:
+        return _evaluate_method_primary(model, method, server_state, tasks, split)
+    payload: list[Any] = [None]
+    if torch.distributed.get_rank() == 0:
+        payload[0] = _evaluate_method_primary(model, method, server_state, tasks, split)
+    torch.distributed.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
 def execute(config: dict[str, Any]) -> dict[str, Any]:
     """Select the configured execution backend without changing method semantics."""
     backend = str(config.get("runtime", {}).get("backend", "serial"))
@@ -104,30 +126,50 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()
     import numpy as np
+    import torch
+
+    distributed = str(config.get("runtime", {}).get("backend")) == "client_ddp"
+    rank, local_rank, world_size = 0, 0, 1
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("client_ddp requires CUDA")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+    primary = rank == 0
+    os.environ["AFVLM_PRIMARY_PROCESS"] = "1" if primary else "0"
 
     run = config["run"]
     seed = int(run["seed"])
-    progress_enabled = bool(config["output"].get("progress_bar", True))
+    progress_enabled = bool(config["output"].get("progress_bar", True)) and primary
     random.seed(seed)
     np.random.seed(seed)
     output = Path(str(config["output"]["directory"])).resolve()
-    if (
+    if primary and (
         output.exists()
         and any(output.iterdir())
         and not bool(config["output"].get("overwrite", False))
     ):
         raise FileExistsError(f"Output directory is not empty: {output}")
     data_module = AFVLMDataModule(config["dataset"])
-    output.mkdir(parents=True, exist_ok=True)
-    for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
-        (output / name).write_text("", encoding="utf-8")
-    (output / "train.log").write_text(
-        f"AFVLM-CM run start\nmethod={method.name}\nseed={seed}\n", encoding="utf-8"
-    )
-    (output / "resolved_config.yaml").write_text(
-        yaml.safe_dump(resolved_public_config(config), sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
+    if primary:
+        output.mkdir(parents=True, exist_ok=True)
+        for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
+            (output / name).write_text("", encoding="utf-8")
+        (output / "train.log").write_text(
+            f"AFVLM-CM run start\nmethod={method.name}\nseed={seed}\n"
+            f"runtime={'client_ddp' if distributed else 'serial'}\n"
+            f"world_size={world_size}\n",
+            encoding="utf-8",
+        )
+        (output / "resolved_config.yaml").write_text(
+            yaml.safe_dump(resolved_public_config(config), sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+    if distributed:
+        torch.distributed.barrier()
 
     tasks = data_module.tasks
     partitions = list(data_module.clients.values())
@@ -168,12 +210,16 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     model_config = dict(config["model"])
     model_config["max_text_length"] = config["training"]["max_text_length"]
     model_config["progress_bar"] = progress_enabled
+    if distributed:
+        model_config["device_map"] = {"": local_rank}
     model.load(model_config)
     if progress_enabled:
         tqdm.write("[AFVLM-CM] model ready; starting federated event replay")
     method.configure_model(model, profiles)
     server = FederatedServer(model, method, len(clients))
     method.configure_server(server.state, profiles)
+    if distributed:
+        model.enable_distributed_data_parallel(local_rank)
     federation = config["federation"]
     training = config["training"]
     if method.capabilities.requires_custom_scheduler or method.capabilities.mode == "synchronous":
@@ -284,6 +330,21 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         start_state = job_start_states.pop(event.event_id)
         stale = server.version - base_version
         staleness_values.append(stale)
+        physical_optimizer_steps = (
+            optimizer_steps_for_distributed_epochs(
+                len(clients[event.client_id].samples),
+                int(training["local_epochs"]),
+                int(training["batch_size"]),
+                int(training["gradient_accumulation"]),
+                world_size,
+            )
+            if distributed
+            else event.local_steps
+        )
+        record_by_event[event.event_id]["physical_optimizer_steps"] = physical_optimizer_steps
+        record_by_event[event.event_id]["physical_executor"] = (
+            "client_ddp" if distributed else "serial"
+        )
         train_config = TrainConfig(
             local_epochs=int(training["local_epochs"]),
             batch_size=int(training["batch_size"]),
@@ -292,10 +353,12 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             max_text_length=int(training["max_text_length"]),
             seed=context.seed,
             collect_mean_gradient=method.capabilities.requires_mean_gradient,
-            planned_optimizer_steps=event.local_steps,
+            planned_optimizer_steps=physical_optimizer_steps,
             max_local_steps=event.local_steps
             if method.capabilities.requires_local_step_control
             else None,
+            distributed_rank=rank,
+            distributed_world_size=world_size,
         )
         client_method = create_method(method.name, method.params)
         client_method.load_client_runtime_state(job_method_states.pop(event.event_id), context)
@@ -355,8 +418,8 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 "accepted": any(item.applied_weight > 0 for item in results),
                 "aggregation_weight": sum(item.applied_weight for item in results),
                 "planned_local_steps": event.local_steps,
-                "assigned_local_steps": event.local_steps
-                if method.capabilities.requires_local_step_control
+                "assigned_local_steps": physical_optimizer_steps
+                if distributed or method.capabilities.requires_local_step_control
                 else None,
                 "optimizer_steps": update.optimizer_steps,
                 "speed_factor": event.speed_factor,
@@ -423,6 +486,12 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         },
     )
     stats = {
+        "runtime_backend": "client_ddp" if distributed else "serial",
+        "ddp_world_size": world_size,
+        "per_device_batch_size": int(training["batch_size"]),
+        "effective_batch_size": (
+            int(training["batch_size"]) * int(training["gradient_accumulation"]) * world_size
+        ),
         "mean_staleness": mean_staleness(staleness_values),
         "median_staleness": statistics.median(staleness_values) if staleness_values else None,
         "max_staleness": max(staleness_values, default=0),
@@ -461,9 +530,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             for group in group_sizes
         }
     _write_json(output / "system_stats.json", stats)
-    if bool(config["output"].get("save_checkpoint", True)):
-        import torch
-
+    if primary and bool(config["output"].get("save_checkpoint", True)):
         checkpoint_dir = output / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -487,13 +554,20 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                     "dataset": config["dataset"]["name"],
                     "clients_per_task": config["dataset"]["clients_per_task"],
                     "model_path": config["model"]["model_path"],
+                    "runtime_backend": "client_ddp" if distributed else "serial",
+                    "ddp_world_size": world_size,
                 },
             },
             checkpoint_dir / "final_trainable.pt",
         )
-    with (output / "train.log").open("a", encoding="utf-8") as handle:
-        handle.write(
-            f"AFVLM-CM run complete\nserver_version={server.version}\n"
-            f"virtual_completion_time={last_virtual_time}\n"
-        )
-    return {"metrics": metrics, "system": stats, "output": str(output)}
+    if primary:
+        with (output / "train.log").open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"AFVLM-CM run complete\nserver_version={server.version}\n"
+                f"virtual_completion_time={last_virtual_time}\n"
+            )
+    result = {"metrics": metrics, "system": stats, "output": str(output)}
+    if distributed:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+    return result

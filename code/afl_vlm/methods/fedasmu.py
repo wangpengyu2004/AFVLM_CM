@@ -32,6 +32,7 @@ class FedASMU(Method):
     name = "fedasmu"
     capabilities = MethodCapabilities(
         mode="asynchronous",
+        supports_client_ddp=False,
         requires_staleness=True,
         requires_fresh_global_during_local_training=True,
     )

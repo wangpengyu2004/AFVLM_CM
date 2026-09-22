@@ -27,4 +27,17 @@ if [[ ! -f "$config" ]]; then
   echo "Unknown method or missing experiment config: $config" >&2
   exit 2
 fi
-python scripts/run_experiment.py --config "$config"
+backend="$(python tools/select_runtime_backend.py --config "$config")"
+echo "[AFVLM-CM] config: $config"
+echo "[AFVLM-CM] selected runtime backend: $backend"
+if [[ "$backend" == "client_ddp" ]]; then
+  echo "[AFVLM-CM] launching one DDP process per visible GPU"
+  python -m torch.distributed.run \
+    --standalone \
+    --nproc_per_node=gpu \
+    scripts/run_experiment.py \
+    --config "$config" \
+    --runtime-backend client_ddp
+else
+  python scripts/run_experiment.py --config "$config" --runtime-backend "$backend"
+fi

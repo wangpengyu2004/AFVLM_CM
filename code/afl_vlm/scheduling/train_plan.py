@@ -49,6 +49,28 @@ def optimizer_steps_for_epochs(
     return local_epochs * math.ceil(micro_batches / gradient_accumulation)
 
 
+def optimizer_steps_for_distributed_epochs(
+    num_samples: int,
+    local_epochs: int,
+    per_device_batch_size: int,
+    gradient_accumulation: int,
+    world_size: int,
+) -> int:
+    """Return DDP steps with a padded DistributedSampler-style partition."""
+    values = (
+        num_samples,
+        local_epochs,
+        per_device_batch_size,
+        gradient_accumulation,
+        world_size,
+    )
+    if any(value <= 0 for value in values):
+        raise ValueError("Distributed local-training controls must be positive")
+    samples_per_rank = math.ceil(num_samples / world_size)
+    micro_batches_per_rank = math.ceil(samples_per_rank / per_device_batch_size)
+    return local_epochs * math.ceil(micro_batches_per_rank / gradient_accumulation)
+
+
 def build_train_plan(
     clients: Iterable[ClientSpec],
     rounds: int,

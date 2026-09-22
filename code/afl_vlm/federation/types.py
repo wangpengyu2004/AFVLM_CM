@@ -104,6 +104,7 @@ class ServerContext:
 @dataclass(frozen=True, slots=True)
 class MethodCapabilities:
     mode: str
+    supports_client_ddp: bool = True
     requires_task_id: bool = False
     requires_staleness: bool = False
     requires_buffer: bool = False

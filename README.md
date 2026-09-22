@@ -2,7 +2,7 @@
 
 AFVLM-CM 是用于论文实验的异步联邦视觉语言模型指令微调框架，研究固定任务客户端下的任务异构与系统异构：每个客户端永久属于一个任务，客户端速度、可用时间和网络延迟不同，但不存在持续学习或任务增量流。
 
-正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。默认运行时自动发现全部可见 GPU，并为每张卡创建一个独立 worker；每个 worker 常驻一份完整的冻结 7B 主干并训练不同客户端。权威服务器的 LoRA 聚合、FedAdam 矩状态以及方法状态默认放在第一张可见 GPU，CPU 只负责调度、进程通信、日志和数据加载。冻结主干不会上传、聚合或写入联邦检查点。
+正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。默认运行时自动发现全部可见 GPU，并按方法能力选择物理执行器：普通 local-epoch 方法与 `ours` 使用全部 GPU 对同一客户端做 DDP，依赖特殊 optimizer-step 轨迹、动态本地步数、中途刷新或动态 adapter 的方法保留“一卡一个客户端”worker pool。两条路径都按同一虚拟 TrainPlan 冻结 base version 并按计划到达顺序聚合。冻结 7B 主干不会上传、聚合或写入联邦检查点。
 
 ## 已检测的数据
 
@@ -172,6 +172,163 @@ python tools/generate_system_profiles.py \
 
 profile 名称只允许字母、数字、点、下划线和连字符。同名目录默认拒绝覆盖；要保留旧实验时必须使用新名称。生成器会先检查复用 Plan 与当前 `local_epochs`、batch size、梯度累积和 rounds 是否兼容。
 
+## 服务器上第一次启动正式训练（推荐照抄）
+
+下面以服务器目录 `/userhome/bcx/AFVLM_CM`、Conda 环境 `afvlm-cm`、8 张可见
+V100、2 clients/task 和 Rank-Gate `ours` 为例。命令都在服务器执行。
+
+### 1. 安全拉取电脑端最新代码
+
+`data/`、`pretrained/`、`runs/`、`wandb/`、`outputs/` 和 `checkpoints/` 已被
+`.gitignore` 排除，正常 fast-forward 拉取不会覆盖它们。先确认服务器没有未保存的
+**tracked 代码/配置修改**：
+
+```bash
+cd /userhome/bcx/AFVLM_CM
+git status --short
+```
+
+如果输出为空，直接拉取：
+
+```bash
+git switch main
+git fetch origin main
+git merge --ff-only origin/main
+```
+
+如果只看到类似 `M configs/base.yaml` 的服务器配置修改，先保存它，再拉取：
+
+```bash
+git stash push -m "server config before pull" -- configs/base.yaml configs/methods
+git switch main
+git fetch origin main
+git merge --ff-only origin/main
+git stash pop
+```
+
+若 `stash pop` 报冲突，不要使用 `git reset --hard`；应检查并手工合并配置。服务器上的
+大数据和权重属于 ignored 文件，不需要 stash，也不要执行 `git clean -fdx`。
+
+### 2. 激活环境并确认 8 卡、依赖、权重和数据
+
+```bash
+conda activate afvlm-cm
+
+nvidia-smi -L
+python -c "import torch; print('torch=', torch.__version__, 'cuda=', torch.version.cuda, 'available=', torch.cuda.is_available(), 'gpus=', torch.cuda.device_count())"
+
+test -f pretrained/llava-v1.5-7b/config.json
+test -f pretrained/clip-vit-large-patch14-336/config.json
+test -d data/AFVLM_CM/partitioned/2_clients
+test -d data/AFVLM_CM/dataset
+```
+
+四个 `test` 命令无输出且退出码为 0 才表示路径存在。数据全量格式/图片检查是独立工具，
+不会在正常训练启动时自动运行；只有需要时才执行：
+
+```bash
+python tools/validate_afvlm_cm_data.py --setting 2
+```
+
+### 3. 生成新的不可变实验 profile，并保留原虚拟 Plan
+
+这次改变的是方法实现和物理执行器，不需要重随机生成客户端速度或到达顺序，因此复用
+原 profile 的 system profile 与 TrainPlan：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+```
+
+如果提示同名 profile 已存在，先用下面命令查看；确认它就是本次配置时直接使用，不要覆盖。
+参数有变化时换一个能说明参数的新名称。
+
+```bash
+python tools/generate_system_profiles.py --list
+```
+
+检查 `ours` 实际会选择哪个物理执行器：
+
+```bash
+python tools/select_runtime_backend.py \
+  --config experiment_profiles/rank_gate_ddp_e1_bs1_ga4_r10_s42/configs/2clients/ours.yaml
+```
+
+正常应输出 `client_ddp`。`fedcompass`、`fedasmu`、`masfl`、`adamasfl` 和 `pilot`
+会输出 `client_parallel`，这是方法能力约束，不是运行错误。
+
+### 4. 在 8 卡上启动 `ours`
+
+正常情况下不设置 `CUDA_VISIBLE_DEVICES`，程序就会使用当前可见的全部 GPU：
+
+```bash
+PYTHONUNBUFFERED=1 \
+bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  2>&1 | tee ours-rank-gate-2clients.log
+```
+
+建议在 `tmux` 中运行，避免 SSH 断开终止训练：
+
+```bash
+tmux new -s afvlm-ours
+conda activate afvlm-cm
+cd /userhome/bcx/AFVLM_CM
+PYTHONUNBUFFERED=1 bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  2>&1 | tee ours-rank-gate-2clients.log
+```
+
+按 `Ctrl-b` 再按 `d` 可退出但保持训练；重新进入：
+
+```bash
+tmux attach -t afvlm-ours
+```
+
+`scripts/run_one.sh` 会先打印配置路径和选中的 backend。`client_ddp` 表示 `torchrun`
+已启动一个进程/GPU，所有 GPU 同时训练同一个客户端；只有 rank 0 打印进度、执行评估
+并写磁盘，各 rank 会确定性重放相同的服务器更新以保持状态一致。不要改成直接运行
+`python scripts/run_experiment.py`，否则不会自动创建 DDP 进程。
+
+### 5. 查看训练状态和结果
+
+另开终端观察 GPU：
+
+```bash
+watch -n 2 nvidia-smi
+```
+
+本次输出目录为：
+
+```text
+runs/llava/afvlm_cm/profiles/rank_gate_ddp_e1_bs1_ga4_r10_s42/2clients/ours/seed42/
+```
+
+常用文件包括 `train.log`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、
+`system_stats.json`、`metrics.json` 和 `checkpoints/final_trainable.pt`。当前项目没有实现
+任意中间异步事件恢复；若手动中断，保留旧输出用于排查，再使用新的 profile 名称重新运行。
+不要删除或覆盖已有正式实验目录。
+
+### 6. 运行一个 baseline 或整组 baseline
+
+同一 profile 下运行 FedAsync：
+
+```bash
+PYTHONUNBUFFERED=1 \
+bash scripts/run_one.sh fedasync 2 rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  2>&1 | tee fedasync-2clients.log
+```
+
+依次运行 12 个 baseline（不包含 `ours`）：
+
+```bash
+bash scripts/run_baselines.sh 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
+```
+
+将第二个参数改为 `5` 或 `10` 即选择 5/10 clients per task。8 卡 DDP 中
+`training.batch_size` 是**每卡** micro-batch；默认 `batch_size=1`、
+`gradient_accumulation=4` 时，全局有效 batch 为 `1 × 4 × 8 = 32`。GPU 数量属于实验
+条件，正式对比中应保持一致并记录。
+
 ## 从修改参数到服务器运行的完整流程
 
 以下命令均在服务器仓库根目录执行。服务器本地的 `data/`、`pretrained/`、`runs/`、`wandb/`、`outputs/` 和 `checkpoints/` 已由根目录 `.gitignore` 排除，正常的 `fetch + fast-forward merge` 不会删除或提交这些目录。不要使用 `git clean -fdx`、`git reset --hard` 或手动删除上述目录。
@@ -317,15 +474,27 @@ git push origin main
 
 ## 异步语义
 
-运行器按常见异步联邦框架拆分为权威 Server/Method、虚拟时钟 Scheduler、Dispatcher、每张可见 GPU 一个常驻 Client Trainer 和 Aggregator。TrainPlan 只保存开始时间、到达时间、客户端速度、网络延迟、本地工作量和可选调度组，**不保存全局模型或指定客户端必须下载哪个参数版本**。运行器在 `start_time` 读取当时的 `base_version`，再调用该方法自己的 `prepare_download`：普通方法下载全局 LoRA，Local-only 下载客户端本地状态，Pilot 下载个性化状态，UniFed-LoRA 下载任务条件化状态，MasFL/AdaMasFL 同时冻结本地控制变量。即使服务器随后更新，该作业也仍从已冻结的 dispatch package 训练。
+运行器按常见异步联邦框架拆分为权威 Server/Method、虚拟时钟 Scheduler、Dispatcher、Client Trainer 和 Aggregator。TrainPlan 只保存开始时间、到达时间、客户端速度、网络延迟、本地工作量和可选调度组，**不保存全局模型或指定客户端必须下载哪个参数版本**。运行器在 `start_time` 读取当时的 `base_version`，再调用该方法自己的 `prepare_download`：普通方法下载全局 LoRA，Local-only 下载客户端本地状态，Pilot 下载个性化状态，UniFed-LoRA 下载任务条件化状态，MasFL/AdaMasFL 同时冻结本地控制变量。即使服务器随后更新，该作业也仍从已冻结的 dispatch package 训练。
 
 worker 完成后先返回未经服务器处理的原始更新；父进程在计划的 `arrival_time` 调用权威方法实例的 `prepare_upload` 和 `on_arrival`。上传包含 `client_id`、`task`、`dataset`、`num_samples`、`base_version`、`arrival_time`、`local_state` 和 `delta`。服务器在到达时计算 `staleness = server_version - base_version`。FedASMU 的中途新鲜模型访问被建模为显式虚拟事件，不依赖某一次运行中偶然的 GPU 完成先后。
 
 默认 `runtime.arrival_policy: planned` 会按持久化虚拟到达顺序应用更新，`runtime.worker_queue: plan_arrival_edf` 则只优化物理 GPU 执行顺序。逻辑 start 时先冻结 `base_version` 和方法产生的下载状态，在下一次计划 arrival 前把所有已经合法启动的作业放入候选堆，再优先执行计划 `arrival_time` 最早者；提前算完但尚未轮到的结果进入缓存。EDF 不重算下载版本、不提前聚合，也不允许未来 start 事件偷跑，因此某次运行的磁盘抖动或 GPU 波动只影响 wall-clock，不改变方法比较的逻辑到达条件。FedCompass 可以改变本地步数和分组，因为这是算法本身；其他方法不能通过修改 Plan 偷换系统条件。完整生命周期、特殊方法处理、方法服务器状态和任务耗时校准见 [`docs/async_runtime.md`](docs/async_runtime.md)。
 
+物理执行器由 `MethodCapabilities.supports_client_ddp` 选择。普通 local-epoch 方法以及
+`ours` 使用所有可见 GPU 对同一个客户端执行 DDP；FedCompass、FedASMU、MasFL、
+AdaMasFL 和 Pilot 继续使用原来的一卡一客户端 worker pool。前四者显式依赖 local-step
+分配、中途刷新或 optimizer-step 梯度轨迹；Pilot 的任务/客户端专属 adapter 会随客户端
+产生动态 unused parameters，不与当前重入式梯度检查点强行组合 DDP。两种执行器都只在
+Plan 指定的逻辑 arrival 聚合。
+DDP 的 `training.batch_size` 是每卡 batch，其有效批量为
+`batch_size × gradient_accumulation × GPU数`，这一差异会写入输出，也必须在论文实验中披露。
+
 ### V100 八卡运行
 
-当前可编辑配置已经设置 `runtime.backend: client_parallel`、`runtime.devices: all`、GPU 服务器聚合和 `model.dtype: fp16`。程序会使用当前进程可见的全部 GPU，不需要在普通运行命令中指定卡号。历史 profile 不会自动继承这些修改，因此先创建新的不可变多卡 profile：
+当前可编辑配置已经设置 `runtime.backend: client_parallel`、
+`runtime.executor_policy: capability`、`runtime.devices: all`、GPU 服务器聚合和
+`model.dtype: fp16`。`scripts/run_one.sh` 会根据方法能力自动启动 DDP 或原 worker pool。
+历史 profile 不会自动继承这些修改，因此先创建新的不可变多卡 profile：
 
 ```bash
 python tools/generate_system_profiles.py \
@@ -361,7 +530,7 @@ python tools/estimate_task_compute_factors.py \
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
-- `ours`：敏感性感知异步 LoRA 整合；使用 LoRA group sensitivity、功能性陈旧度、按任务历史敏感性记忆和逐组精度融合。默认 `module_gate`，并支持 `rank_gate`、`adam_v` 消融。
+- `ours`：Rank-Gate 敏感度感知异步 LoRA 聚合；使用 rank 级有效 LoRA 功能陈旧度、任务模块记忆和模块级共享 A/B 精度融合，不增加训练参数、不使用 SVD 或 rank 对齐。
 
 FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前固定任务客户端的强制 baseline；FedAST 的原问题是并行训练多个联邦模型，也不作为当前主 baseline。注册表保留后续扩展能力。
 
@@ -385,17 +554,18 @@ bash scripts/run_one.sh unifed_lora 2
 bash scripts/run_one.sh ours 2
 ```
 
-`ours` 的默认主配置使用 `module_gate` sensitivity。推荐为正式实验生成独立的不可变 profile：
+`ours` 现在只实现本文的 Rank-Gate 版本。推荐为正式实验生成独立的不可变 profile：
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile ours_module_gate_e1_bs1_ga4_r10_s42
+  --profile rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  --reuse_plans_from default_e1_bs1_ga4_r10_s42
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-bash scripts/run_one.sh ours 2 ours_module_gate_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
 ```
 
-如需 `rank_gate` 或 `adam_v` 消融，修改准备实验所用的 `configs/methods/ours.yaml`，并生成名称中明确包含 estimator 的新 profile；不要修改已保存的 profile。完整参数与公式见 `docs/ours.md`。
+完整 Rank-Gate 统计、功能距离、聚合公式和限制见 `docs/ours.md`。
 
 使用前文创建的正式 V100 八卡快照：
 
@@ -420,7 +590,8 @@ bash scripts/run_one.sh unifed_lora 10
 bash scripts/run_one.sh ours 2
 ```
 
-直接使用完整配置的等价命令为：
+直接调用 Python 不会自动派生 torchrun 进程；需要能力选择和 DDP 时应使用
+`scripts/run_one.sh`。下面的命令只适合显式的单进程或固定 backend 调试：
 
 ```bash
 python scripts/run_experiment.py \
@@ -454,11 +625,12 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 - 元数据扫描完成以及所有可见 GPU worker 分别就绪的提示；
 - `fedasync virtual arrivals`：当前已应用的虚拟到达数 / TrainPlan 总更新数，并显示服务器版本、当前客户端和 staleness；
 - `GPU<n> <client_id>`：每张卡当前客户端的真实 optimizer step / 计划 optimizer step，并动态显示 loss；
+- DDP 方法只由 rank 0 显示 `local <client_id>` 进度；其余 rank 同步训练同一客户端，不重复打印；
 - `evaluate <task>`：定期 validation 和最终 test 时各任务已评估样本数。8 卡并行模式由主进程显示一条跨任务的总评估进度，任务切换时更新名称，不会让多个 GPU worker 同时写终端。
 
 本地进度按 optimizer step 计数，不按 gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
 
-`batch_size` 是每个 GPU worker 的真实多模态 micro-batch 大小：文本在当前 batch 内动态 padding，图像组成同一个 batch tensor，并通过一次 LLaVA forward/backward 处理。每个客户端的有效批量为 `batch_size × gradient_accumulation`；例如 `batch_size: 4`、`gradient_accumulation: 4` 对应有效批量 16。增大 `batch_size` 会提高单卡显存占用，修改后必须创建匹配的新实验 profile 和 TrainPlan。
+`batch_size` 是每张 GPU 的真实多模态 micro-batch 大小：文本在当前 batch 内动态 padding，图像组成同一个 batch tensor，并通过一次 LLaVA forward/backward 处理。原 worker pool 的有效批量是 `batch_size × gradient_accumulation`；DDP 的有效批量还要乘以 world size。例如八卡下 `batch_size: 1`、`gradient_accumulation: 4` 的有效批量是 32。修改 batch、卡数或执行策略后必须创建新的实验 profile。
 
 若需要把终端输出重定向到文件，建议同时打开 Python 非缓冲输出：
 
@@ -496,7 +668,7 @@ python scripts/evaluate.py \
 
 系统统计包括 mean/median/max staleness、总/接受更新数、聚合次数、客户端/任务更新分布、虚拟训练时间、真实 wall-clock 时间和 GPU worker 数；FedBuff 额外报告缓冲聚合次数、平均占用和平均等待时间；FedCompass 额外报告本地步数分配、分组完成时间与组内完成跨度。不同任务的量纲不兼容，因此不会把 accuracy、CIDEr 和 IoU 粗暴平均为一个原始分数。
 
-数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。提出方法的公式、三种 sensitivity estimator、配置和运行流程见 `docs/ours.md`。
+数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。提出方法的 Rank-Gate 公式、配置和运行流程见 `docs/ours.md`。
 
 ## 静态工程检查
 

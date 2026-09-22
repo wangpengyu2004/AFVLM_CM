@@ -1,223 +1,254 @@
-# Proposed method: Sensitivity-Aware Asynchronous LoRA Consolidation
+# Proposed method: Rank-Gate Sensitivity-Aware Asynchronous LoRA Aggregation
 
-本项目中的 `ours` 已实现为 **Sensitivity-Aware Asynchronous LoRA
-Consolidation**。它面向固定任务身份客户端、LoRA-only 的异步联邦 VLM
-指令微调。冻结的 LLaVA 主干不参与敏感性估计、通信或聚合。
+The registered method **ours** implements the supplied Rank-Gate design for
+fixed-task asynchronous federated LLaVA instruction tuning. It changes neither
+the LLaVA/PEFT model structure nor the LoRA rank, adds no trainable parameter,
+and performs no SVD or cross-client rank alignment. Only LoRA A/B tensors and
+small sensitivity metadata cross the federation boundary.
 
-## 1. 客户端上传内容
+## 1. PEFT LoRA discovery and validation
 
-客户端 `k` 在 server version `s` 下载 LoRA 状态 `phi^s`，本地训练得到
-`phi_k`。上传内容包括：
+The function **iter_lora_modules(model)** reads the active PEFT adapter and
+yields:
 
-- LoRA 本地状态与 delta；
-- `base_version = s` 和对应的不可变 `base_state = phi^s`；
-- 固定任务 ID `q_k`；
-- 每个 LoRA group 的非负敏感性 `C[k,g]`；
-- 实际 optimizer steps、样本量和常规运行 metadata。
+~~~text
+module_name, A[rank,in], B[out,rank], scaling
+~~~
 
-原始数据、梯度和冻结主干均不上传。已有 worker 使用正常 backward 产生的
-LoRA 梯度估计敏感性，不增加第二次 backward。
+The client validates that the A and B ranks match. Every update also carries
+module name, A/B state keys, shapes, rank, and scaling. The authoritative
+method validates this schema against the server LoRA state and rejects later
+clients whose module layout or scaling differs. Frozen 7B parameters and the
+vision backbone are never uploaded.
 
-## 2. 三种敏感性估计器
+## 2. Rank sensitivity at the client
 
-通过 `method.params.sensitivity_estimator` 选择。
+For module l, rank r, and the accumulated gradient immediately before one real
+optimizer step:
 
-### 2.1 `module_gate`（默认主方法）
+~~~text
+h_A[l,r] = sum_i grad(A[l,r,i]) A[l,r,i]
+h_B[l,r] = sum_j grad(B[l,j,r]) B[l,j,r]
+h[l,r]   = 0.5 (h_A[l,r] + h_B[l,r])
+c[l,r]   = h[l,r]^2
+~~~
 
-对 LoRA module `l` 的有效更新 `Delta W_l = scale_l B_l A_l` 引入虚拟 gate：
+**RankSensitivityTracker** keeps a zero-initialized FP32 EMA:
 
-```text
-Delta W_l(z_l) = z_l scale_l B_l A_l
-```
+~~~text
+v[l,r] <- beta v[l,r] + (1-beta) c[l,r]
+~~~
 
-正常训练点为 `z_l = 1`。已有梯度满足：
+The hook runs exactly once after all gradient-accumulation micro-batches and
+before optimizer.step(). The current LLaVA path has no GradScaler and no
+gradient clipping, so gradients are already unscaled. If AMP scaling is added
+later, unscale must happen before this hook.
 
-```text
-h_l = dL/dz_l
-    = <grad_B_l L, B_l>_F
-    = <grad_A_l L, A_l>_F
-```
+For each module with n_l positive observations:
 
-代码对 A、B 两个有限精度估计取平均，再在 local optimizer steps 上维护：
+~~~text
+v_hat[l,r] = v[l,r] / (1-beta^n_l)
+~~~
 
-```text
-C[k,l] = EMA(h_l^2)
-```
+All ranks from all modules are normalized by one client-wide mean and clipped:
 
-该定义作用于完整 `B_l A_l`，在 `B <- cB, A <- A/c` 重参数化下保持不变。
-每个 module 只上传一个 scalar。
+~~~text
+C[k,l,r] = clip(v_hat[l,r] / (mean(v_hat)+eps), 0, clip_max)
+C_module[k,l] = mean_r C[k,l,r]
+~~~
 
-### 2.2 `rank_gate`（消融）
+When the global mean is non-finite or at most eps, every rank falls back to
+one and sensitivity_valid is false; the update remains auditable rather than
+silently producing zero aggregation.
 
-把 `B A` 写成 rank-1 分量之和，并为每个 rank 引入 gate。敏感性为：
+## 3. Rank-functional staleness
 
-```text
-h[l,r] = <grad_B[:,r], B[:,r]>
-       = <grad_A[r,:], A[r,:]>
-C[k,l,r] = EMA(h[l,r]^2)
-```
+For one LoRA rank, the effective function is:
 
-服务端也按 rank 分片计算陈旧度和融合系数。A 的第 `r` 行与 B 的第 `r`
-列使用同一个系数。该实现保留固定 LoRA rank；由于直接在 A/B 因子上插值，
-融合后的 `BA` 并不等于两个 dense `BA` 的严格线性插值，这是固定-rank
-工程实现需要在论文中披露的边界。
+~~~text
+M[l,r] = scaling[l] B[l,:,r] A[l,r,:]
+~~~
 
-### 2.3 `adam_v`（效率消融）
+The implementation never constructs the dense outer product. It uses FP64:
 
-复用 Adam 二阶矩思想，在每个 module 内对梯度平方取均值：
+~~~text
+||s b1 a1^T - s b0 a0^T||_F^2
+= s^2 (
+    ||b1||^2 ||a1||^2
+  + ||b0||^2 ||a0||^2
+  - 2 (b1^T b0)(a1^T a0)
+)
+~~~
 
-```text
-v_g <- beta2 v_g + (1-beta2) mean(grad_g^2)
-C[k,g] = v_g / (1-beta2^steps)
-```
+Let s be the immutable client base version, t the current server, and k the
+returned client endpoint. After dividing each rank distance by
+out_features times in_features:
 
-分组均值与先维护逐参数 `v` 再分组求均值在代数上等价，但无需保存一份额外的
-逐元素二阶矩。它是 optimization-trajectory sensitivity surrogate，不宣称等于
-endpoint Fisher。
+~~~text
+D[k,t] = sum_l,r C[k,l,r] d(M[t,l,r], M[s,l,r])
+U[k]   = sum_l,r C[k,l,r] d(M[k,l,r], M[s,l,r])
 
-三种 estimator 的正值都先以客户端内部 group mean 归一化，再按
-`sensitivity_floor` 和 `sensitivity_ceiling` 裁剪，避免绝对尺度任意地改变
-服务器精度权衡。
+delta[k,t] = sqrt(D[k,t] / (U[k] + eps))
+rho[k,t]   = exp(-gamma min(delta[k,t], delta_max))
+~~~
 
-## 3. 功能性陈旧度
+The existing Update.base_state is already an immutable LoRA snapshot of the
+client's start version, so no frozen backbone snapshots or duplicate full
+version archive is required.
 
-更新到达时当前 server 状态为 `phi^t`。对客户端上传的敏感性计算：
+An update is rejected as no_effective_update only when both functional energy
+U and the ordinary A/B parameter delta norm are below min_update_energy.
+Rejected updates do not change the model, server version, or task memory.
 
-```text
-D[t,k] = sum_g C[k,g] ||phi^t(g) - phi^s(g)||_2^2 / |g|
-U[k]   = sum_g C[k,g] ||phi_k(g) - phi^s(g)||_2^2 / |g|
+## 4. Task-balanced module memory
 
-delta[k,t] = sqrt(D[t,k] / (U[k] + epsilon_update))
-rho[k,t]   = exp(-gamma * min(delta[k,t], delta_max))
-```
+For each task q and module l, the server stores one scalar Omega[q,l]. Task
+weights are automatically uniform over all task IDs in the current system
+profile. Every task/module entry is explicitly initialized to zero:
 
-`D` 衡量客户端离线期间，当前 global 在“该客户端真正敏感的 LoRA group”上
-移动了多少；`U` 是客户端自身有效更新能量。因此相同 version staleness 的两个
-客户端可以获得不同可靠度。`version_staleness` 仍记录用于分析，但不直接决定
-融合权重。
+~~~text
+Omega[q,l] = 0
+~~~
 
-若 `U <= min_update_energy`、optimizer steps 不足或能量非有限，更新会被显式
-拒绝，不增加 server version，避免用 epsilon 掩盖无效更新。
+The protected historical precision is:
 
-## 4. 按任务历史敏感性记忆
+~~~text
+history_precision[l]
+= base_precision + sum_q pi[q] Omega[q,l]
+~~~
 
-server 为每个任务 `q`、每个 group `g` 保存：
+Only the source task is updated, after the new model endpoint has been
+computed:
 
-```text
-Omega[q,g] <- memory_beta * Omega[q,g]
-              + (1-memory_beta) * r_k * rho[k,t] * C[k,g]
-```
+~~~text
+Omega[q_k,l] <- history_beta Omega[q_k,l]
+                + (1-history_beta) rho[k,t] C_module[k,l]
+~~~
 
-`r_k` 由 `quality_weighting` 决定；主配置使用 `constant`，避免数据量差异在没有
-额外校准时淹没敏感性。可选值为 `constant`、`num_samples`、
-`sqrt_num_samples` 和 `optimizer_steps`。
+Other tasks are not decayed when task q_k arrives.
 
-当前历史保护精度为：
+## 5. Module-level A/B aggregation
 
-```text
-Omega_t[g] = omega_prior + sum_q pi_q Omega[q,g]
-```
+The first implementation uses constant client_weight=1. For each module:
 
-默认 `pi_q` 是 system profile 中所有任务的固定等权权重，防止高频任务仅因到达
-次数更多而支配记忆。也可通过完整的 `task_weights` 映射显式设置。`omega_prior`
-提供 cold-start 保护。
+~~~text
+p_client[l] = rho[k,t] C_module[k,l]
 
-## 5. 逐组精度融合
+alpha[k,l] =
+  p_client[l]
+  / (p_client[l] + history_lambda history_precision[l] + eps)
 
-在一个不可变的 `phi^t` 与 `Omega_t` 快照上同时计算所有 group 系数：
+alpha[k,l] <- clip(alpha[k,l], 0, alpha_max)
+~~~
 
-```text
-p_local[k,g] = r_k rho[k,t] C[k,g]
+One alpha is shared by the complete A and B tensors of that module:
 
-alpha[k,g] = p_local[k,g]
-             / (p_local[k,g] + lambda_history Omega_t[g] + epsilon_precision)
-alpha[k,g] <- min(alpha[k,g], alpha_max)
+~~~text
+A_new[l] = A_current[l] + alpha[k,l] (A_client[l] - A_current[l])
+B_new[l] = B_current[l] + alpha[k,l] (B_client[l] - B_current[l])
+~~~
 
-phi^(t+1)(g) = phi^t(g) + alpha[k,g] (phi_k(g) - phi^t(g))
-```
+The endpoint is the returned client solution, not current plus alpha times
+(client minus base). Rank sensitivity controls functional staleness; it does
+not create independent rank-wise fusion coefficients.
 
-成功应用后只更新来源任务 `q_k` 的历史记忆并令 server version 加一。每个 group
-的更新是位于当前状态和客户端状态之间的凸组合；它防止单次 group overshoot，
-但不构成在无限延迟或任意冲突任务下的全局收敛保证。
+## 6. Configuration
 
-实现直接使用 Update 中已经冻结的 `base_state`，因此无需为每个旧 server version
-永久保留完整模型副本。并行 worker、EDF 物理调度和虚拟 Plan 顺序不变。
+The complete first-version configuration is
+**configs/methods/ours.yaml**:
 
-## 6. 配置
-
-默认配置位于 `configs/methods/ours.yaml`。主实验保持：
-
-```yaml
+~~~yaml
 method:
   name: ours
   params:
-    sensitivity_estimator: module_gate
     sensitivity_beta: 0.95
+    sensitivity_warmup_steps: 1
+    sensitivity_clip_max: 10.0
     gamma: 1.0
     delta_max: 10.0
-    lambda_history: 1.0
-    memory_beta: 0.9
-    omega_prior: 1.0
-    alpha_max: 0.9
-    quality_weighting: constant
-    task_weights: null
-```
+    history_beta: 0.95
+    history_lambda: 1.0
+    base_precision: 1.0
+    alpha_max: 0.5
+    eps: 0.000000000001
+    min_update_energy: 0.0000000000000001
+~~~
 
-`task_weights: null` 表示对 AFVLM-CM 的六个任务自动等权。若手动设置，必须完整
-覆盖 `cls`、`caption`、`vqa`、`chart_vqa`、`visual_reasoning`、`grounding`，
-并使用非负权重。
+There are no Module-Gate, Adam-v, sample-weighting, SVD, or rank-alignment
+switches in this version.
 
-## 7. 运行
+## 7. DDP execution and virtual semantics
 
-使用兼容配置：
+The editable base configuration uses executor policy **capability**. The
+proposed method supports client DDP, so **scripts/run_one.sh** launches one
+process per visible GPU and all ranks train the same client:
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-bash scripts/run_one.sh ours 2
-```
+~~~text
+per-device batch = training.batch_size
+effective batch  = batch_size * gradient_accumulation * DDP world size
+~~~
 
-推荐先基于当前 `configs/base.yaml` 创建不可变 profile，再运行：
+Samples are deterministically shuffled, padded like DistributedSampler, and
+sharded across ranks. Non-final accumulation micro-batches use DDP.no_sync();
+the final backward synchronizes LoRA gradients before Rank-Gate sensitivity is
+sampled.
 
-```bash
+DDP changes physical optimizer steps and effective batch, but does not change
+the persisted virtual Plan's logical start, frozen base version, arrival, or
+aggregation order. Output train_plan.json, events.jsonl, and system_stats.json
+record physical executor, DDP world size, effective batch, and actual
+optimizer steps.
+
+FedCompass, FedASMU, MasFL, AdaMasFL, and Pilot declare that they do not support
+client DDP. The first four preserve their algorithm-specific local-step
+allocation, mid-training refresh, or optimizer-step gradient trajectory. Pilot
+preserves its dynamic task/client adapter unused-parameter topology alongside
+re-entrant gradient checkpointing. They continue to use the original
+one-GPU-per-client worker pool. This requested mixed executor policy must be
+disclosed because local optimization trajectories differ across executors.
+
+## 8. Running
+
+Create a new immutable profile after this method/configuration change while
+reusing the previous system profile and virtual TrainPlan:
+
+~~~bash
 python tools/generate_system_profiles.py \
-  --profile ours_module_gate_e1_bs1_ga4_r10_s42
+  --profile rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+~~~
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-bash scripts/run_one.sh ours 2 ours_module_gate_e1_bs1_ga4_r10_s42
-```
+Run the proposed method on all visible GPUs:
 
-将 setting 改为 `5` 或 `10` 即运行另外两个 AFVLM-CM 客户端规模。Rank-Gate 或
-Adam-v 消融应修改 `configs/methods/ours.yaml`（或准备该实验的基础配置），然后用
-新的、能表达 estimator 的 profile 名重新生成快照；不要修改已有 profile。
+~~~bash
+bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
+~~~
 
-## 8. 输出与复现检查
+Restricting visible devices also changes DDP world size and effective batch, so
+do it only when the experiment records that choice:
 
-`events.jsonl` 的 `result_metadata` 额外记录：
+~~~bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
+~~~
 
-- version staleness 与 functional staleness；
-- drift/update energy；
-- reliability 与 quality weight；
-- group alpha 的 mean/min/max；
-- estimator 和 group 数量；
-- 被拒绝更新的明确原因。
+Settings 5 and 10 select the other client-count datasets.
 
-最终 checkpoint 的 method state 保存 `task_memory`、归一化 `task_weights` 和全部
-方法参数。以下检查不加载 7B 权重、不开始训练：
+## 9. Output and limitations
 
-```bash
-python -m unittest discover -s tests -v
-python -m compileall -q code scripts tools tests
-python tools/validate_repository.py
-ruff check code scripts tools tests
-ruff format --check code scripts tools tests
-```
+events.jsonl result metadata records server drift, local functional update,
+parameter delta norm, relative staleness, reliability, validity of the
+sensitivity estimate, per-module alphas, and rejection reason. The final
+checkpoint stores method parameters, task memory, uniform task weights, and
+the validated LoRA module/scaling schema.
 
-## 9. 实现边界
+Known boundaries:
 
-- 默认主方法是 Module-Gate；Rank-Gate 与 Adam-v 是同一方法的 estimator 消融，
-  不是三个独立注册方法。
-- 仅支持 LoRA-only 联邦状态。若启用 `train_mm_projector` 或其他非 LoRA 参数，
-  方法会在模型/服务器初始化阶段直接报错，避免无定义的混合分组。
-- 敏感性是局部二次精度代理，不是完整 Hessian，也不等价于真实任务泛化重要性。
-- 历史记忆只保存按任务、按 group 的 scalar，不保存原始数据或完整客户端梯度。
-- 当前项目仍只保存最终训练 checkpoint，不提供任意中间异步事件恢复。
+- Only LoRA A/B may be federated; enabling trainable mm_projector is rejected.
+- Rank sensitivity is a local gradient/parameter gate statistic, not a full
+  Fisher matrix or Hessian.
+- Interpolating A and B separately does not equal a linear interpolation of
+  dense BA; the implementation intentionally preserves fixed PEFT rank.
+- DDP uses a larger global effective batch than one-GPU client training when
+  per-device batch is unchanged.
+- No 7B training is run by repository validation.

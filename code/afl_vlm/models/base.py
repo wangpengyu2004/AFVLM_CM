@@ -32,6 +32,8 @@ class TrainConfig:
     context: dict[str, Any] = field(default_factory=dict)
     planned_optimizer_steps: int = 1
     max_local_steps: int | None = None
+    distributed_rank: int = 0
+    distributed_world_size: int = 1
 
 
 @dataclass(slots=True)

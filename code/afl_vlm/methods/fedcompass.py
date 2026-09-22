@@ -28,6 +28,7 @@ class FedCompass(Method):
     name = "fedcompass"
     capabilities = MethodCapabilities(
         mode="semi_asynchronous",
+        supports_client_ddp=False,
         requires_client_speed=True,
         requires_custom_scheduler=True,
         requires_local_step_control=True,

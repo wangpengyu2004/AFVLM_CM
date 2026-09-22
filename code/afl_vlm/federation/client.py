@@ -96,6 +96,8 @@ class FederatedClient:
             },
             planned_optimizer_steps=train_config.planned_optimizer_steps,
             max_local_steps=train_config.max_local_steps,
+            distributed_rank=train_config.distributed_rank,
+            distributed_world_size=train_config.distributed_world_size,
         )
         loaded_start_state = model.snapshot_trainable()
         result = model.local_train(self.samples, configured, self.task)

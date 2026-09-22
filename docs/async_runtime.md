@@ -16,7 +16,7 @@ authoritative server/method (GPU aggregation in parent)
         └── method.prepare_upload() + on_arrival() at logical arrival
 ```
 
-父进程是唯一权威服务器，联邦可训练状态、服务器优化器、缓冲区、超网络和
+对于 `client_parallel`，父进程是唯一权威服务器，联邦可训练状态、服务器优化器、缓冲区、超网络和
 方法张量状态默认保存在第一张可见 GPU。每个 worker 是一个由 `spawn` 创建的独立进程，
 固定占用一张 GPU，并常驻一份完整 LLaVA-1.5-7B；worker 只执行客户端本地
 训练钩子，不能直接修改服务器状态。冻结主干不会跨进程传输，每个作业只发送
@@ -27,6 +27,24 @@ FedAvg/FedAdam/MasFL/Pilot 等高频张量聚合。
 该边界对应 APPFL 的 Server Agent / Scheduler / Aggregator / Trainer 分工，也对应
 FLGo 在通信时先为客户端打包服务器消息、再把客户端回复交给虚拟时钟处理的
 方式。当前实现没有复制两个项目的框架代码。
+
+## 能力选择的两种物理执行器
+
+当前可编辑配置使用 `runtime.executor_policy: capability`。`scripts/run_one.sh` 读取方法的
+`MethodCapabilities.supports_client_ddp`，选择以下一种物理执行器：
+
+- `client_ddp`：全部可见 GPU 同时训练一个客户端，每卡处理不同样本，最后一个累积
+  micro-batch 同步梯度；适用于普通 local-epoch 方法和 `ours`。
+- `client_parallel`：每张 GPU 训练一个不同客户端；FedCompass、FedASMU、MasFL、
+  AdaMasFL 因算法依赖 local-step 分配、中途刷新或 optimizer-step 梯度轨迹而保留此路径。
+  Pilot 也使用该路径，避免动态任务/客户端 adapter 的 unused-parameter 集合与重入式梯度
+  检查点冲突。
+
+执行器选择只影响物理训练。两条路径仍在逻辑 start 冻结下载状态，并按 TrainPlan 的
+arrival 顺序聚合。DDP 不会因为物理完成更早而提前聚合。不过 DDP 的 `batch_size` 是每卡
+batch，有效批量为 `batch_size * gradient_accumulation * world_size`，实际 optimizer steps
+也按填充后的分布式数据分片计算；这些字段会写入运行输出。选择性使用不同执行器意味着
+本地优化轨迹不同，论文对比必须明确披露。
 
 ## TrainPlan 不保存全局模型
 
@@ -69,8 +87,8 @@ FLGo 在通信时先为客户端打包服务器消息、再把客户端回复交
 `server_memory/client_memory` 都应由父进程中的 Method 实例持有，而不是放到 GPU worker。
 
 需要随最终 checkpoint 保存的额外状态必须进入 `state_dict()`，可恢复状态还必须实现
-`load_state_dict()`。`ours` 已把按任务、按 LoRA group 的历史敏感性与任务权重作为父进程
-方法状态保存；客户端 worker 只接收本次 sensitivity 收集所需的 group/reset metadata。
+`load_state_dict()`。`ours` 已把按任务、按 LoRA module 的历史敏感性、任务权重和验证过的
+LoRA rank/shape/scaling schema 作为方法状态保存；客户端只保存本次 Rank-Gate EMA。
 当前项目保存最终服务器和方法状态，尚未提供从中途事件游标恢复未完成训练的入口；
 实现断点续训时还需要恢复 pending jobs、完成缓存、虚拟时间游标和随机数状态。
 

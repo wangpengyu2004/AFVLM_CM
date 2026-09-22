@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import math
 import random
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -32,6 +34,29 @@ class Llava15Adapter(ModelAdapter):
         self.device: Any = None
         self._config: dict[str, Any] = {}
         self._pilot_connector: Any = None
+        self._ddp_enabled = False
+
+    def _network(self) -> Any:
+        """Return the underlying PEFT model, excluding an optional DDP shell."""
+        return self.model.module if self._ddp_enabled else self.model
+
+    def enable_distributed_data_parallel(self, local_rank: int) -> None:
+        """Wrap the complete local model after method-specific adapters are installed."""
+        if self._ddp_enabled:
+            return
+        torch = self._imports()[0]
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("torch.distributed must be initialized before enabling DDP")
+        self.model = torch.nn.parallel.DistributedDataParallel(
+            self.model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            # Re-entrant gradient checkpointing requires this to be false.
+            # Methods with dynamic unused adapters stay on client_parallel.
+            find_unused_parameters=False,
+        )
+        self._ddp_enabled = True
 
     @staticmethod
     def _imports() -> tuple[Any, ...]:
@@ -152,11 +177,12 @@ class Llava15Adapter(ModelAdapter):
         self.device = self.model.get_input_embeddings().weight.device
 
     def named_federated_parameters(self) -> list[tuple[str, Any]]:
-        if self.model is None:
+        network = self._network()
+        if network is None:
             raise RuntimeError("Model is not loaded")
         return [
             (name, parameter)
-            for name, parameter in self.model.named_parameters()
+            for name, parameter in network.named_parameters()
             if parameter.requires_grad
         ]
 
@@ -183,10 +209,11 @@ class Llava15Adapter(ModelAdapter):
     ) -> None:
         from afl_vlm.methods.pilot.adapters import build_pilot_connector
 
-        base = self.model.base_model.model.model.mm_projector
-        hidden = int(self.model.config.hidden_size)
+        network = self._network()
+        base = network.base_model.model.model.mm_projector
+        hidden = int(network.config.hidden_size)
         wrapper = build_pilot_connector(base, hidden, tasks, clients, bottleneck)
-        self.model.base_model.model.model.mm_projector = wrapper
+        network.base_model.model.model.mm_projector = wrapper
         self._pilot_connector = wrapper
 
     def pilot_auxiliary_losses(self) -> dict[str, Any]:
@@ -229,8 +256,9 @@ class Llava15Adapter(ModelAdapter):
             .unsqueeze(0)
             .to(self.device)
         )
-        image = process_images([self._image(sample)], self.image_processor, self.model.config)
-        image = image.to(device=self.device, dtype=next(self.model.parameters()).dtype)
+        network = self._network()
+        image = process_images([self._image(sample)], self.image_processor, network.config)
+        image = image.to(device=self.device, dtype=next(network.parameters()).dtype)
         encoded = {
             "input_ids": input_ids,
             "images": image,
@@ -340,7 +368,7 @@ class Llava15Adapter(ModelAdapter):
             for sample in samples:
                 with Image.open(sample.image) as handle:
                     images.append(handle.convert("RGB"))
-            image_batch = process_images(images, self.image_processor, self.model.config)
+            image_batch = process_images(images, self.image_processor, self._network().config)
         finally:
             for image in images:
                 image.close()
@@ -363,7 +391,9 @@ class Llava15Adapter(ModelAdapter):
         encoded = {
             "input_ids": input_ids.to(self.device),
             "attention_mask": attention_mask.to(self.device),
-            "images": image_batch.to(device=self.device, dtype=next(self.model.parameters()).dtype),
+            "images": image_batch.to(
+                device=self.device, dtype=next(self._network().parameters()).dtype
+            ),
         }
         if labels is not None:
             encoded["labels"] = labels.to(self.device)
@@ -377,9 +407,11 @@ class Llava15Adapter(ModelAdapter):
         if not samples:
             raise ValueError("Local training received no samples")
         rng = random.Random(train_config.seed)
-        torch.random.default_generator.manual_seed(train_config.seed)
+        torch.random.default_generator.manual_seed(
+            train_config.seed + train_config.distributed_rank
+        )
         if torch.cuda.is_available():
-            torch.cuda.manual_seed(train_config.seed)
+            torch.cuda.manual_seed(train_config.seed + train_config.distributed_rank)
         start = self.snapshot_trainable()
         gradient_sum = zeros_like(start) if train_config.collect_mean_gradient else None
         parameter_groups = [
@@ -418,6 +450,19 @@ class Llava15Adapter(ModelAdapter):
         while train_config.max_local_steps is not None or epoch < train_config.local_epochs:
             indices = list(range(len(samples)))
             rng.shuffle(indices)
+            if train_config.distributed_world_size > 1:
+                samples_per_rank = math.ceil(len(indices) / train_config.distributed_world_size)
+                padded_size = samples_per_rank * train_config.distributed_world_size
+                missing = padded_size - len(indices)
+                if missing:
+                    repeats = math.ceil(missing / len(indices))
+                    indices.extend((indices * repeats)[:missing])
+                shard = slice(
+                    train_config.distributed_rank,
+                    padded_size,
+                    train_config.distributed_world_size,
+                )
+                indices = indices[shard]
             micro_batches = [
                 indices[offset : offset + train_config.batch_size]
                 for offset in range(0, len(indices), train_config.batch_size)
@@ -427,18 +472,25 @@ class Llava15Adapter(ModelAdapter):
                     window_start : window_start + train_config.gradient_accumulation
                 ]
                 accumulated = None
-                for batch_indices in window:
+                for micro_index, batch_indices in enumerate(window):
                     encoded = self._encode_batch(
                         [samples[index] for index in batch_indices],
                         train_config.max_text_length,
                     )
-                    base_loss = self.model(**encoded).loss
-                    loss = (
-                        train_config.loss_hook(base_loss, self, encoded, train_config.context)
-                        if train_config.loss_hook
-                        else base_loss
+                    synchronize = micro_index == len(window) - 1
+                    sync_context = (
+                        contextlib.nullcontext()
+                        if synchronize or not self._ddp_enabled
+                        else self.model.no_sync()
                     )
-                    (loss / len(window)).backward()
+                    with sync_context:
+                        base_loss = self.model(**encoded).loss
+                        loss = (
+                            train_config.loss_hook(base_loss, self, encoded, train_config.context)
+                            if train_config.loss_hook
+                            else base_loss
+                        )
+                        (loss / len(window)).backward()
                     detached_loss = loss.detach()
                     accumulated = (
                         detached_loss if accumulated is None else accumulated + detached_loss
@@ -450,6 +502,12 @@ class Llava15Adapter(ModelAdapter):
                                 gradient_sum[name] + parameter.grad.detach().float()
                             )
                 if train_config.gradient_hook:
+                    # This hook runs exactly once per optimizer step: after all
+                    # accumulation micro-batches and before clipping/step. The
+                    # current implementation does not use GradScaler, so the
+                    # gradients are already in their optimization scale.
+                    train_config.context["optimizer_step"] = steps
+                    train_config.context["gradients_unscaled"] = True
                     train_config.gradient_hook(self, train_config.context)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -503,7 +561,8 @@ class Llava15Adapter(ModelAdapter):
     ) -> dict[str, float]:
         torch = self._imports()[0]
         samples = task_adapter.samples_by_id(sample_ids)
-        self.model.eval()
+        network = self._network()
+        network.eval()
         losses, predictions, references = [], [], []
         with torch.no_grad():
             iterator = tqdm(
@@ -522,9 +581,9 @@ class Llava15Adapter(ModelAdapter):
                     include_answer=mode == "probe",
                 )
                 if mode == "probe":
-                    losses.append(float(self.model(**encoded).loss.detach().cpu()))
+                    losses.append(float(network(**encoded).loss.detach().cpu()))
                 else:
-                    generated = self.model.generate(
+                    generated = network.generate(
                         **encoded, max_new_tokens=int(self._config.get("max_new_tokens", 64))
                     )
                     predictions.append(

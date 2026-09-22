@@ -149,9 +149,12 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
         raise ValueError("output.progress_bar must be true or false")
     runtime = config.get("runtime", {"backend": "serial"})
     backend = str(runtime.get("backend", "serial"))
-    if backend not in {"serial", "client_parallel"}:
-        raise ValueError("runtime.backend must be serial or client_parallel")
-    if backend == "client_parallel":
+    if backend not in {"serial", "client_parallel", "client_ddp"}:
+        raise ValueError("runtime.backend must be serial, client_parallel, or client_ddp")
+    executor_policy = str(runtime.get("executor_policy", "fixed"))
+    if executor_policy not in {"fixed", "capability"}:
+        raise ValueError("runtime.executor_policy must be fixed or capability")
+    if backend in {"client_parallel", "client_ddp"}:
         devices = runtime.get("devices")
         if devices != "all":
             if not isinstance(devices, list) or not devices:
@@ -175,7 +178,7 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
         }:
             raise ValueError("runtime.worker_queue must be fifo or plan_arrival_edf")
         if str(model.get("dtype", "fp16")) not in {"fp16", "bf16"}:
-            raise ValueError("client_parallel model.dtype must be fp16 or bf16")
+            raise ValueError("multi-GPU model.dtype must be fp16 or bf16")
     method_cfg = config["method"]
     method = create_method(str(method_cfg["name"]), method_cfg.get("params", {}))
     configured_mode = str(config["federation"]["mode"])
@@ -184,6 +187,14 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
             f"Method {method.name} requires federation.mode={method.capabilities.mode}, "
             f"got {configured_mode}"
         )
+    if backend == "client_ddp":
+        if runtime.get("devices") != "all":
+            raise ValueError("client_ddp currently requires runtime.devices=all")
+        if not method.capabilities.supports_client_ddp:
+            raise ValueError(
+                f"Method {method.name} requires the original client-parallel optimizer-step "
+                "trajectory and does not support client_ddp"
+            )
 
 
 def resolved_public_config(config: Mapping[str, Any]) -> dict[str, Any]:
