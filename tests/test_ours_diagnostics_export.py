@@ -10,10 +10,11 @@ from tools.export_ours_diagnostics import export_diagnostics
 
 
 class OursDiagnosticsExportTests(unittest.TestCase):
-    def test_exports_update_module_and_optional_rank_rows(self) -> None:
+    def test_exports_update_and_module_rows(self) -> None:
         module = "model.layers.0.self_attn.q_proj"
         diagnostics = {
-            "schema_version": 1,
+            "schema_version": 3,
+            "method_variant": "module_gate",
             "client": {
                 "update_id": "vqa/client_0-r0",
                 "client_id": "vqa/client_0",
@@ -27,17 +28,26 @@ class OursDiagnosticsExportTests(unittest.TestCase):
             },
             "sensitivity": {
                 "valid": True,
-                "rank_by_module": {module: [0.5, 1.5]},
                 "module_by_module": {module: 1.0},
                 "observations_by_module": {module: 2},
-                "rank_summary": {
-                    "count": 2,
+                "module_summary": {
+                    "count": 1,
                     "mean": 1.0,
-                    "std": 0.5,
-                    "min": 0.5,
-                    "max": 1.5,
+                    "std": 0.0,
+                    "min": 1.0,
+                    "max": 1.0,
                     "zero_fraction": 0.0,
-                    "clipped_fraction": 0.0,
+                    "clipped_fraction": None,
+                },
+                "transform": {
+                    "gate": "module_gate",
+                    "statistic": "mean_absolute_gate",
+                    "normalization": "client_module_mean",
+                    "uniform_mix": 0.5,
+                    "uniform_floor": 0.5,
+                    "raw_by_module": {module: 2.0},
+                    "raw_summary": {"mean": 2.0},
+                    "final_summary": {"mean": 1.0},
                 },
             },
             "functional_staleness": {
@@ -82,20 +92,18 @@ class OursDiagnosticsExportTests(unittest.TestCase):
             events = root / "events.jsonl"
             events.write_text(json.dumps(event) + "\n", encoding="utf-8")
 
-            result = export_diagnostics(events, root / "derived", include_ranks=True)
+            result = export_diagnostics(events, root / "derived")
 
             self.assertEqual(result["updates"], 1)
             self.assertEqual(result["modules"], 1)
-            self.assertEqual(result["ranks"], 2)
             with Path(result["update_csv"]).open(encoding="utf-8-sig", newline="") as handle:
                 update_rows = list(csv.DictReader(handle))
             with Path(result["module_csv"]).open(encoding="utf-8-sig", newline="") as handle:
                 module_rows = list(csv.DictReader(handle))
-            with Path(result["rank_csv"]).open(encoding="utf-8-sig", newline="") as handle:
-                rank_rows = list(csv.DictReader(handle))
             self.assertEqual(update_rows[0]["relative_staleness"], "0.75")
+            self.assertEqual(update_rows[0]["sensitivity_statistic"], "mean_absolute_gate")
+            self.assertEqual(module_rows[0]["raw_module_sensitivity"], "2.0")
             self.assertEqual(module_rows[0]["module_alpha"], "0.2")
-            self.assertEqual([row["rank_sensitivity"] for row in rank_rows], ["0.5", "1.5"])
 
     def test_ignores_only_an_incomplete_trailing_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -96,8 +96,9 @@ Paper: [UniFed-LoRA: Exploiting Semantic Task Correlation for Heterogeneous Mult
 ## Proposed method
 
 `ours` implements sensitivity-aware asynchronous LoRA consolidation. Clients
-estimate module/rank/Adam-v LoRA sensitivity during normal backward passes;
-the server uses functional staleness, task-balanced historical sensitivity,
-and group-wise precision fusion. The default paper setting is Module-Gate.
+estimate one mean-absolute Module-Gate sensitivity per LoRA module during the
+normal backward pass; the server uses complete-module functional staleness,
+bias-corrected per-task historical sensitivity, and module-wise precision
+fusion. Task-arrival-frequency correction is not part of the current method.
 It is excluded from baseline batches because it is the proposed method, not
 because it is unavailable. Full equations and commands are in `docs/ours.md`.

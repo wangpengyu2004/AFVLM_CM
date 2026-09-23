@@ -197,7 +197,7 @@ profile 名称只允许字母、数字、点、下划线和连字符。同名目
 ## 服务器上第一次启动正式训练（推荐照抄）
 
 下面以服务器目录 `/userhome/bcx/AFVLM_CM`、Conda 环境 `afvlm-cm`、8 张可见
-V100、2 clients/task 和 Rank-Gate `ours` 为例。命令都在服务器执行。
+V100、2 clients/task 和 Module-Gate `ours` 为例。命令都在服务器执行。
 
 ### 1. 安全拉取电脑端最新代码
 
@@ -259,7 +259,7 @@ python tools/validate_afvlm_cm_data.py --setting 2
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  --profile module_gate_e1_bs1_ga4_r10_s42 \
   --reuse_plans_from default_e1_bs1_ga4_r10_s42
 ```
 
@@ -274,7 +274,7 @@ python tools/generate_system_profiles.py --list
 
 ```bash
 python tools/select_runtime_backend.py \
-  --config experiment_profiles/rank_gate_ddp_e1_bs1_ga4_r10_s42/configs/2clients/ours.yaml
+  --config experiment_profiles/module_gate_e1_bs1_ga4_r10_s42/configs/2clients/ours.yaml
 ```
 
 正常应输出 `client_ddp`。`fedcompass`、`fedasmu`、`masfl`、`adamasfl` 和 `pilot`
@@ -286,8 +286,8 @@ python tools/select_runtime_backend.py \
 
 ```bash
 PYTHONUNBUFFERED=1 \
-bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42 \
-  2>&1 | tee ours-rank-gate-2clients.log
+bash scripts/run_one.sh ours 2 module_gate_e1_bs1_ga4_r10_s42 \
+  2>&1 | tee ours-module-gate-2clients.log
 ```
 
 建议在 `tmux` 中运行，避免 SSH 断开终止训练：
@@ -296,8 +296,8 @@ bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42 \
 tmux new -s afvlm-ours
 conda activate afvlm-cm
 cd /userhome/bcx/AFVLM_CM
-PYTHONUNBUFFERED=1 bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42 \
-  2>&1 | tee ours-rank-gate-2clients.log
+PYTHONUNBUFFERED=1 bash scripts/run_one.sh ours 2 module_gate_e1_bs1_ga4_r10_s42 \
+  2>&1 | tee ours-module-gate-2clients.log
 ```
 
 按 `Ctrl-b` 再按 `d` 可退出但保持训练；重新进入：
@@ -322,7 +322,7 @@ watch -n 2 nvidia-smi
 本次输出目录为：
 
 ```text
-runs/llava/afvlm_cm/profiles/rank_gate_ddp_e1_bs1_ga4_r10_s42/2clients/ours/seed42/
+runs/llava/afvlm_cm/profiles/module_gate_e1_bs1_ga4_r10_s42/2clients/ours/seed42/
 ```
 
 常用文件包括 `train.log`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、
@@ -336,14 +336,14 @@ runs/llava/afvlm_cm/profiles/rank_gate_ddp_e1_bs1_ga4_r10_s42/2clients/ours/seed
 
 ```bash
 PYTHONUNBUFFERED=1 \
-bash scripts/run_one.sh fedasync 2 rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+bash scripts/run_one.sh fedasync 2 module_gate_e1_bs1_ga4_r10_s42 \
   2>&1 | tee fedasync-2clients.log
 ```
 
 依次运行 12 个 baseline（不包含 `ours`）：
 
 ```bash
-bash scripts/run_baselines.sh 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
+bash scripts/run_baselines.sh 2 module_gate_e1_bs1_ga4_r10_s42
 ```
 
 将第二个参数改为 `5` 或 `10` 即选择 5/10 clients per task。8 卡 DDP 中
@@ -564,7 +564,7 @@ python tools/estimate_task_compute_factors.py \
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
-- `ours`：Rank-Gate 敏感度感知异步 LoRA 聚合；使用 rank 级有效 LoRA 功能陈旧度、任务模块记忆和模块级共享 A/B 精度融合，不增加训练参数、不使用 SVD 或 rank 对齐。
+- `ours`：Module-Gate 敏感度感知异步 LoRA 聚合；在每个真实 optimizer step 读取整个 LoRA 模块的 gate 梯度，使用绝对值时间平均、客户端内均值归一化与均匀下限，结合完整模块 `BA` 功能陈旧度、偏差修正的分任务历史记忆和模块级共享 A/B 融合；不增加训练参数、不使用 SVD，也不包含快慢任务到达频率校正。
 
 ### 观察 `ours` 是否正常工作
 
@@ -572,11 +572,12 @@ python tools/estimate_task_compute_factors.py \
 `result_metadata[].ours_diagnostics` 中记录完整的版本化诊断信息。记录只由 `ours`
 生成，不改变其他方法的日志、训练状态或聚合路径。主要字段包括：
 
-- `sensitivity.rank_by_module`：每个 LoRA module 的完整 rank sensitivity；
-- `sensitivity.module_by_module`、观测次数、零值/截断比例和 top rank/module；
-- `functional_staleness`：版本陈旧度、server drift、local update、相对功能陈旧度和可靠度；
+- `sensitivity.module_by_module`：每个 LoRA module 的最终敏感度；
+- `sensitivity.transform`：绝对值统计方式、原始/最终分布、均值归一化、均匀混合系数和下限；
+- `sensitivity.observations_by_module`、分布摘要和 top module；
+- `functional_staleness`：版本陈旧度、server drift、local update、相对功能陈旧度、可靠度函数及 gamma；
 - `aggregation.module_alpha_by_module`：每个模块实际使用的共享 A/B 聚合系数；
-- `memory`：当前任务记忆和跨任务历史精度在聚合前后的值；
+- `memory`：当前任务的原始/偏差修正记忆、接受次数和跨任务历史精度在聚合前后的值；
 - rejected update 的拒绝原因和未变化的 memory。
 
 训练过程中可以直接查看最后一条记录：
@@ -592,17 +593,9 @@ python tools/export_ours_diagnostics.py \
   runs/llava/afvlm_cm/profiles/<profile>/2clients/ours/seed42
 ```
 
-需要把完整 rank sensitivity 展开为一行一个 rank 时使用：
-
-```bash
-python tools/export_ours_diagnostics.py \
-  runs/llava/afvlm_cm/profiles/<profile>/2clients/ours/seed42 \
-  --include-ranks
-```
-
 默认输出到运行目录下的 `ours_diagnostics/`：
-`ours_update_diagnostics.csv`、`ours_module_diagnostics.csv`，以及可选的
-`ours_rank_diagnostics.csv`。CSV 是派生分析文件，可以随时重新生成；权威原始记录始终是
+`ours_update_diagnostics.csv` 和 `ours_module_diagnostics.csv`。Module-Gate 不产生
+rank 级 CSV。CSV 是派生分析文件，可以随时重新生成；权威原始记录始终是
 `events.jsonl`。
 
 FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前固定任务客户端的强制 baseline；FedAST 的原问题是并行训练多个联邦模型，也不作为当前主 baseline。注册表保留后续扩展能力。
@@ -627,18 +620,18 @@ bash scripts/run_one.sh unifed_lora 2
 bash scripts/run_one.sh ours 2
 ```
 
-`ours` 现在只实现本文的 Rank-Gate 版本。推荐为正式实验生成独立的不可变 profile：
+`ours` 现在只实现本文的 Module-Gate 版本。推荐为正式实验生成独立的不可变 profile：
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile rank_gate_ddp_e1_bs1_ga4_r10_s42 \
+  --profile module_gate_e1_bs1_ga4_r10_s42 \
   --reuse_plans_from default_e1_bs1_ga4_r10_s42
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_e1_bs1_ga4_r10_s42
 ```
 
-完整 Rank-Gate 统计、功能距离、聚合公式和限制见 `docs/ours.md`。
+完整 Module-Gate 统计、功能距离、聚合公式和限制见 `docs/ours.md`。
 
 使用前文创建的正式 V100 八卡快照：
 
@@ -757,7 +750,7 @@ python scripts/evaluate.py \
 
 系统统计包括 mean/median/max staleness、总/接受更新数、聚合次数、客户端/任务更新分布、虚拟训练时间、真实 wall-clock 时间和 GPU worker 数；FedBuff 额外报告缓冲聚合次数、平均占用和平均等待时间；FedCompass 额外报告本地步数分配、分组完成时间与组内完成跨度。不同任务的量纲不兼容，因此不会把 accuracy、CIDEr 和 IoU 粗暴平均为一个原始分数。
 
-数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。提出方法的 Rank-Gate 公式、配置和运行流程见 `docs/ours.md`。
+数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。提出方法的 Module-Gate 公式、配置和运行流程见 `docs/ours.md`。
 
 ## 静态工程检查
 
@@ -785,7 +778,7 @@ ruff check code scripts tools
 - 当前训练入口保存可独立复评的最终联邦检查点，但尚未提供从任意中间异步事件恢复并继续训练的 CLI；这需要同时恢复仍在途的客户端作业快照。
 - Flickr30k 指令当前每条只有一个参考答案；内置 CIDEr 使用标准 1--4 gram TF-IDF 余弦构造，但与拥有五参考标注的官方 COCO caption scorer 不能宣称数值完全等价。
 - Pilot 的联合阶段适配和 FedASMU 的确定性刷新策略必须在论文中按上述差异披露。
-- `ours` 已实现，但其 sensitivity 是局部二次精度代理，并非完整 Hessian 或真实任务泛化重要性；当前只支持 LoRA-only 联邦状态。`ours` 不在 baseline 批处理里，应使用独立命令运行。
+- `ours` 已实现，但其 sensitivity 是虚拟 Module-Gate 的局部一阶变化幅度，即各 optimizer step 的 `|dL/dz_l|` 平均，并非完整 Fisher、Hessian 或真实任务泛化重要性；当前只支持 LoRA-only 联邦状态，也暂不补偿快慢任务的到达频率。`ours` 不在 baseline 批处理里，应使用独立命令运行。
 
 ## 主要论文与数据来源
 

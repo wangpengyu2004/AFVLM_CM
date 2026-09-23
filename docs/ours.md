@@ -1,254 +1,261 @@
-# Proposed method: Rank-Gate Sensitivity-Aware Asynchronous LoRA Aggregation
+# Proposed method: Module-Gate Sensitivity-Aware Asynchronous LoRA Consolidation
 
-The registered method **ours** implements the supplied Rank-Gate design for
-fixed-task asynchronous federated LLaVA instruction tuning. It changes neither
-the LLaVA/PEFT model structure nor the LoRA rank, adds no trainable parameter,
-and performs no SVD or cross-client rank alignment. Only LoRA A/B tensors and
-small sensitivity metadata cross the federation boundary.
+The registered method `ours` implements the Module-Gate design for fixed-task
+asynchronous federated LLaVA instruction tuning. Its main line is:
 
-## 1. PEFT LoRA discovery and validation
+```text
+module importance + functional staleness + task-specific historical memory
+```
 
-The function **iter_lora_modules(model)** reads the active PEFT adapter and
-yields:
+It does not add a trainable gate, change the PEFT structure, perform SVD, align
+LoRA ranks across clients, or maintain task-arrival-frequency weights. Only
+LoRA A/B tensors and one sensitivity scalar per LoRA module are communicated.
 
-~~~text
-module_name, A[rank,in], B[out,rank], scaling
-~~~
+## 1. LoRA scope and validation
 
-The client validates that the A and B ranks match. Every update also carries
-module name, A/B state keys, shapes, rank, and scaling. The authoritative
-method validates this schema against the server LoRA state and rejects later
-clients whose module layout or scaling differs. Frozen 7B parameters and the
-vision backbone are never uploaded.
+For module `l`, the effective LoRA update is:
 
-## 2. Rank sensitivity at the client
+```text
+DeltaW_l = scaling_l B_l A_l
+A_l: [rank, in_features]
+B_l: [out_features, rank]
+```
 
-For module l, rank r, and the accumulated gradient immediately before one real
-optimizer step:
+The client and server validate module names, A/B state keys, shapes, rank, and
+LoRA scaling. Frozen LLaVA and vision-tower parameters are never included in
+the federated state.
 
-~~~text
-h_A[l,r] = sum_i grad(A[l,r,i]) A[l,r,i]
-h_B[l,r] = sum_j grad(B[l,j,r]) B[l,j,r]
-h[l,r]   = 0.5 (h_A[l,r] + h_B[l,r])
-c[l,r]   = h[l,r]^2
-~~~
+## 2. Client Module-Gate sensitivity
 
-**RankSensitivityTracker** keeps a zero-initialized FP32 EMA:
+For an imaginary scalar gate `z_l`:
 
-~~~text
-v[l,r] <- beta v[l,r] + (1-beta) c[l,r]
-~~~
+```text
+DeltaW_l(z_l) = scaling_l z_l B_l A_l
+```
 
-The hook runs exactly once after all gradient-accumulation micro-batches and
-before optimizer.step(). The current LLaVA path has no GradScaler and no
-gradient clipping, so gradients are already unscaled. If AMP scaling is added
-later, unscale must happen before this hook.
+At one real optimizer step, after gradient accumulation and DDP gradient
+synchronization, the implementation reads the existing gradients:
 
-For each module with n_l positive observations:
+```text
+h_A[l] = <grad(A_l), A_l>_F
+h_B[l] = <grad(B_l), B_l>_F
+h[l]   = 0.5 (h_A[l] + h_B[l])
+```
 
-~~~text
-v_hat[l,r] = v[l,r] / (1-beta^n_l)
-~~~
+This is the derivative with respect to the virtual module gate at `z_l=1`.
+The operation runs under `torch.no_grad()`, does not change `.grad`, does not
+call backward again, and introduces no optimizer parameter.
 
-All ranks from all modules are normalized by one client-wide mean and clipped:
+The first `sensitivity_warmup_steps` optimizer steps are skipped. For the
+remaining observed steps, the raw statistic is the mean absolute gate:
 
-~~~text
-C[k,l,r] = clip(v_hat[l,r] / (mean(v_hat)+eps), 0, clip_max)
-C_module[k,l] = mean_r C[k,l,r]
-~~~
+```text
+C_raw[k,l] = mean_m |h[k,l,m]|
+```
 
-When the global mean is non-finite or at most eps, every rank falls back to
-one and sensitivity_valid is false; the update remains auditable rather than
-silently producing zero aggregation.
+Absolute value is applied before averaging, so positive and negative steps do
+not cancel. Unlike a squared statistic, it does not quadratically amplify an
+occasional large gate response.
 
-## 3. Rank-functional staleness
+The current version performs no sqrt transform, quantile cap, or sensitivity
+clipping. It first normalizes across all modules of the same client and then
+mixes in a uniform prior:
 
-For one LoRA rank, the effective function is:
+```text
+C_norm[k,l] = C_raw[k,l] / (mean_j C_raw[k,j] + eps)
+C[k,l]      = (1-eta) + eta C_norm[k,l]
+```
 
-~~~text
-M[l,r] = scaling[l] B[l,:,r] A[l,r,:]
-~~~
+The default `eta=0.5` gives a floor of 0.5 while preserving an approximately
+unit client-wide mean. If no module has a valid post-warm-up observation, all
+module sensitivities fall back to one and the diagnostic validity flag is
+false.
 
-The implementation never constructs the dense outer product. It uses FP64:
+## 3. Complete-module functional distance
 
-~~~text
-||s b1 a1^T - s b0 a0^T||_F^2
-= s^2 (
-    ||b1||^2 ||a1||^2
-  + ||b0||^2 ||a0||^2
-  - 2 (b1^T b0)(a1^T a0)
-)
-~~~
+Parameter distance in A/B space is not used because LoRA has scale ambiguity.
+For two versions `x` and `y` of one module:
 
-Let s be the immutable client base version, t the current server, and k the
-returned client endpoint. After dividing each rank distance by
-out_features times in_features:
+```text
+d_l(x,y) = ||scaling_l (B_x A_x - B_y A_y)||_F^2
+           / (out_features_l * in_features_l)
+```
 
-~~~text
-D[k,t] = sum_l,r C[k,l,r] d(M[t,l,r], M[s,l,r])
-U[k]   = sum_l,r C[k,l,r] d(M[k,l,r], M[s,l,r])
+The implementation never constructs the dense `B @ A`. It uses rank-by-rank
+Gram products:
+
+```text
+||B_x A_x||_F^2
+  = tr[(B_x^T B_x)(A_x A_x^T)]
+
+<B_x A_x, B_y A_y>_F
+  = tr[(B_x^T B_y)(A_y A_x^T)]
+```
+
+This includes cross-rank terms while constructing only rank-by-rank
+intermediates. Small negative distances caused by floating-point cancellation
+are clamped to zero.
+
+## 4. Functional staleness and reliability
+
+Let `b_k` be the client's immutable base snapshot, `k` its local endpoint, and
+`t` the current server state:
+
+```text
+D[k,t] = sum_l C[k,l] d_l(t,b_k)
+U[k]   = sum_l C[k,l] d_l(k,b_k)
 
 delta[k,t] = sqrt(D[k,t] / (U[k] + eps))
-rho[k,t]   = exp(-gamma min(delta[k,t], delta_max))
-~~~
+rho[k,t]   = exp(-gamma delta[k,t])
+```
 
-The existing Update.base_state is already an immutable LoRA snapshot of the
-client's start version, so no frozen backbone snapshots or duplicate full
-version archive is required.
+The default is `gamma=1.0`; `gamma=0.5` is a direct configuration ablation.
+An update with `U[k] < min_update_energy` is rejected as functionally empty,
+even if A and B changed through an equivalent LoRA reparameterization.
 
-An update is rejected as no_effective_update only when both functional energy
-U and the ordinary A/B parameter delta norm are below min_update_energy.
-Rejected updates do not change the model, server version, or task memory.
+## 5. Bias-corrected per-task historical memory
 
-## 4. Task-balanced module memory
+For every task `q` and module `l`, the server stores a raw EMA `m[q,l]` and an
+accepted-update count `n[q]`. Only an accepted update from its source task
+changes that task's memory:
 
-For each task q and module l, the server stores one scalar Omega[q,l]. Task
-weights are automatically uniform over all task IDs in the current system
-profile. Every task/module entry is explicitly initialized to zero:
+```text
+m[q_k,l] <- history_beta m[q_k,l]
+            + (1-history_beta) rho[k,t] C[k,l]
+n[q_k]   <- n[q_k] + 1
+```
 
-~~~text
-Omega[q,l] = 0
-~~~
+The default is `history_beta=0.9`. Memory is bias-corrected separately for
+each task:
 
-The protected historical precision is:
+```text
+m_hat[q,l] = m[q,l] / (1-history_beta^n[q])    if n[q] > 0
+```
 
-~~~text
-history_precision[l]
-= base_precision + sum_q pi[q] Omega[q,l]
-~~~
+With uniform target-task prior `pi[q]=1/Q`, the protected server precision is:
 
-Only the source task is updated, after the new model endpoint has been
-computed:
+```text
+Omega[t,l] = base_precision
+             + history_strength sum_q pi[q] m_hat[q,l]
+```
 
-~~~text
-Omega[q_k,l] <- history_beta Omega[q_k,l]
-                + (1-history_beta) rho[k,t] C_module[k,l]
-~~~
+The memory used for one arrival is the state before fusing that arrival. The
+source task memory is updated only after fusion.
 
-Other tasks are not decayed when task q_k arrives.
+This is not task-arrival-frequency correction. The method does not estimate
+arrival rates and does not compute an `omega_frequency` multiplier. Per-task
+memory prevents fast tasks from directly overwriting slow-task memory, but it
+does not increase how often a slow task contributes an update.
 
-## 5. Module-level A/B aggregation
+## 6. Module-wise LoRA fusion
 
-The first implementation uses constant client_weight=1. For each module:
+Client precision and server protection are:
 
-~~~text
-p_client[l] = rho[k,t] C_module[k,l]
+```text
+P_client[k,l] = rho[k,t] C[k,l]
+P_server[t,l] = history_lambda Omega[t,l]
+```
 
-alpha[k,l] =
-  p_client[l]
-  / (p_client[l] + history_lambda history_precision[l] + eps)
+There is deliberately no frequency term. The module coefficient is:
 
-alpha[k,l] <- clip(alpha[k,l], 0, alpha_max)
-~~~
+```text
+alpha[k,l] = P_client[k,l]
+             / (P_client[k,l] + P_server[t,l] + eps)
+alpha[k,l] = clip(alpha[k,l], 0, alpha_max)
+```
 
-One alpha is shared by the complete A and B tensors of that module:
+The default `alpha_max=0.5`. One coefficient is shared by the complete A and B
+of the same module:
 
-~~~text
-A_new[l] = A_current[l] + alpha[k,l] (A_client[l] - A_current[l])
-B_new[l] = B_current[l] + alpha[k,l] (B_client[l] - B_current[l])
-~~~
+```text
+A[t+1,l] = A[t,l] + alpha[k,l] (A[k,l] - A[t,l])
+B[t+1,l] = B[t,l] + alpha[k,l] (B[k,l] - B[t,l])
+```
 
-The endpoint is the returned client solution, not current plus alpha times
-(client minus base). Rank sensitivity controls functional staleness; it does
-not create independent rank-wise fusion coefficients.
+The endpoint is the client's final local state, not a stale delta directly
+added to the current server. Factor-space interpolation is not identical to
+dense `BA` interpolation, but it preserves rank and the existing PEFT state
+interface without SVD.
 
-## 6. Configuration
+## 7. Configuration
 
-The complete first-version configuration is
-**configs/methods/ours.yaml**:
+`configs/methods/ours.yaml` contains:
 
-~~~yaml
+```yaml
 method:
   name: ours
   params:
-    sensitivity_beta: 0.95
     sensitivity_warmup_steps: 1
-    sensitivity_clip_max: 10.0
+    sensitivity_uniform_mix: 0.5
     gamma: 1.0
-    delta_max: 10.0
-    history_beta: 0.95
+    history_beta: 0.9
     history_lambda: 1.0
+    history_strength: 1.0
     base_precision: 1.0
     alpha_max: 0.5
     eps: 0.000000000001
     min_update_energy: 0.0000000000000001
-~~~
+```
 
-There are no Module-Gate, Adam-v, sample-weighting, SVD, or rank-alignment
-switches in this version.
+There are intentionally no parameters for rank sensitivity, sensitivity
+power/quantile compression, or task-arrival-frequency correction.
 
-## 7. DDP execution and virtual semantics
+## 8. DDP and optimizer-step semantics
 
-The editable base configuration uses executor policy **capability**. The
-proposed method supports client DDP, so **scripts/run_one.sh** launches one
-process per visible GPU and all ranks train the same client:
+`ours` remains DDP-capable. All visible GPUs train the same client. With eight
+GPUs, per-device batch 16, and gradient accumulation 4, one optimizer step has
+effective batch `8 * 16 * 4 = 512`.
 
-~~~text
-per-device batch = training.batch_size
-effective batch  = batch_size * gradient_accumulation * DDP world size
-~~~
+The training hook order is:
 
-Samples are deterministically shuffled, padded like DistributedSampler, and
-sharded across ranks. Non-final accumulation micro-batches use DDP.no_sync();
-the final backward synchronizes LoRA gradients before Rank-Gate sensitivity is
-sampled.
+```text
+accumulated forward/backward
+-> final DDP gradient synchronization
+-> Module-Gate read under no_grad
+-> optimizer.step
+-> zero_grad
+```
 
-DDP changes physical optimizer steps and effective batch, but does not change
-the persisted virtual Plan's logical start, frozen base version, arrival, or
-aggregation order. Output train_plan.json, events.jsonl, and system_stats.json
-record physical executor, DDP world size, effective batch, and actual
-optimizer steps.
+The current LLaVA training path does not use GradScaler. If AMP scaling is
+added later, gradients must be unscaled before the Module-Gate hook. The
+virtual TrainPlan, base version, planned arrival, and aggregation order are
+unchanged by this method revision.
 
-FedCompass, FedASMU, MasFL, AdaMasFL, and Pilot declare that they do not support
-client DDP. The first four preserve their algorithm-specific local-step
-allocation, mid-training refresh, or optimizer-step gradient trajectory. Pilot
-preserves its dynamic task/client adapter unused-parameter topology alongside
-re-entrant gradient checkpointing. They continue to use the original
-one-GPU-per-client worker pool. This requested mixed executor policy must be
-disclosed because local optimization trajectories differ across executors.
+## 9. Diagnostics and checkpoints
 
-## 8. Running
+Every arrival writes schema-version-3 `ours_diagnostics`, including:
 
-Create a new immutable profile after this method/configuration change while
-reusing the previous system profile and virtual TrainPlan:
+- raw and final module-sensitivity summaries;
+- per-module sensitivity and observation count;
+- module-functional server drift and local update energy;
+- relative staleness, reliability, and gamma;
+- per-module alpha;
+- raw and bias-corrected task memory and accepted-update counts;
+- no arrival-rate or frequency-correction state.
 
-~~~bash
+`tools/export_ours_diagnostics.py` exports update-level and module-level CSV
+files. There is no rank-level CSV because Module-Gate does not produce or
+upload rank sensitivity.
+
+Module-Gate uses state schema version 3. Rank-Gate checkpoints and their task
+memory are rejected because the stored sensitivity semantics are incompatible.
+
+## 10. Running
+
+Create a new immutable profile so an old Rank-Gate snapshot is not reused. For
+batch size 16 while preserving an existing virtual system and TrainPlan:
+
+```bash
 python tools/generate_system_profiles.py \
-  --profile rank_gate_ddp_e1_bs1_ga4_r10_s42 \
-  --reuse_plans_from default_e1_bs1_ga4_r10_s42
-~~~
+  --profile module_gate_e1_bs16_ga4_r10_s42 \
+  --reuse_plans_from ddp_e1_bs16_ga4_r10_s42
+```
 
-Run the proposed method on all visible GPUs:
+Run on all visible GPUs:
 
-~~~bash
-bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
-~~~
+```bash
+bash scripts/run_one.sh ours 2 module_gate_e1_bs16_ga4_r10_s42
+```
 
-Restricting visible devices also changes DDP world size and effective batch, so
-do it only when the experiment records that choice:
-
-~~~bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-bash scripts/run_one.sh ours 2 rank_gate_ddp_e1_bs1_ga4_r10_s42
-~~~
-
-Settings 5 and 10 select the other client-count datasets.
-
-## 9. Output and limitations
-
-events.jsonl result metadata records server drift, local functional update,
-parameter delta norm, relative staleness, reliability, validity of the
-sensitivity estimate, per-module alphas, and rejection reason. The final
-checkpoint stores method parameters, task memory, uniform task weights, and
-the validated LoRA module/scaling schema.
-
-Known boundaries:
-
-- Only LoRA A/B may be federated; enabling trainable mm_projector is rejected.
-- Rank sensitivity is a local gradient/parameter gate statistic, not a full
-  Fisher matrix or Hessian.
-- Interpolating A and B separately does not equal a linear interpolation of
-  dense BA; the implementation intentionally preserves fixed PEFT rank.
-- DDP uses a larger global effective batch than one-GPU client training when
-  per-device batch is unchanged.
-- No 7B training is run by repository validation.
+Use setting `5` or `10` for the corresponding existing AFVLM-CM partition.
+Do not resume an old Rank-Gate output directory or checkpoint.

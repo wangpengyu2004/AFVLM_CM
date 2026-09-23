@@ -16,7 +16,7 @@ class ExecutorSelectionTests(unittest.TestCase):
             }
         }
 
-    def test_standard_and_rank_gate_methods_select_ddp(self) -> None:
+    def test_standard_and_module_gate_methods_select_ddp(self) -> None:
         for name in (
             "local",
             "fedavg",

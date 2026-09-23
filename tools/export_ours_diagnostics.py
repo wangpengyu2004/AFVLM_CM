@@ -1,4 +1,4 @@
-"""Export Rank-Gate diagnostics embedded in an AFVLM-CM events.jsonl file."""
+"""Export Module-Gate diagnostics embedded in an AFVLM-CM events.jsonl file."""
 
 from __future__ import annotations
 
@@ -50,11 +50,9 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
 def export_diagnostics(
     events_path: Path,
     output_directory: Path,
-    include_ranks: bool = False,
 ) -> dict[str, Any]:
     update_rows: list[dict[str, Any]] = []
     module_rows: list[dict[str, Any]] = []
-    rank_rows: list[dict[str, Any]] = []
     for event in _read_events(events_path):
         for item in _diagnostics(event):
             client = item["client"]
@@ -62,7 +60,11 @@ def export_diagnostics(
             functional = item["functional_staleness"]
             aggregation = item["aggregation"]
             memory = item["memory"]
-            rank_summary = sensitivity["rank_summary"]
+            module_summary = sensitivity["module_summary"]
+            transform = sensitivity.get("transform", {})
+            raw_summary = transform.get("raw_summary", {})
+            raw_by_module = transform.get("raw_by_module", {})
+            final_summary = transform.get("final_summary", module_summary)
             alpha_summary = aggregation["alpha_summary"]
             before_summary = memory["task_memory_before_summary"]
             after_summary = memory["task_memory_after_summary"]
@@ -87,20 +89,30 @@ def export_diagnostics(
                     "parameter_delta_norm": functional["parameter_delta_norm"],
                     "relative_staleness": functional["relative_staleness"],
                     "reliability": _summary_value(functional, "reliability"),
+                    "reliability_function": functional.get("reliability_function", ""),
+                    "gamma": _summary_value(functional, "gamma"),
                     "sensitivity_valid": sensitivity["valid"],
-                    "rank_sensitivity_mean": _summary_value(rank_summary, "mean"),
-                    "rank_sensitivity_std": _summary_value(rank_summary, "std"),
-                    "rank_sensitivity_min": _summary_value(rank_summary, "min"),
-                    "rank_sensitivity_max": _summary_value(rank_summary, "max"),
-                    "rank_zero_fraction": _summary_value(rank_summary, "zero_fraction"),
-                    "rank_clipped_fraction": _summary_value(
-                        rank_summary, "clipped_fraction"
+                    "sensitivity_gate": transform.get("gate", "module_gate"),
+                    "sensitivity_statistic": transform.get("statistic", ""),
+                    "sensitivity_normalization": transform.get("normalization", ""),
+                    "sensitivity_uniform_mix": _summary_value(transform, "uniform_mix"),
+                    "sensitivity_uniform_floor": _summary_value(
+                        transform, "uniform_floor"
                     ),
+                    "raw_sensitivity_mean": _summary_value(raw_summary, "mean"),
+                    "final_sensitivity_mean": _summary_value(final_summary, "mean"),
+                    "module_sensitivity_mean": _summary_value(module_summary, "mean"),
+                    "module_sensitivity_std": _summary_value(module_summary, "std"),
+                    "module_sensitivity_min": _summary_value(module_summary, "min"),
+                    "module_sensitivity_max": _summary_value(module_summary, "max"),
                     "alpha_mean": _summary_value(alpha_summary, "mean"),
                     "alpha_min": _summary_value(alpha_summary, "min"),
                     "alpha_max": _summary_value(alpha_summary, "max"),
                     "task_memory_before_mean": _summary_value(before_summary, "mean"),
                     "task_memory_after_mean": _summary_value(after_summary, "mean"),
+                    "task_memory_count_before": memory.get("task_memory_count_before", ""),
+                    "task_memory_count_after": memory.get("task_memory_count_after", ""),
+                    "history_strength": memory.get("history_strength", ""),
                 }
             )
             modules = sensitivity["module_by_module"]
@@ -111,9 +123,16 @@ def export_diagnostics(
                     {
                         **common,
                         "module": module,
+                        "raw_module_sensitivity": raw_by_module.get(module, ""),
                         "module_sensitivity": module_sensitivity,
                         "observations": observations[module],
                         "module_alpha": alphas.get(module, ""),
+                        "task_memory_raw_before": memory.get(
+                            "task_memory_raw_before", memory["task_memory_before"]
+                        )[module],
+                        "task_memory_raw_after": memory.get(
+                            "task_memory_raw_after", memory["task_memory_after"]
+                        )[module],
                         "task_memory_before": memory["task_memory_before"][module],
                         "task_memory_after": memory["task_memory_after"][module],
                         "historical_precision_before": memory[
@@ -124,18 +143,6 @@ def export_diagnostics(
                         ][module],
                     }
                 )
-                if include_ranks:
-                    for rank, rank_sensitivity in enumerate(
-                        sensitivity["rank_by_module"][module]
-                    ):
-                        rank_rows.append(
-                            {
-                                **common,
-                                "module": module,
-                                "rank": rank,
-                                "rank_sensitivity": rank_sensitivity,
-                            }
-                        )
 
     if not update_rows:
         raise ValueError(f"No ours_diagnostics records found in {events_path}")
@@ -146,17 +153,11 @@ def export_diagnostics(
     module_path = output_directory / "ours_module_diagnostics.csv"
     _write_csv(update_path, update_rows, update_fields)
     _write_csv(module_path, module_rows, module_fields)
-    rank_path = None
-    if include_ranks:
-        rank_path = output_directory / "ours_rank_diagnostics.csv"
-        _write_csv(rank_path, rank_rows, list(rank_rows[0]))
     return {
         "updates": len(update_rows),
         "modules": len(module_rows),
-        "ranks": len(rank_rows),
         "update_csv": str(update_path),
         "module_csv": str(module_path),
-        "rank_csv": str(rank_path) if rank_path is not None else None,
     }
 
 
@@ -164,7 +165,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_directory", type=Path)
     parser.add_argument("--output-directory", type=Path)
-    parser.add_argument("--include-ranks", action="store_true")
     args = parser.parse_args()
     run_directory = args.run_directory.resolve()
     events_path = run_directory / "events.jsonl"
@@ -177,7 +177,7 @@ def main() -> None:
     )
     print(
         json.dumps(
-            export_diagnostics(events_path, output, include_ranks=args.include_ranks),
+            export_diagnostics(events_path, output),
             ensure_ascii=False,
             indent=2,
         )

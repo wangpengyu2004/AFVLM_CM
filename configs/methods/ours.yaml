@@ -1,14 +1,14 @@
 method:
   name: ours
   params:
-    # Rank-Gate sensitivity, collected once per real optimizer step.
-    sensitivity_beta: 0.95
+    # Module-Gate: mean absolute gate magnitude, once per real optimizer step.
     sensitivity_warmup_steps: 1
-    sensitivity_clip_max: 10.0
+    # C = (1-eta) + eta * raw/mean(raw); eta=0.5 gives a 0.5 floor.
+    sensitivity_uniform_mix: 0.5
     gamma: 1.0
-    delta_max: 10.0
-    history_beta: 0.95
+    history_beta: 0.9
     history_lambda: 1.0
+    history_strength: 1.0
     base_precision: 1.0
     alpha_max: 0.5
     eps: 0.000000000001

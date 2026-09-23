@@ -1,8 +1,8 @@
-"""Rank-Gate sensitivity-aware asynchronous LoRA aggregation.
+"""Module-Gate sensitivity-aware asynchronous LoRA aggregation.
 
 The proposed method operates only on PEFT LoRA A/B parameters. It introduces
 no trainable parameter, never materializes a dense LoRA update, and performs no
-SVD or rank alignment. Rank sensitivity is collected from the existing local
+SVD or rank alignment. Module sensitivity is collected from the existing local
 backward pass; the server uses it for functional staleness and computes one
 shared aggregation coefficient for both A and B of each LoRA module.
 """
@@ -63,7 +63,8 @@ def _parameter_identity(name: str) -> tuple[str, str]:
     match = _LORA_PARAMETER.match(name)
     if match is None:
         raise ValueError(
-            f"Rank-Gate supports LoRA-only federated state; unsupported trainable parameter: {name}"
+            "Module-Gate supports LoRA-only federated state; unsupported "
+            f"trainable parameter: {name}"
         )
     return match.group("module"), match.group("side")
 
@@ -166,33 +167,55 @@ def _discover_model_modules(model: Any) -> dict[str, tuple[Any, Any, LoRAModuleM
     return discovered
 
 
-class RankSensitivityTracker:
-    """Track bias-corrected rank-gate sensitivity without joining the graph."""
+def _normalize_module_sensitivity(
+    raw: Mapping[str, float], uniform_mix: float = 0.5, eps: float = 1e-12
+) -> tuple[dict[str, float], bool]:
+    """Mean-normalize module scores and mix them with a uniform prior."""
+
+    if not raw:
+        raise ValueError("Cannot normalize empty module sensitivity")
+    if not 0.0 <= uniform_mix <= 1.0:
+        raise ValueError("Module sensitivity uniform_mix must be in [0, 1]")
+    values = {str(name): float(value) for name, value in raw.items()}
+    valid = all(math.isfinite(value) and value >= 0.0 for value in values.values())
+    mean_value = math.fsum(values.values()) / len(values)
+    valid = valid and mean_value > eps
+    if not valid:
+        return {name: 1.0 for name in values}, False
+    return (
+        {
+            name: (1.0 - uniform_mix) + uniform_mix * value / (mean_value + eps)
+            for name, value in values.items()
+        },
+        True,
+    )
+
+
+class ModuleSensitivityTracker:
+    """Track mean absolute Module-Gate sensitivity without joining the graph."""
 
     def __init__(
         self,
         model: Any,
-        beta: float = 0.95,
         warmup_steps: int = 1,
-        clip_max: float = 10.0,
+        uniform_mix: float = 0.5,
         eps: float = 1e-12,
     ) -> None:
-        if not 0.0 <= beta < 1.0:
-            raise ValueError("Rank sensitivity beta must be in [0, 1)")
         if warmup_steps < 0:
-            raise ValueError("Rank sensitivity warmup_steps must be non-negative")
-        if clip_max <= 0.0 or eps <= 0.0:
-            raise ValueError("Rank sensitivity clip_max and eps must be positive")
-        self.beta = float(beta)
+            raise ValueError("Module sensitivity warmup_steps must be non-negative")
+        if not 0.0 <= uniform_mix <= 1.0:
+            raise ValueError("Module sensitivity uniform_mix must be in [0, 1]")
+        if eps <= 0.0:
+            raise ValueError("Module sensitivity eps must be positive")
         self.warmup_steps = int(warmup_steps)
-        self.clip_max = float(clip_max)
+        self.uniform_mix = float(uniform_mix)
         self.eps = float(eps)
         self.modules = _discover_model_modules(model)
-        self.ema = {
-            name: a.detach().float().new_zeros(metadata.rank)
-            for name, (a, _, metadata) in self.modules.items()
+        self.sums = {
+            name: a.detach().float().new_zeros(()) for name, (a, _, _) in self.modules.items()
         }
         self.count = {name: 0 for name in self.modules}
+        self._finalize_diagnostics: dict[str, Any] = {}
 
     def update(self, optimizer_step: int) -> None:
         """Collect once after accumulated backward and before optimizer.step."""
@@ -204,51 +227,50 @@ class RankSensitivityTracker:
             for name, (a, b, _) in self.modules.items():
                 if a.grad is None or b.grad is None:
                     continue
-                h_a = (a.grad.detach().float() * a.detach().float()).sum(dim=1)
-                h_b = (b.grad.detach().float() * b.detach().float()).sum(dim=0)
-                if h_a.shape != h_b.shape:
-                    raise ValueError(f"LoRA rank mismatch while tracking {name}")
-                current = (0.5 * (h_a + h_b)).square()
-                self.ema[name].mul_(self.beta)
-                self.ema[name].add_(current, alpha=1.0 - self.beta)
+                h_a = (a.grad.detach().float() * a.detach().float()).sum()
+                h_b = (b.grad.detach().float() * b.detach().float()).sum()
+                module_gate = 0.5 * (h_a + h_b)
+                self.sums[name].add_(module_gate.abs())
                 self.count[name] += 1
 
-    def finalize(self) -> tuple[dict[str, Any], dict[str, float], bool]:
-        """Return globally normalized rank and module sensitivity."""
+    def finalize(self) -> tuple[dict[str, float], bool]:
+        """Return client-wide mean-normalized module sensitivity."""
 
-        corrected = {
-            name: (
-                value / (1.0 - self.beta ** self.count[name])
-                if self.count[name] > 0
-                else value.clone()
+        observed_names = [name for name in sorted(self.sums) if self.count[name] > 0]
+        if observed_names:
+            torch = __import__("torch")
+            packed = torch.stack(
+                [self.sums[name] / self.count[name] for name in observed_names]
             )
-            for name, value in self.ema.items()
-        }
-        all_values = [corrected[name].reshape(-1) for name in sorted(corrected)]
-        if not all_values:
-            raise RuntimeError("Rank sensitivity tracker has no LoRA modules")
-        torch = __import__("torch")
-        packed = torch.cat(all_values)
-        mean_value = float(packed.mean().detach().cpu())
-        valid = math.isfinite(mean_value) and mean_value > self.eps
-        if valid:
-            rank_sensitivity = {
-                name: (value / (mean_value + self.eps))
-                .clamp_(0.0, self.clip_max)
-                .detach()
-                .float()
-                .cpu()
-                for name, value in corrected.items()
-            }
+            packed_values = packed.detach().float().cpu().tolist()
+            raw_values = dict(zip(observed_names, packed_values, strict=True))
         else:
-            rank_sensitivity = {
-                name: torch.ones_like(value, dtype=torch.float32, device="cpu")
-                for name, value in corrected.items()
-            }
-        module_sensitivity = {
-            name: float(value.mean().item()) for name, value in rank_sensitivity.items()
+            raw_values = {}
+        all_observed = set(raw_values) == set(self.modules)
+        if all_observed:
+            module_sensitivity, valid = _normalize_module_sensitivity(
+                raw_values, uniform_mix=self.uniform_mix, eps=self.eps
+            )
+        else:
+            module_sensitivity = {name: 1.0 for name in self.modules}
+            valid = False
+        self._finalize_diagnostics = {
+            "gate": "module_gate",
+            "statistic": "mean_absolute_gate",
+            "normalization": "client_module_mean",
+            "uniform_mix": self.uniform_mix,
+            "uniform_floor": 1.0 - self.uniform_mix,
+            "warmup_steps": self.warmup_steps,
+            "raw_by_module": {
+                name: raw_values.get(name) for name in sorted(self.modules)
+            },
+            "raw_summary": _numeric_summary(list(raw_values.values())),
+            "final_summary": _numeric_summary(list(module_sensitivity.values())),
         }
-        return rank_sensitivity, module_sensitivity, valid
+        return module_sensitivity, valid
+
+    def diagnostics(self) -> dict[str, Any]:
+        return copy.deepcopy(self._finalize_diagnostics)
 
     def metadata(self) -> dict[str, dict[str, Any]]:
         return {name: metadata.as_dict() for name, (_, _, metadata) in sorted(self.modules.items())}
@@ -261,22 +283,52 @@ def _vector_dot(left: Any, right: Any) -> Any:
         if len(left) != len(right):
             raise ValueError("Vector lengths differ")
         return sum(float(a) * float(b) for a, b in zip(left, right, strict=True))
-    raise TypeError("Rank functional distance requires tensor or list vectors")
+    raise TypeError("Module functional distance requires tensor or list vectors")
 
 
-def rank_functional_distance_sq(
-    b1: Any,
-    a1: Any,
-    b0: Any,
-    a0: Any,
+def _module_cross_inner(
+    b_x: Any,
+    a_x: Any,
+    b_y: Any,
+    a_y: Any,
+) -> Any:
+    """Compute <B_x A_x, B_y A_y> using only rank-by-rank products."""
+
+    if all(hasattr(value, "detach") for value in (b_x, a_x, b_y, a_y)):
+        bx = b_x.detach().double()
+        ax = a_x.detach().double()
+        by = b_y.detach().double()
+        ay = a_y.detach().double()
+        return ((bx.transpose(0, 1) @ by) @ (ay @ ax.transpose(0, 1))).trace()
+    rank = _shape(a_x)[0]
+    return sum(
+        _vector_dot(_column(b_x, i), _column(b_y, j))
+        * _vector_dot(_row(a_y, j), _row(a_x, i))
+        for i in range(rank)
+        for j in range(rank)
+    )
+
+
+def lora_functional_distance_sq(
+    a_x: Any,
+    b_x: Any,
+    a_y: Any,
+    b_y: Any,
     scaling: float,
 ) -> Any:
-    """Squared distance between two scaled rank-1 LoRA functions."""
+    """Squared distance between two complete scaled LoRA module functions."""
 
+    shapes = (_shape(a_x), _shape(b_x), _shape(a_y), _shape(b_y))
+    if any(len(shape) != 2 for shape in shapes):
+        raise ValueError(f"Module functional distance requires matrices, got {shapes}")
+    if shapes[0] != shapes[2] or shapes[1] != shapes[3]:
+        raise ValueError(f"LoRA module shapes differ: {shapes}")
+    if shapes[0][0] != shapes[1][1]:
+        raise ValueError(f"LoRA A/B ranks differ: A={shapes[0]}, B={shapes[1]}")
     value = float(scaling) ** 2 * (
-        _vector_dot(b1, b1) * _vector_dot(a1, a1)
-        + _vector_dot(b0, b0) * _vector_dot(a0, a0)
-        - 2.0 * _vector_dot(b1, b0) * _vector_dot(a1, a0)
+        _module_cross_inner(b_x, a_x, b_x, a_x)
+        + _module_cross_inner(b_y, a_y, b_y, a_y)
+        - 2.0 * _module_cross_inner(b_x, a_x, b_y, a_y)
     )
     return value.clamp_min(0.0) if hasattr(value, "clamp_min") else max(0.0, float(value))
 
@@ -289,12 +341,6 @@ def _column(matrix: Any, rank: int) -> Any:
     if hasattr(matrix, "select"):
         return matrix.select(1, rank)
     return [row[rank] for row in matrix]
-
-
-def _sensitivity_values(value: Any) -> list[float]:
-    if hasattr(value, "detach"):
-        return [float(item) for item in value.detach().float().cpu().reshape(-1).tolist()]
-    return [float(item) for item in value]
 
 
 def _as_float(value: Any) -> float:
@@ -315,49 +361,33 @@ def compute_functional_staleness(
     base_state: Mapping[str, Any],
     current_state: Mapping[str, Any],
     client_state: Mapping[str, Any],
-    rank_sensitivity: Mapping[str, Any],
+    module_sensitivity: Mapping[str, Any],
     lora_metadata: Mapping[str, Mapping[str, Any]],
     eps: float = 1e-12,
 ) -> tuple[float, float, float]:
-    """Compute sensitivity-weighted rank-functional server drift and local update."""
+    """Compute sensitivity-weighted module-functional server drift and local update."""
 
     server_drift: Any = 0.0
     local_update: Any = 0.0
-    if set(rank_sensitivity) != set(lora_metadata):
-        raise ValueError("Rank sensitivity and LoRA metadata modules differ")
+    if set(module_sensitivity) != set(lora_metadata):
+        raise ValueError("Module sensitivity and LoRA metadata modules differ")
     for module_name in sorted(lora_metadata):
         metadata = lora_metadata[module_name]
         a_name, b_name = str(metadata["a_name"]), str(metadata["b_name"])
         a_s, b_s = base_state[a_name], base_state[b_name]
         a_t, b_t = current_state[a_name], current_state[b_name]
         a_k, b_k = client_state[a_name], client_state[b_name]
-        rank = int(metadata["rank"])
-        values = _sensitivity_values(rank_sensitivity[module_name])
-        if len(values) != rank:
-            raise ValueError(
-                f"Rank sensitivity size mismatch for {module_name}: {len(values)} != {rank}"
-            )
+        importance = float(module_sensitivity[module_name])
+        if not math.isfinite(importance) or importance < 0.0:
+            raise ValueError(f"Invalid module sensitivity for {module_name}")
         normalizer = int(metadata["out_features"]) * int(metadata["in_features"])
         if normalizer <= 0:
             raise ValueError(f"Invalid LoRA module size for {module_name}")
         scaling = float(metadata["scaling"])
-        for index, importance in enumerate(values):
-            d_server = rank_functional_distance_sq(
-                _column(b_t, index),
-                _row(a_t, index),
-                _column(b_s, index),
-                _row(a_s, index),
-                scaling,
-            )
-            d_local = rank_functional_distance_sq(
-                _column(b_k, index),
-                _row(a_k, index),
-                _column(b_s, index),
-                _row(a_s, index),
-                scaling,
-            )
-            server_drift = server_drift + importance * d_server / normalizer
-            local_update = local_update + importance * d_local / normalizer
+        d_server = lora_functional_distance_sq(a_t, b_t, a_s, b_s, scaling)
+        d_local = lora_functional_distance_sq(a_k, b_k, a_s, b_s, scaling)
+        server_drift = server_drift + importance * d_server / normalizer
+        local_update = local_update + importance * d_local / normalizer
     drift = _as_float(server_drift)
     update = _as_float(local_update)
     relative = math.sqrt(drift / (update + eps))
@@ -367,9 +397,8 @@ def compute_functional_staleness(
 def staleness_reliability(
     relative_staleness: float,
     gamma: float = 1.0,
-    delta_max: float = 10.0,
 ) -> float:
-    return math.exp(-float(gamma) * min(float(relative_staleness), float(delta_max)))
+    return math.exp(-float(gamma) * float(relative_staleness))
 
 
 def compute_module_alpha(
@@ -435,20 +464,9 @@ def _numeric_summary(values: Sequence[float], clip_max: float | None = None) -> 
 
 
 def _sensitivity_diagnostics(
-    rank_sensitivity: Mapping[str, Sequence[float]],
     module_sensitivity: Mapping[str, float],
     observations: Mapping[str, int],
-    clip_max: float,
 ) -> dict[str, Any]:
-    rank_rows = [
-        {"module": module, "rank": index, "sensitivity": float(value)}
-        for module, values in sorted(rank_sensitivity.items())
-        for index, value in enumerate(values)
-    ]
-    top_ranks = sorted(
-        rank_rows,
-        key=lambda item: (-item["sensitivity"], item["module"], item["rank"]),
-    )[:10]
     top_modules = [
         {"module": module, "sensitivity": float(value)}
         for module, value in sorted(
@@ -456,22 +474,17 @@ def _sensitivity_diagnostics(
         )[:10]
     ]
     return {
-        "rank_by_module": copy.deepcopy(dict(rank_sensitivity)),
         "module_by_module": copy.deepcopy(dict(module_sensitivity)),
         "observations_by_module": dict(observations),
-        "rank_summary": _numeric_summary(
-            [item["sensitivity"] for item in rank_rows], clip_max=clip_max
-        ),
         "module_summary": _numeric_summary(list(module_sensitivity.values())),
         "observation_summary": _numeric_summary(list(observations.values())),
-        "top_ranks": top_ranks,
         "top_modules": top_modules,
     }
 
 
 @register_method("ours")
 class Ours(Method):
-    """Rank-Gate sensitivity-aware asynchronous LoRA aggregation."""
+    """Module-Gate sensitivity-aware asynchronous LoRA aggregation."""
 
     name = "ours"
     capabilities = MethodCapabilities(
@@ -482,13 +495,12 @@ class Ours(Method):
         requires_group_sensitivity=True,
     )
     allowed_params = {
-        "sensitivity_beta",
         "sensitivity_warmup_steps",
-        "sensitivity_clip_max",
+        "sensitivity_uniform_mix",
         "gamma",
-        "delta_max",
         "history_beta",
         "history_lambda",
+        "history_strength",
         "base_precision",
         "alpha_max",
         "eps",
@@ -498,26 +510,27 @@ class Ours(Method):
     def __init__(self, params: Mapping[str, Any] | None = None) -> None:
         super().__init__(params)
         self.task_memory: dict[str, dict[str, float]] = {}
+        self.task_memory_counts: dict[str, int] = {}
         self.task_weights: dict[str, float] = {}
         self._server_metadata: dict[str, dict[str, Any]] = {}
         self._model_metadata: dict[str, dict[str, Any]] = {}
-        self._tracker: RankSensitivityTracker | None = None
+        self._tracker: ModuleSensitivityTracker | None = None
         self._validate_parameters()
 
     def _value(self, key: str, default: float | int) -> float:
         return float(self.params.get(key, default))
 
     def _validate_parameters(self) -> None:
-        beta = self._value("sensitivity_beta", 0.95)
-        history_beta = self._value("history_beta", 0.95)
-        if not 0.0 <= beta < 1.0 or not 0.0 <= history_beta < 1.0:
-            raise ValueError("sensitivity_beta and history_beta must be in [0, 1)")
+        history_beta = self._value("history_beta", 0.9)
+        if not 0.0 <= history_beta < 1.0:
+            raise ValueError("history_beta must be in [0, 1)")
         if int(self.params.get("sensitivity_warmup_steps", 1)) < 0:
             raise ValueError("sensitivity_warmup_steps must be non-negative")
+        uniform_mix = self._value("sensitivity_uniform_mix", 0.5)
+        if not 0.0 <= uniform_mix <= 1.0:
+            raise ValueError("sensitivity_uniform_mix must be in [0, 1]")
         positive = {
-            "sensitivity_clip_max": 10.0,
             "gamma": 1.0,
-            "delta_max": 10.0,
             "history_lambda": 1.0,
             "base_precision": 1.0,
             "alpha_max": 0.5,
@@ -528,6 +541,9 @@ class Ours(Method):
             value = self._value(key, default)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{key} must be positive")
+        history_strength = self._value("history_strength", 1.0)
+        if not math.isfinite(history_strength) or history_strength < 0.0:
+            raise ValueError("history_strength must be finite and non-negative")
         if self._value("alpha_max", 0.5) > 1.0:
             raise ValueError("alpha_max must be <= 1")
 
@@ -569,7 +585,7 @@ class Ours(Method):
                 server_item["scaling"] = float(model_item["scaling"])
         tasks = sorted({str(client.task) for client in clients})
         if not tasks:
-            raise ValueError("Rank-Gate requires client task identities")
+            raise ValueError("Module-Gate requires client task identities")
         self.task_weights = {task: 1.0 / len(tasks) for task in tasks}
         self.task_memory = {
             task: {
@@ -578,23 +594,25 @@ class Ours(Method):
             }
             for task in tasks
         }
+        self.task_memory_counts = {
+            task: int(self.task_memory_counts.get(task, 0)) for task in tasks
+        }
 
     def client_runtime_state(self, context: Any) -> dict[str, Any]:
-        return {"reset_rank_sensitivity_for": context.client_id}
+        return {"reset_module_sensitivity_for": context.client_id}
 
     def load_client_runtime_state(self, state: Mapping[str, Any], context: Any) -> None:
-        expected = state.get("reset_rank_sensitivity_for")
+        expected = state.get("reset_module_sensitivity_for")
         if expected is not None and expected != context.client_id:
-            raise ValueError("Rank sensitivity runtime state belongs to another client")
+            raise ValueError("Module sensitivity runtime state belongs to another client")
         self._tracker = None
 
     def transform_gradients(self, model: Any, context: Mapping[str, Any]) -> None:
         if self._tracker is None:
-            self._tracker = RankSensitivityTracker(
+            self._tracker = ModuleSensitivityTracker(
                 model,
-                beta=self._value("sensitivity_beta", 0.95),
                 warmup_steps=int(self.params.get("sensitivity_warmup_steps", 1)),
-                clip_max=self._value("sensitivity_clip_max", 10.0),
+                uniform_mix=self._value("sensitivity_uniform_mix", 0.5),
                 eps=self._value("eps", 1e-12),
             )
         self._tracker.update(int(context.get("optimizer_step", 0)))
@@ -606,13 +624,13 @@ class Ours(Method):
         if step != total_steps:
             return {}
         if self._tracker is None:
-            raise RuntimeError("Local training produced no Rank-Gate tracker")
-        rank_sensitivity, module_sensitivity, valid = self._tracker.finalize()
+            raise RuntimeError("Local training produced no Module-Gate tracker")
+        module_sensitivity, valid = self._tracker.finalize()
         return {
-            "rank_sensitivity": rank_sensitivity,
             "module_sensitivity": module_sensitivity,
             "sensitivity_valid": valid,
             "sensitivity_observations": dict(self._tracker.count),
+            "sensitivity_transform": self._tracker.diagnostics(),
             "lora_metadata": self._tracker.metadata(),
         }
 
@@ -632,16 +650,18 @@ class Ours(Method):
         )
 
     def _validate_client_update(self, update: Update) -> None:
-        rank_raw = update.metadata.get("rank_sensitivity")
         module_raw = update.metadata.get("module_sensitivity")
         observation_raw = update.metadata.get("sensitivity_observations")
+        transform_raw = update.metadata.get("sensitivity_transform", {})
         metadata_raw = update.metadata.get("lora_metadata")
-        if not isinstance(rank_raw, Mapping) or not isinstance(module_raw, Mapping):
-            raise ValueError("Rank-Gate update requires rank and module sensitivity")
+        if not isinstance(module_raw, Mapping):
+            raise ValueError("Module-Gate update requires module sensitivity")
         if not isinstance(observation_raw, Mapping):
-            raise ValueError("Rank-Gate update requires sensitivity observation counts")
+            raise ValueError("Module-Gate update requires sensitivity observation counts")
+        if not isinstance(transform_raw, Mapping):
+            raise ValueError("Module-Gate sensitivity diagnostics must be a mapping")
         if not isinstance(metadata_raw, Mapping):
-            raise ValueError("Rank-Gate update requires LoRA metadata")
+            raise ValueError("Module-Gate update requires LoRA metadata")
         metadata = {
             str(name): {str(key): value for key, value in item.items()}
             for name, item in metadata_raw.items()
@@ -663,53 +683,52 @@ class Ours(Method):
         else:
             self._server_metadata = copy.deepcopy(metadata)
 
-        rank_sensitivity: dict[str, list[float]] = {}
         module_sensitivity: dict[str, float] = {}
         observations: dict[str, int] = {}
-        if (
-            set(rank_raw) != set(metadata)
-            or set(module_raw) != set(metadata)
-            or set(observation_raw) != set(metadata)
-        ):
+        if set(module_raw) != set(metadata) or set(observation_raw) != set(metadata):
             raise ValueError("Sensitivity modules do not match LoRA modules")
-        for name, item in metadata.items():
-            values = _sensitivity_values(rank_raw[name])
-            if len(values) != int(item["rank"]):
-                raise ValueError(f"Rank sensitivity size mismatch for {name}")
-            if any(not math.isfinite(value) or value < 0.0 for value in values):
-                raise ValueError(f"Invalid rank sensitivity for {name}")
+        for name in metadata:
             module_value = float(module_raw[name])
-            expected_mean = sum(values) / len(values)
             if not math.isfinite(module_value) or module_value < 0.0:
                 raise ValueError(f"Invalid module sensitivity for {name}")
-            if not math.isclose(module_value, expected_mean, rel_tol=1e-5, abs_tol=1e-7):
-                raise ValueError(f"Module sensitivity is not the rank mean for {name}")
             observation_value = observation_raw[name]
             if isinstance(observation_value, bool):
                 raise ValueError(f"Invalid sensitivity observation count for {name}")
             observation_count = int(observation_value)
             if observation_count < 0 or observation_count != float(observation_value):
                 raise ValueError(f"Invalid sensitivity observation count for {name}")
-            rank_sensitivity[name] = values
             module_sensitivity[name] = module_value
             observations[name] = observation_count
-        update.metadata["rank_sensitivity"] = rank_sensitivity
         update.metadata["module_sensitivity"] = module_sensitivity
         update.metadata["sensitivity_observations"] = observations
+        update.metadata["sensitivity_transform"] = copy.deepcopy(dict(transform_raw))
         update.metadata["lora_metadata"] = metadata
         update.metadata["sensitivity_valid"] = bool(update.metadata.get("sensitivity_valid", False))
-        update.metadata["_rank_gate_validated"] = True
+        update.metadata["_module_gate_validated"] = True
 
     def prepare_upload(self, update: Update, context: Any) -> Update:
         del context
         self._validate_client_update(update)
         return update
 
+    def _corrected_task_memory(self, task: str, module: str) -> float:
+        count = int(self.task_memory_counts.get(task, 0))
+        if count <= 0:
+            return 0.0
+        beta = self._value("history_beta", 0.9)
+        correction = 1.0 - beta**count
+        return self.task_memory.get(task, {}).get(module, 0.0) / max(
+            correction, self._value("eps", 1e-12)
+        )
+
     def _historical_precision(self, module: str) -> float:
-        return self._value("base_precision", 1.0) + sum(
-            weight * self.task_memory.get(task, {}).get(module, 0.0)
+        memory = sum(
+            weight * self._corrected_task_memory(task, module)
             for task, weight in self.task_weights.items()
         )
+        return self._value("base_precision", 1.0) + self._value(
+            "history_strength", 1.0
+        ) * memory
 
     def _fuse_modules(
         self,
@@ -728,7 +747,7 @@ class Ours(Method):
                 result[name] = _blend_value(current[name], client[name], alpha)
                 covered.add(name)
         if covered != set(current):
-            raise ValueError("Some federated parameters are outside Rank-Gate LoRA modules")
+            raise ValueError("Some federated parameters are outside Module-Gate LoRA modules")
         return result
 
     def _reject(
@@ -749,35 +768,40 @@ class Ours(Method):
         ]
 
     def on_arrival(self, update: Update, server_context: ServerContext) -> list[ServerMutation]:
-        if not update.metadata.get("_rank_gate_validated"):
+        if not update.metadata.get("_module_gate_validated"):
             self._validate_client_update(update)
         if update.task not in self.task_weights:
             raise ValueError(f"Unknown task identity: {update.task}")
         version_staleness = server_context.version - update.base_version
         if version_staleness < 0:
             raise ValueError("Update base_version cannot exceed server version")
-        rank_sensitivity = update.metadata["rank_sensitivity"]
         module_sensitivity = update.metadata["module_sensitivity"]
         observations = update.metadata["sensitivity_observations"]
         drift, local, relative = compute_functional_staleness(
             update.base_state,
             server_context.global_state,
             update.local_state,
-            rank_sensitivity,
+            module_sensitivity,
             self._server_metadata,
             eps=self._value("eps", 1e-12),
         )
         parameter_norm = _parameter_delta_norm(update.delta)
-        task_memory_before = {
+        task_memory_raw_before = {
             module: float(self.task_memory[update.task][module])
             for module in sorted(self._server_metadata)
         }
+        task_memory_before = {
+            module: self._corrected_task_memory(update.task, module)
+            for module in sorted(self._server_metadata)
+        }
+        task_memory_count_before = int(self.task_memory_counts.get(update.task, 0))
         historical_precision_before = {
             module: self._historical_precision(module)
             for module in sorted(self._server_metadata)
         }
         diagnostics = {
-            "schema_version": 1,
+            "schema_version": 3,
+            "method_variant": "module_gate",
             "client": {
                 "update_id": update.update_id,
                 "client_id": update.client_id,
@@ -791,11 +815,10 @@ class Ours(Method):
             },
             "sensitivity": {
                 "valid": bool(update.metadata["sensitivity_valid"]),
+                "transform": copy.deepcopy(update.metadata["sensitivity_transform"]),
                 **_sensitivity_diagnostics(
-                    rank_sensitivity,
                     module_sensitivity,
                     observations,
-                    clip_max=self._value("sensitivity_clip_max", 10.0),
                 ),
             },
             "functional_staleness": {
@@ -805,6 +828,8 @@ class Ours(Method):
                 "parameter_delta_norm": parameter_norm,
                 "relative_staleness": relative,
                 "reliability": None,
+                "reliability_function": "exponential",
+                "gamma": self._value("gamma", 1.0),
             },
             "aggregation": {
                 "accepted": False,
@@ -814,6 +839,14 @@ class Ours(Method):
             },
             "memory": {
                 "task": update.task,
+                "history_beta": self._value("history_beta", 0.9),
+                "history_strength": self._value("history_strength", 1.0),
+                "base_precision": self._value("base_precision", 1.0),
+                "history_lambda": self._value("history_lambda", 1.0),
+                "task_memory_count_before": task_memory_count_before,
+                "task_memory_count_after": task_memory_count_before,
+                "task_memory_raw_before": task_memory_raw_before,
+                "task_memory_raw_after": dict(task_memory_raw_before),
                 "task_memory_before": task_memory_before,
                 "task_memory_after": dict(task_memory_before),
                 "historical_precision_before": historical_precision_before,
@@ -841,11 +874,10 @@ class Ours(Method):
         reliability = staleness_reliability(
             relative,
             gamma=self._value("gamma", 1.0),
-            delta_max=self._value("delta_max", 10.0),
         )
         diagnostics["functional_staleness"]["reliability"] = reliability
         minimum = self._value("min_update_energy", 1e-16)
-        if local < minimum and parameter_norm < minimum:
+        if local < minimum:
             diagnostics["aggregation"]["rejection_reason"] = "no_effective_update"
             return self._reject(update, server_context, "no_effective_update", common)
 
@@ -863,16 +895,21 @@ class Ours(Method):
         }
         new_state = self._fuse_modules(server_context.global_state, update.local_state, alphas)
 
-        history_beta = self._value("history_beta", 0.95)
+        history_beta = self._value("history_beta", 0.9)
         task_memory = self.task_memory.setdefault(update.task, {})
         for module, sensitivity in module_sensitivity.items():
             task_memory[module] = (
                 history_beta * task_memory.get(module, 0.0)
                 + (1.0 - history_beta) * reliability * sensitivity
             )
+        self.task_memory_counts[update.task] = task_memory_count_before + 1
 
-        task_memory_after = {
+        task_memory_raw_after = {
             module: float(self.task_memory[update.task][module])
+            for module in sorted(self._server_metadata)
+        }
+        task_memory_after = {
+            module: self._corrected_task_memory(update.task, module)
             for module in sorted(self._server_metadata)
         }
         historical_precision_after = {
@@ -887,6 +924,8 @@ class Ours(Method):
         }
         diagnostics["memory"].update(
             {
+                "task_memory_count_after": self.task_memory_counts[update.task],
+                "task_memory_raw_after": task_memory_raw_after,
                 "task_memory_after": task_memory_after,
                 "historical_precision_after": historical_precision_after,
                 "task_memory_after_summary": _numeric_summary(
@@ -916,19 +955,40 @@ class Ours(Method):
 
     def state_dict(self) -> dict[str, Any]:
         return {
+            "state_schema_version": 3,
+            "method_variant": "module_gate",
             "params": copy.deepcopy(self.params),
             "task_memory": copy.deepcopy(self.task_memory),
+            "task_memory_counts": copy.deepcopy(self.task_memory_counts),
             "task_weights": copy.deepcopy(self.task_weights),
             "lora_metadata": copy.deepcopy(self._server_metadata),
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if int(state.get("state_schema_version", 0)) != 3 or state.get(
+            "method_variant"
+        ) != "module_gate":
+            raise ValueError(
+                "Checkpoint is not a Module-Gate state-schema-v3 checkpoint; "
+                "Rank-Gate memory cannot be reused as Module-Gate memory"
+            )
         super().load_state_dict(state)
+        unknown = set(self.params) - self.allowed_params
+        if unknown:
+            raise ValueError(f"Unknown parameter(s) for {self.name}: {sorted(unknown)}")
         self._validate_parameters()
         self.task_memory = {
             str(task): {str(module): float(value) for module, value in memory.items()}
             for task, memory in state.get("task_memory", {}).items()
         }
+        counts = state.get("task_memory_counts")
+        if not isinstance(counts, Mapping):
+            raise ValueError("task_memory_counts must be a mapping")
+        self.task_memory_counts = {}
+        for task, value in counts.items():
+            if isinstance(value, bool) or int(value) != value or int(value) < 0:
+                raise ValueError(f"Invalid task memory count for {task}: {value}")
+            self.task_memory_counts[str(task)] = int(value)
         self.task_weights = {
             str(task): float(value) for task, value in state.get("task_weights", {}).items()
         }
