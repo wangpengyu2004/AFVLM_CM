@@ -15,7 +15,7 @@ import yaml
 from tqdm.auto import tqdm
 
 from afl_vlm.config import resolved_public_config, validate_config
-from afl_vlm.data.afvlm_cm import AFVLMDataModule
+from afl_vlm.data.afvlm_cm import AFVLMDataModule, validate_caption_metric_runtime
 from afl_vlm.evaluation import merge_evaluation_outputs
 from afl_vlm.federation.client import FederatedClient
 from afl_vlm.federation.server import FederatedServer
@@ -97,6 +97,22 @@ def _evaluate_method_primary(
         model.load_trainable(original)
 
 
+def _primary_corpus_metrics(
+    task_adapter: Any,
+    gathered: list[dict[str, Any]],
+    total: int,
+    rank: int,
+) -> dict[str, float] | None:
+    """Compute a corpus metric exactly once after distributed generation."""
+
+    if rank != 0:
+        return None
+    ordered_predictions, ordered_references = merge_evaluation_outputs(
+        [payload["rows"] for payload in gathered], total
+    )
+    return task_adapter.metric(ordered_predictions, ordered_references)
+
+
 def _evaluate_distributed_task(
     model: Any,
     task_adapter: Any,
@@ -151,10 +167,22 @@ def _evaluate_distributed_task(
     ]
     if errors:
         raise RuntimeError("Distributed evaluation shard failed: " + "; ".join(errors))
-    ordered_predictions, ordered_references = merge_evaluation_outputs(
-        [payload["rows"] for payload in complete], len(sample_ids)
-    )
-    metrics = task_adapter.metric(ordered_predictions, ordered_references)
+    metric_payload: list[dict[str, Any]] = [{"metrics": None, "error": None}]
+    if rank == 0:
+        try:
+            metric_payload[0]["metrics"] = _primary_corpus_metrics(
+                task_adapter, complete, len(sample_ids), rank
+            )
+        except Exception as exc:
+            metric_payload[0]["error"] = f"{type(exc).__name__}: {exc}"
+    torch.distributed.broadcast_object_list(metric_payload, src=0)
+    if metric_payload[0]["error"] is not None:
+        raise RuntimeError(
+            "Distributed evaluation metric failed on rank 0: " + metric_payload[0]["error"]
+        )
+    metrics = metric_payload[0]["metrics"]
+    if not isinstance(metrics, dict):
+        raise RuntimeError("Distributed evaluation did not receive corpus metrics")
     if rank == 0:
         tqdm.write(
             f"[AFVLM-CM] DDP evaluation complete: task={task_adapter.task_key}, "
@@ -241,6 +269,8 @@ def _initialize_server(
 
 def execute(config: dict[str, Any]) -> dict[str, Any]:
     """Select the configured execution backend without changing method semantics."""
+    if "caption" in config.get("dataset", {}).get("tasks", []):
+        validate_caption_metric_runtime()
     backend = str(config.get("runtime", {}).get("backend", "serial"))
     if backend == "client_parallel":
         from afl_vlm.parallel_runner import execute_parallel

@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from afl_vlm.data.afvlm_cm import TASK_DATASETS, AFVLMDataModule, AFVLMTaskAdapter
+from afl_vlm.data.afvlm_cm import (
+    TASK_DATASETS,
+    AFVLMDataModule,
+    AFVLMTaskAdapter,
+    validate_caption_metric_runtime,
+)
 
 
 def _write(path: Path, payload: object) -> None:
@@ -238,6 +243,19 @@ class AFVLMPreflightTests(unittest.TestCase):
             ) as scorer:
                 self.assertEqual(adapter.metric(["caption"], references), expected)
             scorer.assert_called_once_with(["caption"], references)
+
+    def test_caption_runtime_validation_fails_fast_without_java(self) -> None:
+        components = (object(), object(), object(), object(), object())
+        with (
+            patch(
+                "afl_vlm.data.afvlm_cm._load_coco_caption_components",
+                return_value=components,
+            ) as loader,
+            patch("afl_vlm.data.afvlm_cm.shutil.which", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "Java runtime"),
+        ):
+            validate_caption_metric_runtime()
+        loader.assert_called_once_with()
 
 
 if __name__ == "__main__":

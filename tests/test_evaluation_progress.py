@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 from afl_vlm.evaluation import merge_evaluation_outputs
 from afl_vlm.federation.worker_pool import _evaluate_states, _evaluate_states_shard
 from afl_vlm.parallel_runner import _merge_parallel_evaluation
+from afl_vlm.runner import _primary_corpus_metrics
 
 
 class _TaskAdapter:
@@ -98,6 +100,20 @@ class EvaluationProgressTests(unittest.TestCase):
 
 
 class DistributedEvaluationTests(unittest.TestCase):
+    def test_only_primary_rank_computes_complete_corpus_metric(self) -> None:
+        adapter = Mock()
+        adapter.metric.return_value = {"score": 1.0}
+        gathered = [
+            {"rows": [(0, "p0", "r0")]},
+            {"rows": [(1, "p1", "r1")]},
+        ]
+
+        self.assertIsNone(_primary_corpus_metrics(adapter, gathered, 2, rank=1))
+        self.assertEqual(
+            _primary_corpus_metrics(adapter, gathered, 2, rank=0), {"score": 1.0}
+        )
+        adapter.metric.assert_called_once_with(["p0", "p1"], ["r0", "r1"])
+
     def test_shards_are_merged_in_original_corpus_order(self) -> None:
         predictions, references = merge_evaluation_outputs(
             [

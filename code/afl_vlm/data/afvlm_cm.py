@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -57,6 +58,35 @@ def _fcit_text(text: str) -> str:
     return str(text).strip().upper()
 
 
+def _load_coco_caption_components() -> tuple[Any, Any, Any, Any, Any]:
+    """Load the FCIT caption evaluator with one actionable dependency error."""
+
+    try:
+        from pycocoevalcap.bleu.bleu import Bleu
+        from pycocoevalcap.cider.cider import Cider
+        from pycocoevalcap.meteor.meteor import Meteor
+        from pycocoevalcap.rouge.rouge import Rouge
+        from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Caption evaluation requires pycocoevalcap==1.2. Run "
+            "`python -m pip install pycocoevalcap==1.2`, or reinstall the current "
+            "requirements.txt, before starting training."
+        ) from exc
+    return Bleu, Cider, Meteor, Rouge, PTBTokenizer
+
+
+def validate_caption_metric_runtime() -> None:
+    """Fail fast before training if the exact FCIT caption metric cannot run."""
+
+    _load_coco_caption_components()
+    if shutil.which("java") is None:
+        raise RuntimeError(
+            "Caption METEOR evaluation requires a Java runtime. Install Java and "
+            "ensure the `java` executable is available on PATH before starting training."
+        )
+
+
 def coco_caption_metrics(
     predictions: list[str], references: list[tuple[str, ...]]
 ) -> dict[str, float]:
@@ -67,17 +97,7 @@ def coco_caption_metrics(
     included in the FCIT score.
     """
 
-    try:
-        from pycocoevalcap.bleu.bleu import Bleu
-        from pycocoevalcap.cider.cider import Cider
-        from pycocoevalcap.meteor.meteor import Meteor
-        from pycocoevalcap.rouge.rouge import Rouge
-        from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
-    except ImportError as exc:
-        raise RuntimeError(
-            "Caption evaluation requires pycocoevalcap. Install requirements.txt "
-            "and ensure Java is available for METEOR."
-        ) from exc
+    Bleu, Cider, Meteor, Rouge, PTBTokenizer = _load_coco_caption_components()
 
     ground_truth = {
         index: [{"caption": caption} for caption in captions]
