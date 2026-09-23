@@ -458,6 +458,9 @@ class Llava15Adapter(ModelAdapter):
             position=1,
             leave=False,
             dynamic_ncols=True,
+            mininterval=0.0,
+            miniters=1,
+            smoothing=0.0,
             disable=not bool(self._config.get("progress_bar", True)),
         )
         self.model.train()
@@ -568,13 +571,14 @@ class Llava15Adapter(ModelAdapter):
             extra=hook_metadata,
         )
 
-    def evaluate(
+    def _evaluation_pass(
         self,
         task_adapter: Any,
         sample_ids: list[str],
         mode: str,
         progress_hook: Any | None = None,
-    ) -> dict[str, float]:
+        progress_label: str | None = None,
+    ) -> tuple[list[float], list[str], list[str]]:
         torch = self._imports()[0]
         samples = task_adapter.samples_by_id(sample_ids)
         network = self._network()
@@ -583,11 +587,14 @@ class Llava15Adapter(ModelAdapter):
         with torch.no_grad():
             iterator = tqdm(
                 samples,
-                desc=f"evaluate {task_adapter.task_key}",
+                desc=progress_label or f"evaluate {task_adapter.task_key}",
                 unit="sample",
                 position=1,
                 leave=False,
                 dynamic_ncols=True,
+                mininterval=0.0,
+                miniters=1,
+                smoothing=0.0,
                 disable=not bool(self._config.get("progress_bar", True)),
             )
             for completed, sample in enumerate(iterator, start=1):
@@ -610,6 +617,39 @@ class Llava15Adapter(ModelAdapter):
                     references.append(sample.answer)
                 if progress_hook is not None:
                     progress_hook(completed, len(samples))
+        return losses, predictions, references
+
+    def generate_evaluation_outputs(
+        self,
+        task_adapter: Any,
+        sample_ids: list[str],
+        progress_hook: Any | None = None,
+        progress_label: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Generate shard outputs; corpus metrics are computed after DDP gathering."""
+        _, predictions, references = self._evaluation_pass(
+            task_adapter,
+            sample_ids,
+            "final",
+            progress_hook=progress_hook,
+            progress_label=progress_label,
+        )
+        return predictions, references
+
+    def evaluate(
+        self,
+        task_adapter: Any,
+        sample_ids: list[str],
+        mode: str,
+        progress_hook: Any | None = None,
+    ) -> dict[str, float]:
+        losses, predictions, references = self._evaluation_pass(
+            task_adapter,
+            sample_ids,
+            mode,
+            progress_hook=progress_hook,
+            progress_label=None,
+        )
         return (
             {"loss": sum(losses) / len(losses)}
             if mode == "probe"

@@ -267,6 +267,18 @@ class ModelAdapter(ABC):
     ) -> MetricDict:
         """Evaluate the current state on a task-specific adapter."""
 
+    def generate_evaluation_outputs(
+        self,
+        task_adapter: Any,
+        sample_ids: list[str],
+        progress_hook: Any | None = None,
+        progress_label: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Return ordered predictions/references for exact distributed metrics."""
+        raise NotImplementedError(
+            f"Model adapter {type(self).__name__} does not expose evaluation outputs"
+        )
+
     def set_evaluation_context(self, task: str, client_id: str | None = None) -> None:
         """Select optional task/client routing without changing model state."""
         return None

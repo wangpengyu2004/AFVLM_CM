@@ -170,6 +170,8 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
             raise ValueError("client_parallel requires runtime.start_method=spawn for CUDA safety")
         if float(runtime.get("startup_timeout_seconds", 1800)) <= 0:
             raise ValueError("runtime.startup_timeout_seconds must be positive")
+        if float(runtime.get("ddp_timeout_seconds", 7200)) <= 0:
+            raise ValueError("runtime.ddp_timeout_seconds must be positive")
         if runtime.get("arrival_policy", "planned") != "planned":
             raise ValueError("client_parallel currently requires runtime.arrival_policy=planned")
         if runtime.get("worker_queue", "plan_arrival_edf") not in {

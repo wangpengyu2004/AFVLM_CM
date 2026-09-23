@@ -43,8 +43,11 @@ class TrainJob:
 @dataclass(slots=True)
 class EvaluationJob:
     job_id: str
+    group_id: str
     states: dict[str, LoRAState]
     split: str
+    shard_index: int
+    shard_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +113,8 @@ class TrainCompleted:
 class EvaluationCompleted:
     worker_id: int
     job_id: str
-    metrics: dict[str, Any]
+    group_id: str
+    outputs: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -191,6 +195,68 @@ def _evaluate_states(
     return {
         task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
         for task, rows in by_task.items()
+    }
+
+
+def _evaluate_states_shard(
+    model: Any,
+    data_module: Any,
+    states: Mapping[str, LoRAState],
+    split: str,
+    shard_index: int,
+    shard_count: int,
+    status: Any,
+    progress: Any,
+) -> dict[str, Any]:
+    """Generate one disjoint CPU-output shard for every requested model state."""
+
+    if shard_count <= 0 or not 0 <= shard_index < shard_count:
+        raise ValueError(f"Invalid evaluation shard {shard_index}/{shard_count}")
+    tasks = data_module.tasks
+    sample_ids = {
+        task: [sample.id for sample in adapter.load_split(split)] for task, adapter in tasks.items()
+    }
+    if set(states) == {"global"}:
+        targets = [("global", task, None) for task in sorted(tasks)]
+    else:
+        targets = [
+            (client_id, client_id.split("/", 1)[0], client_id)
+            for client_id in sorted(states)
+        ]
+    total = sum(len(sample_ids[task]) for _, task, _ in targets)
+    completed = 0
+    loaded_state: str | None = None
+    outputs: dict[str, dict[str, list[tuple[int, str, str]]]] = {}
+    for state_key, task, client_id in targets:
+        if loaded_state != state_key:
+            model.load_trainable(states[state_key])
+            loaded_state = state_key
+        label = task if state_key == "global" else state_key
+        status(f"evaluating {label} ({split}) shard {shard_index + 1}/{shard_count}")
+        model.set_evaluation_context(task, client_id)
+        indexed_ids = list(enumerate(sample_ids[task]))
+        local_items = indexed_ids[shard_index::shard_count]
+        offset = completed
+        predictions, references = model.generate_evaluation_outputs(
+            tasks[task],
+            [sample_id for _, sample_id in local_items],
+            progress_hook=lambda current, _local_total, label=label, offset=offset: progress(
+                label, offset + current, total
+            ),
+        )
+        if len(predictions) != len(local_items) or len(references) != len(local_items):
+            raise RuntimeError("Model returned incomplete parallel evaluation outputs")
+        outputs.setdefault(state_key, {})[task] = [
+            (index, prediction, reference)
+            for (index, _), prediction, reference in zip(
+                local_items, predictions, references, strict=True
+            )
+        ]
+        completed += len(local_items)
+    return {
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "outputs": outputs,
     }
 
 
@@ -353,8 +419,7 @@ def _worker_main(
                 continue
             if isinstance(command, EvaluationJob):
                 current_job = command.job_id
-                evaluation_job_id = command.job_id
-                metrics = _evaluate_states(
+                outputs = _evaluate_states_shard(
                     model,
                     data_module,
                     {
@@ -362,8 +427,10 @@ def _worker_main(
                         for key, state in command.states.items()
                     },
                     command.split,
+                    command.shard_index,
+                    command.shard_count,
                     lambda message: output_queue.put(WorkerStatus(worker_id, message)),
-                    lambda label, current, total, job_id=evaluation_job_id: output_queue.put(
+                    lambda label, current, total, job_id=command.group_id: output_queue.put(
                         EvaluationProgress(
                             worker_id,
                             job_id,
@@ -373,7 +440,14 @@ def _worker_main(
                         )
                     ),
                 )
-                output_queue.put(EvaluationCompleted(worker_id, command.job_id, metrics))
+                output_queue.put(
+                    EvaluationCompleted(
+                        worker_id,
+                        command.job_id,
+                        command.group_id,
+                        outputs,
+                    )
+                )
                 continue
             raise TypeError(f"Unsupported worker command: {type(command).__name__}")
     except BaseException:
@@ -411,6 +485,7 @@ class ClientWorkerPool:
             tuple[tuple[int, float, float, int], int, TrainJob | EvaluationJob]
         ] = []
         self._submission_sequence = 0
+        self._dispatch_suspended = False
         self._queues_closed = False
         for worker_id, device_id in enumerate(devices):
             process = self._context.Process(
@@ -435,6 +510,21 @@ class ClientWorkerPool:
     @property
     def worker_count(self) -> int:
         return len(self._processes)
+
+    @property
+    def busy_count(self) -> int:
+        return len(self._busy)
+
+    def suspend_dispatch(self) -> None:
+        """Stop assigning queued jobs while already-running GPU work drains."""
+
+        self._dispatch_suspended = True
+
+    def resume_dispatch(self) -> None:
+        """Resume work-conserving assignment of queued jobs."""
+
+        self._dispatch_suspended = False
+        self.dispatch_pending()
 
     def wait_until_ready(
         self,
@@ -501,12 +591,21 @@ class ClientWorkerPool:
             key = (1, 0.0, 0.0, 0)
         heapq.heappush(self._pending, (key, self._submission_sequence, job))
         self._submission_sequence += 1
-        if not defer:
+        if not defer and not self._dispatch_suspended:
             self.dispatch_pending()
 
     def dispatch_pending(self) -> None:
         """Fill every idle worker from the deterministic priority heap."""
+        if self._dispatch_suspended:
+            return
         while self._idle and self._pending:
+            _, _, job = heapq.heappop(self._pending)
+            self._dispatch(job)
+
+    def dispatch_priority_jobs(self) -> None:
+        """Dispatch only evaluation/barrier jobs, even while training is suspended."""
+
+        while self._idle and self._pending and self._pending[0][0][0] == 0:
             _, _, job = heapq.heappop(self._pending)
             self._dispatch(job)
 
@@ -546,7 +645,8 @@ class ClientWorkerPool:
                     f"Worker {message.worker_id} completed {actual}, expected {expected}"
                 )
             self._idle.add(message.worker_id)
-            self.dispatch_pending()
+            if not self._dispatch_suspended:
+                self.dispatch_pending()
         return message
 
     def receive_nowait(self) -> WorkerMessage:

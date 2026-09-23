@@ -15,6 +15,7 @@ import random
 import statistics
 import time
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from tqdm.auto import tqdm
 
 from afl_vlm.config import resolved_public_config, validate_config
 from afl_vlm.data.afvlm_cm import AFVLMDataModule
+from afl_vlm.evaluation import merge_evaluation_outputs
 from afl_vlm.federation.server import FederatedServer
 from afl_vlm.federation.types import ClientContext
 from afl_vlm.federation.worker_pool import (
@@ -73,6 +75,50 @@ def _write_json(path: Path, payload: Any) -> None:
 def _append(path: Path, payload: Any) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+
+def _merge_parallel_evaluation(
+    data_module: Any,
+    states: Mapping[str, Any],
+    split: str,
+    shard_payloads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Reconstruct complete corpora and compute each metric exactly once."""
+
+    if not shard_payloads:
+        raise RuntimeError("Parallel evaluation returned no shards")
+    shard_count = int(shard_payloads[0]["shard_count"])
+    shard_indices = sorted(int(payload["shard_index"]) for payload in shard_payloads)
+    if len(shard_payloads) != shard_count or shard_indices != list(range(shard_count)):
+        raise RuntimeError("Parallel evaluation did not return every configured shard")
+    if any(int(payload["shard_count"]) != shard_count for payload in shard_payloads):
+        raise RuntimeError("Parallel evaluation workers reported inconsistent shard counts")
+
+    tasks = data_module.tasks
+    sample_ids = {
+        task: [sample.id for sample in adapter.load_split(split)] for task, adapter in tasks.items()
+    }
+
+    def metric_for(state_key: str, task: str) -> dict[str, float]:
+        try:
+            shards = [payload["outputs"][state_key][task] for payload in shard_payloads]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Parallel evaluation is missing outputs for state={state_key}, task={task}"
+            ) from exc
+        predictions, references = merge_evaluation_outputs(shards, len(sample_ids[task]))
+        return tasks[task].metric(predictions, references)
+
+    if set(states) == {"global"}:
+        return {task: metric_for("global", task) for task in sorted(tasks)}
+    by_task: dict[str, list[dict[str, float]]] = defaultdict(list)
+    for client_id in sorted(states):
+        task = client_id.split("/", 1)[0]
+        by_task[task].append(metric_for(client_id, task))
+    return {
+        task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
+        for task, rows in by_task.items()
+    }
 
 
 def _build_plan(config: dict[str, Any], method: Any, profiles: list[Any]) -> list[Any]:
@@ -232,6 +278,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     )
     job_progress: dict[str, Any] = {}
     evaluation_progress: dict[str, Any] = {}
+    evaluation_progress_last: dict[tuple[str, int], int] = {}
     completed_updates: dict[int, Any] = {}
     completed_evaluations: dict[str, dict[str, Any]] = {}
     logical_fresh_states: dict[int, tuple[dict[str, Any], int]] = {}
@@ -270,10 +317,13 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                             dynamic_ncols=True,
                             leave=False,
                             position=message.worker_id + 1,
+                            mininterval=0.0,
+                            miniters=1,
+                            smoothing=0.0,
                         )
                         job_progress[message.job_id] = bar
-                    bar.update(max(0, message.current - bar.n))
                     bar.set_postfix(loss=f"{message.loss:.4f}", refresh=False)
+                    bar.update(max(0, message.current - bar.n))
                 return
             if isinstance(message, EvaluationProgress):
                 if progress_enabled:
@@ -286,11 +336,17 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                             dynamic_ncols=True,
                             leave=False,
                             position=len(devices) + 1,
+                            mininterval=0.0,
+                            miniters=1,
+                            smoothing=0.0,
                         )
                         evaluation_progress[message.job_id] = bar
                     else:
                         bar.set_description(f"evaluate {message.label}", refresh=False)
-                    bar.update(max(0, message.current - bar.n))
+                    progress_key = (message.job_id, message.worker_id)
+                    previous = evaluation_progress_last.get(progress_key, 0)
+                    bar.update(max(0, message.current - previous))
+                    evaluation_progress_last[progress_key] = message.current
                 return
             if isinstance(message, FreshStateRequest):
                 snapshot = logical_fresh_states.get(message.event_id)
@@ -307,10 +363,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     bar.close()
                 return
             if isinstance(message, EvaluationCompleted):
-                bar = evaluation_progress.pop(message.job_id, None)
-                if bar is not None:
-                    bar.close()
-                completed_evaluations[message.job_id] = message.metrics
+                completed_evaluations[message.job_id] = message.outputs
                 return
             if isinstance(message, WorkerFailed):
                 raise RuntimeError(
@@ -333,17 +386,53 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         def run_evaluation(split: str) -> dict[str, Any]:
             nonlocal evaluation_counter
             evaluation_counter += 1
-            job_id = f"evaluation:{evaluation_counter}:v{server.version}:{split}"
+            group_id = f"evaluation:{evaluation_counter}:v{server.version}:{split}"
             states = (
                 dict(method.evaluation_states(server.state))
                 if method.evaluation_scope == "client_local_mean"
                 else {"global": server.state}
             )
             worker_states = {key: state_to_device(state, "cpu") for key, state in states.items()}
-            pool.submit(EvaluationJob(job_id, worker_states, split), priority=True)
-            while job_id not in completed_evaluations:
-                handle_message(pool.receive())
-            return completed_evaluations.pop(job_id)
+            job_ids = [
+                f"{group_id}:shard{shard_index}" for shard_index in range(pool.worker_count)
+            ]
+
+            # Evaluation is a synchronous snapshot operation.  First stop new
+            # training dispatches and let only the jobs already executing on a
+            # GPU finish.  Their updates remain cached and are not aggregated.
+            # Once every worker is idle, assign one disjoint corpus shard to
+            # every GPU. Queued training remains paused until all shards finish.
+            pool.suspend_dispatch()
+            try:
+                while pool.busy_count:
+                    handle_message(pool.receive())
+                for shard_index, job_id in enumerate(job_ids):
+                    pool.submit(
+                        EvaluationJob(
+                            job_id=job_id,
+                            group_id=group_id,
+                            states=worker_states,
+                            split=split,
+                            shard_index=shard_index,
+                            shard_count=pool.worker_count,
+                        ),
+                        priority=True,
+                        defer=True,
+                    )
+                # There is exactly one priority job per worker, so every GPU
+                # evaluates while queued client training remains suspended.
+                pool.dispatch_priority_jobs()
+                while any(job_id not in completed_evaluations for job_id in job_ids):
+                    handle_message(pool.receive())
+                payloads = [completed_evaluations.pop(job_id) for job_id in job_ids]
+                return _merge_parallel_evaluation(data_module, states, split, payloads)
+            finally:
+                bar = evaluation_progress.pop(group_id, None)
+                if bar is not None:
+                    bar.close()
+                for key in [key for key in evaluation_progress_last if key[0] == group_id]:
+                    evaluation_progress_last.pop(key)
+                pool.resume_dispatch()
 
         contexts: dict[int, ClientContext] = {}
         staleness_values: list[int] = []
@@ -377,7 +466,15 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             dynamic_ncols=True,
             disable=not progress_enabled,
             position=0,
+            mininterval=0.0,
+            miniters=1,
+            smoothing=0.0,
         )
+        if progress_enabled:
+            tqdm.write(
+                "[AFVLM-CM] periodic evaluation schedule: "
+                f"every {eval_interval} accepted server updates"
+            )
 
         for virtual_time, _, kind, event in timeline:
             last_virtual_time = max(last_virtual_time, virtual_time)
@@ -533,6 +630,13 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 and server.version % eval_interval == 0
                 and server.version != last_evaluated_version
             ):
+                if progress_enabled:
+                    federation_progress.refresh()
+                    tqdm.write(
+                        "[AFVLM-CM] starting periodic evaluation: "
+                        f"server_version={server.version}, interval={eval_interval}, "
+                        f"split={periodic_split}, workers={pool.worker_count}"
+                    )
                 validation_metrics = run_evaluation(periodic_split)
                 _append(
                     output / "task_metrics.jsonl",

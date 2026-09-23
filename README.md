@@ -488,6 +488,18 @@ AdaMasFL 和 Pilot 继续使用原来的一卡一客户端 worker pool。前四�
 Plan 指定的逻辑 arrival 聚合。
 DDP 的 `training.batch_size` 是每卡 batch，其有效批量为
 `batch_size × gradient_accumulation × GPU数`，这一差异会写入输出，也必须在论文实验中披露。
+周期验证和最终测试同样由全部 DDP rank 协同执行：每个任务的样本按 rank 做不重复分片，
+生成结果按原始样本顺序汇总后再计算完整语料级指标。Caption 的 CIDEr 因而仍使用整个
+验证/测试语料计算，而不是错误地平均分片 CIDEr。不存在 rank 0 独自验证、其余 rank 在
+NCCL broadcast 中长时间空等的情况。DDP 会先同步 rank 0 模型参数，再创建各 rank 的
+联邦服务器初始快照，避免独立 LoRA 初始化造成状态分叉；`runtime.ddp_timeout_seconds`
+控制长时间生成后 collective 的超时，默认 7200 秒。
+采用一卡一客户端 worker pool 的方法也复用全部常驻 GPU 做数据并行评估，但不会临时建立
+DDP 进程组。每张 GPU 生成六个任务各自互不重叠的样本分片，只向主进程返回 CPU 上的
+样本序号、预测文本和参考文本。主进程检查无遗漏、无重复并恢复原始语料顺序，再在完整
+语料上调用一次任务指标；不会平均分片 CIDEr。触发评估后会暂停新的客户端训练派发，缓存
+已经完成的训练结果，所有评估分片结束后再恢复原 Plan。因此全部可见 GPU 都参与评估，且
+评估不改变 TrainPlan、服务器版本、虚拟聚合顺序、optimizer 或任何方法内部状态。
 
 ### V100 八卡运行
 
@@ -665,9 +677,16 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 - `fedasync virtual arrivals`：当前已应用的虚拟到达数 / TrainPlan 总更新数，并显示服务器版本、当前客户端和 staleness；
 - `GPU<n> <client_id>`：每张卡当前客户端的真实 optimizer step / 计划 optimizer step，并动态显示 loss；
 - DDP 方法只由 rank 0 显示 `local <client_id>` 进度；其余 rank 同步训练同一客户端，不重复打印；
-- `evaluate <task>`：定期 validation 和最终 test 时各任务已评估样本数。8 卡并行模式由主进程显示一条跨任务的总评估进度，任务切换时更新名称，不会让多个 GPU worker 同时写终端。
+- DDP 评估显示 `evaluate <task> rank 1/N shard`，它是 rank 0 的本地分片进度；独立的
+  `DDP evaluation start/complete` 状态行记录该任务的完整样本数、rank 数和全局完成时刻；
+- `evaluate <task>`：worker-pool 方法定期 validation 和最终 test 时的全局累计样本数。
+  主进程汇总全部 worker 的进度，GPU worker 不直接写进度条。
 
-本地进度按 optimizer step 计数，不按 gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
+所有更新条都设置为逐更新刷新；进入周期评估前会再次强制刷新，并输出包含真实
+`server_version` 和 `interval` 的独立状态行。本地进度按 optimizer step 计数，不按
+gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，
+进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取
+已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
 
 `batch_size` 是每张 GPU 的真实多模态 micro-batch 大小：文本在当前 batch 内动态 padding，图像组成同一个 batch tensor，并通过一次 LLaVA forward/backward 处理。原 worker pool 的有效批量是 `batch_size × gradient_accumulation`；DDP 的有效批量还要乘以 world size。例如八卡下 `batch_size: 1`、`gradient_accumulation: 4` 的有效批量是 32。修改 batch、卡数或执行策略后必须创建新的实验 profile。
 

@@ -7,6 +7,7 @@ import os
 import random
 import statistics
 from collections import Counter, defaultdict
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from tqdm.auto import tqdm
 
 from afl_vlm.config import resolved_public_config, validate_config
 from afl_vlm.data.afvlm_cm import AFVLMDataModule
+from afl_vlm.evaluation import merge_evaluation_outputs
 from afl_vlm.federation.client import FederatedClient
 from afl_vlm.federation.server import FederatedServer
 from afl_vlm.federation.types import ClientContext
@@ -95,20 +97,146 @@ def _evaluate_method_primary(
         model.load_trainable(original)
 
 
+def _evaluate_distributed_task(
+    model: Any,
+    task_adapter: Any,
+    sample_ids: list[str],
+) -> dict[str, float]:
+    """Generate one balanced shard per DDP rank and compute exact corpus metrics."""
+
+    import torch
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    indexed_ids = list(enumerate(sample_ids))
+    local_items = indexed_ids[rank::world_size]
+    if rank == 0:
+        tqdm.write(
+            f"[AFVLM-CM] DDP evaluation start: task={task_adapter.task_key}, "
+            f"samples={len(sample_ids)}, ranks={world_size}, "
+            f"rank0_shard={len(local_items)}"
+        )
+    try:
+        predictions, references = model.generate_evaluation_outputs(
+            task_adapter,
+            [sample_id for _, sample_id in local_items],
+            progress_label=(
+                f"evaluate {task_adapter.task_key} rank {rank + 1}/{world_size} shard"
+            ),
+        )
+        if len(predictions) != len(local_items) or len(references) != len(local_items):
+            raise RuntimeError("Model returned incomplete distributed evaluation outputs")
+        local_rows = [
+            (index, prediction, reference)
+            for (index, _), prediction, reference in zip(
+                local_items, predictions, references, strict=True
+            )
+        ]
+        local_payload: dict[str, Any] = {"rank": rank, "rows": local_rows, "error": None}
+    except Exception as exc:
+        local_payload = {
+            "rank": rank,
+            "rows": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    gathered: list[dict[str, Any] | None] = [None] * world_size
+    torch.distributed.all_gather_object(gathered, local_payload)
+    complete = [payload for payload in gathered if payload is not None]
+    if len(complete) != world_size:
+        raise RuntimeError("Distributed evaluation did not receive every rank shard")
+    errors = [
+        f"rank {payload['rank']}: {payload['error']}"
+        for payload in complete
+        if payload["error"] is not None
+    ]
+    if errors:
+        raise RuntimeError("Distributed evaluation shard failed: " + "; ".join(errors))
+    ordered_predictions, ordered_references = merge_evaluation_outputs(
+        [payload["rows"] for payload in complete], len(sample_ids)
+    )
+    metrics = task_adapter.metric(ordered_predictions, ordered_references)
+    if rank == 0:
+        tqdm.write(
+            f"[AFVLM-CM] DDP evaluation complete: task={task_adapter.task_key}, "
+            f"samples={len(sample_ids)}, ranks={world_size}"
+        )
+    return metrics
+
+
+def _evaluate_method_distributed(
+    model: Any,
+    method: Any,
+    server_state: dict[str, Any],
+    tasks: dict[str, Any],
+    split: str,
+) -> dict[str, Any]:
+    """Evaluate every model state cooperatively on all DDP ranks."""
+
+    sample_ids = {
+        task: [sample.id for sample in adapter.load_split(split)]
+        for task, adapter in tasks.items()
+    }
+    original = model.snapshot_trainable()
+    states = (
+        method.evaluation_states(server_state)
+        if method.evaluation_scope == "client_local_mean"
+        else {"global": server_state}
+    )
+    try:
+        if set(states) == {"global"}:
+            model.load_trainable(states["global"])
+            metrics = {}
+            for task in sorted(tasks):
+                model.set_evaluation_context(task, None)
+                metrics[task] = _evaluate_distributed_task(
+                    model, tasks[task], sample_ids[task]
+                )
+            return metrics
+        by_task: dict[str, list[dict[str, float]]] = defaultdict(list)
+        for client_id in sorted(states):
+            task = client_id.split("/", 1)[0]
+            model.load_trainable(states[client_id])
+            model.set_evaluation_context(task, client_id)
+            by_task[task].append(
+                _evaluate_distributed_task(model, tasks[task], sample_ids[task])
+            )
+        return {
+            task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
+            for task, rows in by_task.items()
+        }
+    finally:
+        model.load_trainable(original)
+
+
 def evaluate_method(
     model: Any, method: Any, server_state: dict[str, Any], tasks: dict[str, Any], split: str
 ) -> dict[str, Any]:
-    """Evaluate on DDP rank zero and broadcast the immutable metric object."""
+    """Use all DDP ranks for evaluation without long idle collectives."""
     import torch
 
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not distributed:
         return _evaluate_method_primary(model, method, server_state, tasks, split)
-    payload: list[Any] = [None]
-    if torch.distributed.get_rank() == 0:
-        payload[0] = _evaluate_method_primary(model, method, server_state, tasks, split)
-    torch.distributed.broadcast_object_list(payload, src=0)
-    return payload[0]
+    return _evaluate_method_distributed(model, method, server_state, tasks, split)
+
+
+def _initialize_server(
+    model: Any,
+    method: Any,
+    profiles: list[Any],
+    client_count: int,
+    *,
+    distributed: bool,
+    local_rank: int,
+) -> FederatedServer:
+    """Install extensions, synchronize DDP parameters, then snapshot server state."""
+
+    method.configure_model(model, profiles)
+    if distributed:
+        model.enable_distributed_data_parallel(local_rank)
+    server = FederatedServer(model, method, client_count)
+    method.configure_server(server.state, profiles)
+    return server
 
 
 def execute(config: dict[str, Any]) -> dict[str, Any]:
@@ -137,7 +265,12 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
-        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        ddp_timeout = float(config.get("runtime", {}).get("ddp_timeout_seconds", 7200))
+        torch.distributed.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=timedelta(seconds=ddp_timeout),
+        )
     primary = rank == 0
     os.environ["AFVLM_PRIMARY_PROCESS"] = "1" if primary else "0"
 
@@ -146,6 +279,9 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     progress_enabled = bool(config["output"].get("progress_bar", True)) and primary
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     output = Path(str(config["output"]["directory"])).resolve()
     if primary and (
         output.exists()
@@ -215,11 +351,17 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     model.load(model_config)
     if progress_enabled:
         tqdm.write("[AFVLM-CM] model ready; starting federated event replay")
-    method.configure_model(model, profiles)
-    server = FederatedServer(model, method, len(clients))
-    method.configure_server(server.state, profiles)
-    if distributed:
-        model.enable_distributed_data_parallel(local_rank)
+    # DDP's constructor synchronizes rank 0 parameters. Create the authoritative
+    # federated snapshot only after that synchronization; otherwise independently
+    # initialized LoRA parameters could leave nonzero ranks with stale server state.
+    server = _initialize_server(
+        model,
+        method,
+        profiles,
+        len(clients),
+        distributed=distributed,
+        local_rank=local_rank,
+    )
     federation = config["federation"]
     training = config["training"]
     if method.capabilities.requires_custom_scheduler or method.capabilities.mode == "synchronous":
@@ -294,8 +436,16 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         desc=f"{method.name} client updates",
         unit="update",
         dynamic_ncols=True,
+        mininterval=0.0,
+        miniters=1,
+        smoothing=0.0,
         disable=not progress_enabled,
     )
+    if progress_enabled:
+        tqdm.write(
+            "[AFVLM-CM] periodic evaluation schedule: "
+            f"every {eval_interval} accepted server updates"
+        )
     for virtual_time, _, kind, event in timeline:
         last_virtual_time = max(last_virtual_time, virtual_time)
         if kind == "start":
@@ -441,6 +591,13 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             and server.version % eval_interval == 0
             and server.version != last_evaluated_version
         ):
+            if progress_enabled:
+                federation_progress.refresh()
+                tqdm.write(
+                    "[AFVLM-CM] starting periodic evaluation: "
+                    f"server_version={server.version}, interval={eval_interval}, "
+                    f"split={periodic_split}"
+                )
             validation_metrics = evaluate_method(model, method, server.state, tasks, periodic_split)
             _append(
                 output / "task_metrics.jsonl",

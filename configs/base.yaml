@@ -9,6 +9,8 @@ runtime:
   aggregation_device: auto
   start_method: spawn
   startup_timeout_seconds: 1800
+  # Covers long VLM generation before the next DDP evaluation collective.
+  ddp_timeout_seconds: 7200
   arrival_policy: planned
   worker_queue: plan_arrival_edf
 
