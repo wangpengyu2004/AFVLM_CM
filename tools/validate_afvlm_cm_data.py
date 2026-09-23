@@ -26,7 +26,9 @@ def _validate(setting: int) -> dict[str, object]:
         / "fedavg.yaml"
     )
     config = load_config(config_path)
-    report = AFVLMDataModule(config["dataset"]).preflight_validate(progress=True)
+    dataset_config = dict(config["dataset"])
+    dataset_config["evaluation"] = dict(config["evaluation"])
+    report = AFVLMDataModule(dataset_config).preflight_validate(progress=True)
     return {"setting": setting, "config": str(config_path.relative_to(ROOT)), **report}
 
 

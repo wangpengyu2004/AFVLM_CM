@@ -19,7 +19,9 @@ training:
   batch_size: 1
   gradient_accumulation: 4
   learning_rate: 0.00002
-  max_text_length: 512
+  # The active Grounding conversations fit the native LLaVA 2k context.
+  # Multi-turn samples fail rather than silently dropping later assistant answers.
+  max_text_length: 2048
   optimizer: adamw
 
 federation:
@@ -41,7 +43,8 @@ evaluation:
   eval_every_server_updates: 10
   periodic_split: validation
   final_split: final
-  generation_max_new_tokens: 64
+  # FCIT inference uses deterministic decoding with up to 128 generated tokens.
+  generation_max_new_tokens: 128
   grounding_iou_threshold: 0.5
 
 output:

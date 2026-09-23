@@ -226,7 +226,7 @@ def _evaluate_states_shard(
     total = sum(len(sample_ids[task]) for _, task, _ in targets)
     completed = 0
     loaded_state: str | None = None
-    outputs: dict[str, dict[str, list[tuple[int, str, str]]]] = {}
+    outputs: dict[str, dict[str, list[tuple[int, str, Any]]]] = {}
     for state_key, task, client_id in targets:
         if loaded_state != state_key:
             model.load_trainable(states[state_key])

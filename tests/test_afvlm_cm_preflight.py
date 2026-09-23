@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from afl_vlm.data.afvlm_cm import TASK_DATASETS, AFVLMDataModule, AFVLMTaskAdapter
 
@@ -57,6 +58,7 @@ class AFVLMPreflightTests(unittest.TestCase):
             self.assertEqual(
                 (conversation.instruction, conversation.answer), ("Question", "Answer")
             )
+            self.assertEqual(conversation.turns, (("Question", "Answer"),))
             self.assertEqual((flat.instruction, flat.answer), ("Question", "A"))
             self.assertEqual(grounding.answer, "[0.1,0.2,0.3,0.4]")
 
@@ -70,23 +72,32 @@ class AFVLMPreflightTests(unittest.TestCase):
             for task in TASK_DATASETS:
                 task_root = partition_root / task
                 _write(task_root / "client_0.json", [_conversation("image.jpg")])
+                validation = {
+                    "question_id": "1",
+                    "image": "image.jpg",
+                    "text": "Question",
+                    "answer": "A",
+                }
+                if task == "caption":
+                    validation["references"] = ["A", "B", "C", "D", "E"]
                 _write(
                     task_root / "val.json",
-                    [
-                        {
-                            "question_id": "1",
-                            "image": "image.jpg",
-                            "text": "Question",
-                            "answer": "A",
-                        }
-                    ],
+                    [validation],
                 )
                 answer = (
                     {"answer_bbox": "[0.1,0.2,0.3,0.4]"} if task == "grounding" else {"answer": "A"}
                 )
+                final = {
+                    "question_id": "2",
+                    "image": "image.jpg",
+                    "text": "Question",
+                    **answer,
+                }
+                if task == "caption":
+                    final["references"] = ["A", "B", "C", "D", "E"]
                 _write(
                     task_root / "test.json",
-                    [{"question_id": "2", "image": "image.jpg", "text": "Question", **answer}],
+                    [final],
                 )
 
             data_module = AFVLMDataModule(
@@ -157,6 +168,76 @@ class AFVLMPreflightTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, r"grounding/validation.*val\.json\[0\].*role"):
                 adapter.validate_file(path, "validation")
+
+    def test_grounding_keeps_all_training_turns_and_expands_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = AFVLMTaskAdapter(
+                "grounding",
+                {"partition_dir": root, "image_root": root, "require_images": False},
+            )
+            record = _conversation("image.jpg")
+            conversations = record["conversations"]
+            assert isinstance(conversations, list)
+            conversations.extend(
+                [
+                    {"from": "human", "value": "Second question"},
+                    {"from": "gpt", "value": "Second answer"},
+                ]
+            )
+            path = root / "records.json"
+            _write(path, [record])
+
+            train = adapter.load_file(path, "train")
+            validation = adapter.load_file(path, "validation")
+
+            self.assertEqual(len(train), 1)
+            self.assertEqual(
+                train[0].turns,
+                (("Question", "Answer"), ("Second question", "Second answer")),
+            )
+            self.assertEqual(len(validation), 2)
+            self.assertEqual([sample.answer for sample in validation], ["Answer", "Second answer"])
+
+    def test_fcit_task_metrics_and_grounding_mean_iou(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            common = {
+                "partition_dir": root,
+                "image_root": root,
+                "require_images": False,
+                "evaluation": {"grounding_iou_threshold": 0.5},
+            }
+            cls = AFVLMTaskAdapter("cls", common)
+            reasoning = AFVLMTaskAdapter("visual_reasoning", common)
+            grounding = AFVLMTaskAdapter("grounding", common)
+
+            self.assertEqual(cls.metric([" cat "], ["CAT"]), {"accuracy": 100.0})
+            self.assertEqual(
+                reasoning.metric(["A"], ["The answer is A"]),
+                {"answer_accuracy": 100.0},
+            )
+            metrics = grounding.metric(
+                ["[0,0,1,1]", "invalid"],
+                ["[0,0,1,1]", "[0,0,1,1]"],
+            )
+            self.assertEqual(metrics["mean_IoU"], 0.5)
+            self.assertEqual(metrics["IoU@0.5_accuracy"], 50.0)
+
+    def test_caption_passes_five_references_to_shared_coco_evaluator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = AFVLMTaskAdapter(
+                "caption",
+                {"partition_dir": root, "image_root": root, "require_images": False},
+            )
+            references = [("a", "b", "c", "d", "e")]
+            expected = {"CIDEr": 123.0}
+            with patch(
+                "afl_vlm.data.afvlm_cm.coco_caption_metrics", return_value=expected
+            ) as scorer:
+                self.assertEqual(adapter.metric(["caption"], references), expected)
+            scorer.assert_called_once_with(["caption"], references)
 
 
 if __name__ == "__main__":

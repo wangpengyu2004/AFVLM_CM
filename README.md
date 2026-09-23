@@ -6,7 +6,7 @@ AFVLM-CM 是用于论文实验的异步联邦视觉语言模型指令微调框�
 
 ## 已检测的数据
 
-框架直接读取现有的 `data/AFVLM_CM`，不生成、不重分区、不改写任何指令文件。
+框架训练时只读 `data/AFVLM_CM`，不会隐式生成、重分区或改写指令文件。需要重建论文固定分区时，必须显式运行后文的版本化划分工具。
 
 ```text
 data/AFVLM_CM/
@@ -23,15 +23,37 @@ data/AFVLM_CM/
 | task ID | 来源数据 | 指标 | 图片相对目录 |
 |---|---|---|---|
 | `cls` | ImageNet-R | accuracy | `ImageNet-R/train/` |
-| `caption` | Flickr30k | CIDEr、ROUGE-L | `Flickr30k/train/` |
+| `caption` | Flickr30k | BLEU-1..4、METEOR、ROUGE-L、CIDEr、FCIT average | `Flickr30k/train/` |
 | `vqa` | AOKVQA | VQA accuracy | `COCO2014/train2014/`、`val2014/` |
 | `chart_vqa` | DVQA | answer accuracy | `DVQA/images/` |
 | `visual_reasoning` | FigureQA | answer accuracy | `FigureQA/images/` |
 | `grounding` | COCO grounding | mean IoU、IoU@0.5 accuracy | 与 AOKVQA 共用 `COCO2014/` |
 
-每个任务目录包含原有的 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 记录只读分区的静态完整性摘要。
+每个任务目录包含 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。当前固定版本为 `fcit_eval_v1_72k`，六任务训练记录数依次为 13,000 / 15,000 / 11,000 / 9,500 / 11,500 / 12,000，总计 72,000；2/5/10 clients/task 三档复用同一任务池，只改变客户端划分。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 固定该版本的静态完整性摘要。
 
-数据读取器兼容该 benchmark 实际存在的三种标注形式：LLaVA `conversations`、扁平的 `text + answer`，以及 Grounding 测试集的 `text + answer_bbox`。正常训练和独立评估不会在启动时全量扫描图片；样本真正进入 batch 时才读取对应图片。需要检查数据时，显式运行独立工具，它会验证当前设置下的全部 `client_N.json`、`val.json`、`test.json`，并对去重后的图片路径逐一检查：
+数据读取器兼容该 benchmark 实际存在的三种标注形式：LLaVA `conversations`、扁平的 `text + answer`，以及 Grounding 测试集的 `text + answer_bbox`。Grounding 训练会保留完整多轮对话并让每个 assistant 回答参与 loss；validation/final 会把每个 user/assistant 对展开成独立 query。Caption 的 validation/test 每张图片保留五个参考 caption。`max_text_length` 默认使用 LLaVA 的 2k 上下文；若某个多轮样本仍超长，collator 会明确报错而不会静默截掉后面的 assistant 回答。正常训练和独立评估不会在启动时全量扫描图片；样本真正进入 batch 时才读取对应图片。
+
+### 重建固定 72k 分区
+
+下面命令从 FCIT 指令文件构建一个新候选目录；如果目标目录非空会直接拒绝，不会覆盖当前 `partitioned/`：
+
+```bash
+python tools/partition_afvlm_cm.py \
+  --source_root data/AFVLM_CM/instruction \
+  --output_dir data/AFVLM_CM/partitioned_fcitev1_72k
+```
+
+验证候选目录后，再人工备份旧目录并启用新目录。数据目录不上传 GitHub，因此电脑端和服务器端都要保存/同步同一个固定分区：
+
+```bash
+mv data/AFVLM_CM/partitioned data/AFVLM_CM/partitioned_legacy_89805
+mv data/AFVLM_CM/partitioned_fcitev1_72k data/AFVLM_CM/partitioned
+python tools/validate_afvlm_cm_data.py --all
+```
+
+划分以问题/指令记录为隔离单位，沿用 FCIT 官方问题级 split；DVQA、FigureQA、Grounding 中不同问题或区域可以引用同一原图。每个任务总量不同，同任务客户端大小也不相等；完整数量保存在各任务的 `statistics.json` 和 `partitioned/metadata/partition_report.md`。更换分区后，旧 system profile/TrainPlan 的 `num_samples` 已失效，必须创建不复用旧 Plan 的新 experiment profile。
+
+需要检查数据时，显式运行独立工具。它会验证当前设置下的全部 `client_N.json`、`val.json`、`test.json`，并对去重后的图片路径逐一检查：
 
 ```bash
 python tools/validate_afvlm_cm_data.py --setting 2
@@ -67,7 +89,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` 已包含 CUDA 11.8 对应的 PyTorch 2.0.1/TorchVision 0.15.2、LLaVA、Transformers、PEFT、数据处理、绘图和工程检查依赖，并以 editable 模式安装当前 AFVLM-CM 包。LLaVA 源码固定到官方 `v1.1.3`，通过体积固定的 release archive 安装而不是执行 `git clone`，可避免训练服务器连接 GitHub git 服务超时。环境安装不会下载 7B/CLIP 预训练参数。请在仓库根目录运行命令，并确保宿主机 NVIDIA 驱动兼容 CUDA 11.8。NF4 量化需要 bitsandbytes；Tesla V100 正式配置使用非量化 FP16。正式训练只读取本地模型权重。
+`requirements.txt` 已包含 CUDA 11.8 对应的 PyTorch 2.0.1/TorchVision 0.15.2、LLaVA、Transformers、PEFT、`pycocoevalcap`、数据处理、绘图和工程检查依赖，并以 editable 模式安装当前 AFVLM-CM 包。LLaVA 源码固定到官方 `v1.1.3`，通过体积固定的 release archive 安装而不是执行 `git clone`，可避免训练服务器连接 GitHub git 服务超时。Caption 的 METEOR 评分还要求系统已安装 Java（例如 `openjdk-8-jre-headless`）；环境安装不会下载 7B/CLIP 预训练参数。请在仓库根目录运行命令，并确保宿主机 NVIDIA 驱动兼容 CUDA 11.8。NF4 量化需要 bitsandbytes；Tesla V100 正式配置使用非量化 FP16。正式训练只读取本地模型权重。
 
 安装后可检查关键版本和 CUDA 可用性：
 
@@ -712,6 +734,15 @@ output:
 项目采用常见异步联邦学习评估协议：以**成功的服务器模型更新数**作为评估间隔。每达到 `evaluation.eval_every_server_updates`，复制当前服务器联邦状态并在公共 validation 集上分别评估六个任务；评估过程不计入虚拟训练时间，也不改变训练状态。全部 TrainPlan 到达事件完成后，先执行方法的结尾处理（例如刷新 FedBuff 残余缓冲），再用最终服务器状态在公共 test 集上评估。
 
 所有存在服务器聚合的算法都以 `server_global` 为主评估结果。Pilot 仍使用任务路由，但使用当前服务器状态及同任务服务器端客户端视觉适配器的均值，不使用个性化 LoRA 替代全局主结果。Local-only 没有全局模型，因此是唯一例外：分别用每个客户端本地模型测试其所属任务的同一公共测试集，再在任务内等权平均，输出协议标记为 `client_local_mean`。
+
+所有 baseline 与 `ours` 固定调用同一个 FCIT-compatible evaluator，不允许方法覆盖任务指标：
+
+- ImageNet-R、AOKVQA：去除首尾空白后忽略大小写的 exact match，输出百分比；
+- DVQA、FigureQA：沿用 FCIT 的 `prediction in reference`（忽略大小写）规则，输出百分比；
+- Flickr30k：对每图五个参考 caption 调用 `pycocoevalcap`，报告 BLEU-1..4、METEOR、ROUGE-L、CIDEr 以及七项的 `FCIT_caption_average`，均为原始 scorer 值乘 100；
+- Grounding：每个 query 单独解码，严格以 `IoU > 0.5` 计正确并输出百分比，同时额外保留 0--1 范围的 `mean_IoU`。
+
+默认 `generation_max_new_tokens: 128` 与 FCIT 推理长度一致，`generate()` 使用确定性 greedy decoding。任务间指标量纲不同，因此不生成没有意义的六任务 raw average。
 
 训练完成后可独立复评：
 

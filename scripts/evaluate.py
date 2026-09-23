@@ -28,12 +28,17 @@ def main() -> None:
     os.chdir(ROOT)
     config = load_config(args.config)
     validate_config(config)
-    data_module = AFVLMDataModule(config["dataset"])
+    dataset_config = dict(config["dataset"])
+    dataset_config["evaluation"] = dict(config["evaluation"])
+    data_module = AFVLMDataModule(dataset_config)
     tasks = data_module.tasks
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()
     model = create_model(config["model"]["adapter"])
-    model.load(config["model"])
+    model_config = dict(config["model"])
+    model_config["max_text_length"] = config["training"]["max_text_length"]
+    model_config["max_new_tokens"] = config["evaluation"]["generation_max_new_tokens"]
+    model.load(model_config)
     method.configure_model(model, load_system_profile(config["federation"]["system_profile"]))
     import torch
 

@@ -249,47 +249,95 @@ class Llava15Adapter(ModelAdapter):
         with Image.open(sample.image) as handle:
             return handle.convert("RGB")
 
-    def _encode(self, sample: Any, max_length: int, include_answer: bool = True) -> dict[str, Any]:
-        (
-            torch,
-            conversation_lib,
-            image_token,
-            image_index,
-            process_images,
-            tokenizer_image_token,
-            *_,
-        ) = self._imports()
+    def _conversation_ids(
+        self,
+        sample: Any,
+        max_length: int,
+        include_answer: bool,
+        conversation_lib: Any,
+        image_token: str,
+        image_index: int,
+        tokenizer_image_token: Any,
+    ) -> tuple[Any, Any | None]:
+        """Tokenize one full conversation and supervise every assistant span.
+
+        Grounding records may contain multiple user/assistant pairs.  The image
+        token appears only in the first user turn, matching LLaVA's native
+        multi-turn instruction format.  Labels remain masked for the system and
+        every user span, while every assistant response contributes to the loss.
+        """
+
         template = str(self._config.get("conversation_template", "v1"))
-        conv = conversation_lib.conv_templates[template].copy()
-        question = f"{image_token}\n{sample.instruction}"
-        conv.append_message(conv.roles[0], question)
-        conv.append_message(conv.roles[1], sample.answer if include_answer else None)
-        prompt = conv.get_prompt()
-        input_ids = (
-            tokenizer_image_token(prompt, self.tokenizer, image_index, return_tensors="pt")[
-                :max_length
-            ]
-            .unsqueeze(0)
-            .to(self.device)
+        turns = tuple(getattr(sample, "turns", ())) or (
+            (sample.instruction, sample.answer),
         )
-        network = self._network()
-        image = process_images([self._image(sample)], self.image_processor, network.config)
-        image = image.to(device=self.device, dtype=next(network.parameters()).dtype)
-        encoded = {
-            "input_ids": input_ids,
-            "images": image,
-        }
+        if not include_answer:
+            turns = turns[:1]
+
+        def build_prompt(completed: int, pending: bool = False) -> str:
+            conv = conversation_lib.conv_templates[template].copy()
+            for index, (instruction, answer) in enumerate(turns[:completed]):
+                question = (
+                    f"{image_token}\n{instruction}" if index == 0 else instruction
+                )
+                conv.append_message(conv.roles[0], question)
+                conv.append_message(conv.roles[1], answer)
+            if pending:
+                index = completed
+                instruction = turns[index][0]
+                question = (
+                    f"{image_token}\n{instruction}" if index == 0 else instruction
+                )
+                conv.append_message(conv.roles[0], question)
+                conv.append_message(conv.roles[1], None)
+            return conv.get_prompt()
+
         if include_answer:
-            prompt_conv = conversation_lib.conv_templates[template].copy()
-            prompt_conv.append_message(prompt_conv.roles[0], question)
-            prompt_conv.append_message(prompt_conv.roles[1], None)
-            prompt_ids = tokenizer_image_token(
-                prompt_conv.get_prompt(), self.tokenizer, image_index, return_tensors="pt"
+            prompt = build_prompt(len(turns))
+        else:
+            prompt = build_prompt(0, pending=True)
+        full_input_ids = tokenizer_image_token(
+            prompt,
+            self.tokenizer,
+            image_index,
+            return_tensors="pt",
+        )
+        if include_answer and len(turns) > 1 and len(full_input_ids) > max_length:
+            raise ValueError(
+                f"Multi-turn sample {sample.id} requires {len(full_input_ids)} tokens, "
+                f"exceeding max_text_length={max_length}. Increase max_text_length so no "
+                "Grounding assistant response is silently truncated."
             )
-            labels = input_ids.clone()
-            labels[:, : min(labels.shape[1], prompt_ids.shape[0])] = -100
-            encoded["labels"] = labels
-        return encoded
+        input_ids = full_input_ids[:max_length]
+        if not include_answer:
+            return input_ids, None
+
+        labels = input_ids.new_full(input_ids.shape, -100)
+        for turn_index in range(len(turns)):
+            answer_start = len(
+                tokenizer_image_token(
+                    build_prompt(turn_index, pending=True),
+                    self.tokenizer,
+                    image_index,
+                    return_tensors="pt",
+                )
+            )
+            answer_end = len(
+                tokenizer_image_token(
+                    build_prompt(turn_index + 1),
+                    self.tokenizer,
+                    image_index,
+                    return_tensors="pt",
+                )
+            )
+            start = min(answer_start, input_ids.shape[0])
+            end = min(answer_end, input_ids.shape[0])
+            if start < end:
+                labels[start:end] = input_ids[start:end]
+        return input_ids, labels
+
+    def _encode(self, sample: Any, max_length: int, include_answer: bool = True) -> dict[str, Any]:
+        return self._encode_batch([sample], max_length, include_answer=include_answer)
 
     def _encode_batch(
         self, samples: list[Any], max_length: int, include_answer: bool = True
@@ -313,35 +361,27 @@ class Llava15Adapter(ModelAdapter):
             _,
             _,
         ) = self._imports()
-        template = str(self._config.get("conversation_template", "v1"))
         input_sequences: list[Any] = []
         label_sequences: list[Any] = []
 
         for sample in samples:
             if not sample.image:
                 raise ValueError(f"LLaVA sample has no image: {sample.id}")
-            question = f"{image_token}\n{sample.instruction}"
-            conv = conversation_lib.conv_templates[template].copy()
-            conv.append_message(conv.roles[0], question)
-            conv.append_message(conv.roles[1], sample.answer if include_answer else None)
-            input_ids = tokenizer_image_token(
-                conv.get_prompt(), self.tokenizer, image_index, return_tensors="pt"
-            )[:max_length]
+            input_ids, sample_labels = self._conversation_ids(
+                sample,
+                max_length,
+                include_answer,
+                conversation_lib,
+                image_token,
+                image_index,
+                tokenizer_image_token,
+            )
             input_sequences.append(input_ids)
 
             if include_answer:
-                prompt_conv = conversation_lib.conv_templates[template].copy()
-                prompt_conv.append_message(prompt_conv.roles[0], question)
-                prompt_conv.append_message(prompt_conv.roles[1], None)
-                prompt_ids = tokenizer_image_token(
-                    prompt_conv.get_prompt(),
-                    self.tokenizer,
-                    image_index,
-                    return_tensors="pt",
-                )
-                labels = input_ids.clone()
-                labels[: min(labels.shape[0], prompt_ids.shape[0])] = -100
-                label_sequences.append(labels)
+                if sample_labels is None:
+                    raise RuntimeError("Training encoding did not produce assistant labels")
+                label_sequences.append(sample_labels)
 
         sequence_length = max(sequence.shape[0] for sequence in input_sequences)
         pad_token_id = self.tokenizer.pad_token_id
@@ -578,7 +618,7 @@ class Llava15Adapter(ModelAdapter):
         mode: str,
         progress_hook: Any | None = None,
         progress_label: str | None = None,
-    ) -> tuple[list[float], list[str], list[str]]:
+    ) -> tuple[list[float], list[str], list[Any]]:
         torch = self._imports()[0]
         samples = task_adapter.samples_by_id(sample_ids)
         network = self._network()
@@ -614,7 +654,7 @@ class Llava15Adapter(ModelAdapter):
                             generated[0, encoded["input_ids"].shape[1] :], skip_special_tokens=True
                         ).strip()
                     )
-                    references.append(sample.answer)
+                    references.append(sample.references or sample.answer)
                 if progress_hook is not None:
                     progress_hook(completed, len(samples))
         return losses, predictions, references
@@ -625,7 +665,7 @@ class Llava15Adapter(ModelAdapter):
         sample_ids: list[str],
         progress_hook: Any | None = None,
         progress_label: str | None = None,
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[Any]]:
         """Generate shard outputs; corpus metrics are computed after DDP gathering."""
         _, predictions, references = self._evaluation_pass(
             task_adapter,

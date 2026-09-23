@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 def merge_evaluation_outputs(
-    shards: list[list[tuple[int, str, str]]], total: int
-) -> tuple[list[str], list[str]]:
+    shards: list[list[tuple[int, str, Any]]], total: int
+) -> tuple[list[str], list[Any]]:
     """Restore corpus order and reject missing/duplicate distributed samples."""
 
     rows = sorted((row for shard in shards for row in shard), key=lambda row: row[0])

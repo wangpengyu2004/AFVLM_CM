@@ -16,6 +16,8 @@ class Sample:
     instruction: str
     answer: str
     split: str
+    turns: tuple[tuple[str, str], ...] = ()
+    references: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -39,7 +41,7 @@ class TaskAdapter(ABC):
         """Create a model-specific batch."""
 
     @abstractmethod
-    def metric(self, predictions: list[str], references: list[str]) -> dict[str, float]:
+    def metric(self, predictions: list[str], references: list[Any]) -> dict[str, float]:
         """Compute task-native metrics without cross-task averaging."""
 
     @abstractmethod

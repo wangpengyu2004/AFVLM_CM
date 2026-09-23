@@ -289,7 +289,9 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         and not bool(config["output"].get("overwrite", False))
     ):
         raise FileExistsError(f"Output directory is not empty: {output}")
-    data_module = AFVLMDataModule(config["dataset"])
+    dataset_config = dict(config["dataset"])
+    dataset_config["evaluation"] = dict(config["evaluation"])
+    data_module = AFVLMDataModule(dataset_config)
     if primary:
         output.mkdir(parents=True, exist_ok=True)
         for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
@@ -345,6 +347,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     model = create_model(config["model"]["adapter"])
     model_config = dict(config["model"])
     model_config["max_text_length"] = config["training"]["max_text_length"]
+    model_config["max_new_tokens"] = config["evaluation"]["generation_max_new_tokens"]
     model_config["progress_bar"] = progress_enabled
     if distributed:
         model_config["device_map"] = {"": local_rank}

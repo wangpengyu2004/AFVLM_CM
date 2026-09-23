@@ -1,6 +1,7 @@
 {
   "scope": "data/AFVLM_CM/partitioned",
-  "files": 161,
-  "bytes": 164752723,
-  "aggregate_sha256": "2ebc769eae578da93a7aa0a80ffb5921c0d6e53e7e53db1e1137af50d9116931"
+  "version": "fcit_eval_v1_72k",
+  "files": 158,
+  "bytes": 108209141,
+  "aggregate_sha256": "12acaf7ef39c1b3a1bcb40bcf8f8a11d81beda353b10f77aebaed197915ad74d"
 }

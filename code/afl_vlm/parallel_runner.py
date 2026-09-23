@@ -208,7 +208,9 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     output = Path(str(config["output"]["directory"])).resolve()
     if output.exists() and any(output.iterdir()) and not config["output"].get("overwrite", False):
         raise FileExistsError(f"Output directory is not empty: {output}")
-    data_module = AFVLMDataModule(config["dataset"])
+    dataset_config = dict(config["dataset"])
+    dataset_config["evaluation"] = dict(config["evaluation"])
+    data_module = AFVLMDataModule(dataset_config)
     output.mkdir(parents=True, exist_ok=True)
     for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
         (output / name).write_text("", encoding="utf-8")
@@ -257,6 +259,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
 
     model_config = dict(config["model"])
     model_config["max_text_length"] = config["training"]["max_text_length"]
+    model_config["max_new_tokens"] = config["evaluation"]["generation_max_new_tokens"]
     model_config["progress_bar"] = False
     if progress_enabled:
         tqdm.write(
@@ -268,7 +271,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     pool = ClientWorkerPool(
         devices=devices,
         model_config=model_config,
-        dataset_config=config["dataset"],
+        dataset_config=dataset_config,
         method_name=method.name,
         method_params=config["method"].get("params", {}),
         profiles=profiles,

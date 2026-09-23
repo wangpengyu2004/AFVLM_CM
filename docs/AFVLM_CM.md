@@ -15,12 +15,15 @@ timeline, not a task-incremental stream.
 Every setting contains `cls`, `caption`, `vqa`, `chart_vqa`,
 `visual_reasoning`, and `grounding`. Every task directory contains the
 existing `client_N.json`, `statistics.json`, `val.json`, and `test.json`.
-Training totals per setting are 15,000 / 20,000 / 12,000 / 10,805 / 12,000 /
-20,000 in canonical task order. No runtime code repartitions these records.
+Training totals per setting are 13,000 / 15,000 / 11,000 / 9,500 / 11,500 /
+12,000 in canonical task order, or 72,000 stored records in total. Every
+client-count setting reuses exactly the same task pool; only its client
+partition changes. Runtime code never repartitions these records.
 
-The integrity manifest in `configs/datasets/afvlm_cm_integrity.json` records
-161 files, 164,752,723 bytes, and aggregate SHA-256
-`2ebc769eae578da93a7aa0a80ffb5921c0d6e53e7e53db1e1137af50d9116931`.
+The active partition version is `fcit_eval_v1_72k`. The integrity manifest in
+`configs/datasets/afvlm_cm_integrity.json` records 158 files, 108,209,141
+bytes, and aggregate SHA-256
+`12acaf7ef39c1b3a1bcb40bcf8f8a11d81beda353b10f77aebaed197915ad74d`.
 
 ## Loader interface
 
@@ -38,6 +41,15 @@ Each normalized sample retains the complete source JSON under
 `sample.metadata["raw_record"]`. `resolve_image_path` strips only leading
 `./`, normalizes separators, confines paths to `image_root`, and otherwise
 preserves annotation-relative paths.
+
+Grounding training keeps each source record as one LLaVA conversation and
+supervises every assistant response in that conversation. Grounding
+validation/final loading expands every user/assistant pair into a separate
+query, so every referring expression receives its own prediction and IoU.
+The default 2,048-token context covers the active records; an over-length
+multi-turn record raises an error instead of silently truncating later
+assistant answers. Caption evaluation samples retain exactly five Flickr30k
+references.
 
 ## Image root
 
@@ -73,11 +85,16 @@ client visual adapters for the selected task. Local-only has no server model;
 its explicitly labelled `client_local_mean` result averages client models
 within each fixed task on the same common held-out split.
 
-The task-aware evaluator reports classification accuracy, CIDEr and ROUGE-L,
-VQA accuracy, DVQA/FigureQA answer accuracy, and Grounding mean IoU plus
-IoU@0.5. It records protocol, split, server version, virtual time, and a metric
-dictionary per task. It does not raw-average incompatible metric scales.
+All methods call one shared FCIT-compatible evaluator:
 
-Flickr30k records currently contain one reference caption. The built-in CIDEr
-uses the standard 1--4 gram TF-IDF cosine construction, but it is not claimed
-to be numerically identical to five-reference COCO-caption evaluation.
+- ImageNet-R and transformed AOKVQA use stripped, case-insensitive exact match;
+- DVQA and FigureQA retain FCIT's stripped, case-insensitive
+  `prediction in reference` rule;
+- Flickr30k uses `pycocoevalcap` over five references and reports BLEU-1--4,
+  METEOR, ROUGE-L, CIDEr, and their FCIT average (all multiplied by 100);
+- Grounding reports FCIT's strict `IoU > 0.5` accuracy in percent and the
+  additional raw mean IoU requested for AFVLM-CM.
+
+It records protocol, split, server version, virtual time, and a metric
+dictionary per task. It never raw-averages incompatible task metrics. Caption
+METEOR requires a working Java runtime, as required by `pycocoevalcap`.
