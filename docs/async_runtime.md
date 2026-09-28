@@ -87,8 +87,9 @@ batch，有效批量为 `batch_size * gradient_accumulation * world_size`，实�
 `server_memory/client_memory` 都应由父进程中的 Method 实例持有，而不是放到 GPU worker。
 
 需要随最终 checkpoint 保存的额外状态必须进入 `state_dict()`，可恢复状态还必须实现
-`load_state_dict()`。`ours` 已把按任务、按 LoRA module 的历史敏感性、任务权重和验证过的
-LoRA rank/shape/scaling schema 作为方法状态保存；客户端只保存本次 Module-Gate 累计值与有效观测次数。
+`load_state_dict()`。`ours` 已把按任务、按 LoRA module 的历史敏感性、任务权重、最近成功
+聚合任务的频率窗口和验证过的 LoRA rank/shape/scaling schema 作为方法状态保存；客户端只保存
+本次 Module-Gate 的绝对值/有符号累计值与有效观测次数。
 当前项目保存最终服务器和方法状态，尚未提供从中途事件游标恢复未完成训练的入口；
 实现断点续训时还需要恢复 pending jobs、完成缓存、虚拟时间游标和随机数状态。
 

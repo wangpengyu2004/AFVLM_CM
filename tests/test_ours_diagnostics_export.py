@@ -13,7 +13,7 @@ class OursDiagnosticsExportTests(unittest.TestCase):
     def test_exports_update_and_module_rows(self) -> None:
         module = "model.layers.0.self_attn.q_proj"
         diagnostics = {
-            "schema_version": 3,
+            "schema_version": 4,
             "method_variant": "module_gate",
             "client": {
                 "update_id": "vqa/client_0-r0",
@@ -48,6 +48,9 @@ class OursDiagnosticsExportTests(unittest.TestCase):
                     "raw_by_module": {module: 2.0},
                     "raw_summary": {"mean": 2.0},
                     "final_summary": {"mean": 1.0},
+                    "signed_gate_mean": {module: -1.0},
+                    "gate_direction": {module: 0.5},
+                    "gate_direction_abs_mean": 0.5,
                 },
             },
             "functional_staleness": {
@@ -57,6 +60,15 @@ class OursDiagnosticsExportTests(unittest.TestCase):
                 "parameter_delta_norm": 5.0,
                 "relative_staleness": 0.75,
                 "reliability": 0.4,
+            },
+            "frequency": {
+                "window_size": 18,
+                "window_length_before": 4,
+                "window_length_after": 5,
+                "current_task_count_before": 1,
+                "current_task_count_after": 2,
+                "raw_weight": 1.2,
+                "weight": 1.2,
             },
             "aggregation": {
                 "accepted": True,
@@ -102,7 +114,11 @@ class OursDiagnosticsExportTests(unittest.TestCase):
                 module_rows = list(csv.DictReader(handle))
             self.assertEqual(update_rows[0]["relative_staleness"], "0.75")
             self.assertEqual(update_rows[0]["sensitivity_statistic"], "mean_absolute_gate")
+            self.assertEqual(update_rows[0]["frequency_weight"], "1.2")
+            self.assertEqual(update_rows[0]["gate_direction_abs_mean"], "0.5")
             self.assertEqual(module_rows[0]["raw_module_sensitivity"], "2.0")
+            self.assertEqual(module_rows[0]["signed_gate_mean"], "-1.0")
+            self.assertEqual(module_rows[0]["gate_direction"], "0.5")
             self.assertEqual(module_rows[0]["module_alpha"], "0.2")
 
     def test_ignores_only_an_incomplete_trailing_record(self) -> None:

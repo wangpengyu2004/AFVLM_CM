@@ -39,8 +39,9 @@ federation:
 
 evaluation:
   protocol: server_global
-  interval_unit: server_updates
-  eval_every_server_updates: 10
+  # Fair across single-update, buffered, grouped, and synchronous aggregation.
+  interval_unit: incorporated_client_updates
+  eval_every_client_updates: 10
   periodic_split: validation
   final_split: final
   # FCIT inference uses deterministic decoding with up to 128 generated tokens.

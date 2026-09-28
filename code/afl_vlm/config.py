@@ -136,10 +136,19 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
     evaluation = config["evaluation"]
     if evaluation.get("protocol") != "server_global":
         raise ValueError("evaluation.protocol must be server_global")
-    if evaluation.get("interval_unit") != "server_updates":
-        raise ValueError("evaluation.interval_unit must be server_updates")
-    if int(evaluation.get("eval_every_server_updates", 0)) <= 0:
-        raise ValueError("evaluation.eval_every_server_updates must be positive")
+    interval_unit = evaluation.get("interval_unit")
+    if interval_unit not in {"incorporated_client_updates", "server_updates"}:
+        raise ValueError(
+            "evaluation.interval_unit must be incorporated_client_updates "
+            "or the deprecated server_updates alias"
+        )
+    interval_key = (
+        "eval_every_client_updates"
+        if interval_unit == "incorporated_client_updates"
+        else "eval_every_server_updates"
+    )
+    if int(evaluation.get(interval_key, 0)) <= 0:
+        raise ValueError(f"evaluation.{interval_key} must be positive")
     if evaluation.get("periodic_split") not in {"validation", "val"}:
         raise ValueError("evaluation.periodic_split must be validation or val")
     if evaluation.get("final_split") not in {"final", "test"}:

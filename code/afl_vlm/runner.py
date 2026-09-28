@@ -17,6 +17,10 @@ from tqdm.auto import tqdm
 from afl_vlm.config import resolved_public_config, validate_config
 from afl_vlm.data.afvlm_cm import AFVLMDataModule, validate_caption_metric_runtime
 from afl_vlm.evaluation import merge_evaluation_outputs
+from afl_vlm.evaluation_schedule import (
+    PeriodicEvaluationSchedule,
+    evaluation_progress_count,
+)
 from afl_vlm.federation.client import FederatedClient
 from afl_vlm.federation.server import FederatedServer
 from afl_vlm.federation.types import ClientContext
@@ -460,8 +464,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     client_updates: Counter[str] = Counter()
     task_updates: Counter[str] = Counter()
     last_virtual_time = 0.0
-    last_evaluated_version = -1
-    eval_interval = int(config["evaluation"].get("eval_every_server_updates", 0))
+    eval_schedule = PeriodicEvaluationSchedule.from_config(config["evaluation"])
     periodic_split = str(config["evaluation"].get("periodic_split", "validation"))
     final_split = str(config["evaluation"].get("final_split", "final"))
     federation_progress = tqdm(
@@ -477,7 +480,43 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     if progress_enabled:
         tqdm.write(
             "[AFVLM-CM] periodic evaluation schedule: "
-            f"every {eval_interval} accepted server updates"
+            f"every {eval_schedule.interval} {eval_schedule.unit}"
+        )
+
+    def maybe_run_periodic_evaluation(virtual_time: float, trigger: str) -> None:
+        evaluation_count = evaluation_progress_count(
+            server, method.evaluation_scope, eval_schedule.unit
+        )
+        crossed = eval_schedule.observe(evaluation_count)
+        if not crossed:
+            return
+        if progress_enabled:
+            federation_progress.refresh()
+            tqdm.write(
+                "[AFVLM-CM] starting periodic evaluation: "
+                f"server_version={server.version}, {eval_schedule.unit}={evaluation_count}, "
+                f"crossed={list(crossed)}, split={periodic_split}"
+            )
+        validation_metrics = evaluate_method(
+            model, method, server.state, tasks, periodic_split
+        )
+        _append(
+            output / "task_metrics.jsonl",
+            {
+                "kind": "validation",
+                "protocol": method.evaluation_scope,
+                "split": periodic_split,
+                "server_version": server.version,
+                "virtual_time": virtual_time,
+                "evaluation_interval_unit": eval_schedule.unit,
+                "evaluation_interval": eval_schedule.interval,
+                "crossed_update_thresholds": list(crossed),
+                "evaluation_progress_count": evaluation_count,
+                "accepted_client_updates": server.accepted_updates,
+                "received_client_updates": server.received_updates,
+                "trigger": trigger,
+                "per_task": validation_metrics,
+            },
         )
     for virtual_time, _, kind, event in timeline:
         last_virtual_time = max(last_virtual_time, virtual_time)
@@ -577,6 +616,9 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         )
         receive_version = server.version
         results = server.receive(update)
+        evaluation_count = evaluation_progress_count(
+            server, method.evaluation_scope, eval_schedule.unit
+        )
         client_updates[update.client_id] += 1
         task_updates[update.task] += 1
         for result in results:
@@ -599,6 +641,8 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 "server_version_after": server.version,
                 "arrival_time": event.arrival_time,
                 "accepted": any(item.applied_weight > 0 for item in results),
+                "accepted_update_count_after": server.accepted_updates,
+                "evaluation_update_count_after": evaluation_count,
                 "aggregation_weight": sum(item.applied_weight for item in results),
                 "planned_local_steps": event.local_steps,
                 "assigned_local_steps": physical_optimizer_steps
@@ -615,42 +659,20 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             server_version=server.version,
             staleness=stale,
             client=event.client_id,
+            eval_updates=evaluation_count,
+            next_eval=eval_schedule.next_threshold,
             refresh=False,
         )
         federation_progress.update(1)
-        if (
-            eval_interval > 0
-            and server.version > 0
-            and server.version % eval_interval == 0
-            and server.version != last_evaluated_version
-        ):
-            if progress_enabled:
-                federation_progress.refresh()
-                tqdm.write(
-                    "[AFVLM-CM] starting periodic evaluation: "
-                    f"server_version={server.version}, interval={eval_interval}, "
-                    f"split={periodic_split}"
-                )
-            validation_metrics = evaluate_method(model, method, server.state, tasks, periodic_split)
-            _append(
-                output / "task_metrics.jsonl",
-                {
-                    "kind": "validation",
-                    "protocol": method.evaluation_scope,
-                    "split": periodic_split,
-                    "server_version": server.version,
-                    "virtual_time": event.arrival_time,
-                    "per_task": validation_metrics,
-                },
-            )
-            last_evaluated_version = server.version
-    federation_progress.close()
+        maybe_run_periodic_evaluation(event.arrival_time, "arrival")
     tail = server.finish()
     for result in tail:
         if "buffer_occupancy" in result.metadata:
             buffer_occupancies.append(int(result.metadata["buffer_occupancy"]))
         if "mean_buffer_waiting_time" in result.metadata:
             buffer_waiting_times.append(float(result.metadata["mean_buffer_waiting_time"]))
+    maybe_run_periodic_evaluation(last_virtual_time, "method_finish")
+    federation_progress.close()
     _write_json(output / "train_plan.json", records)
     metrics = evaluate_method(model, method, server.state, tasks, final_split)
     _write_json(
@@ -660,6 +682,11 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             "split": final_split,
             "server_version": server.version,
             "virtual_time": last_virtual_time,
+            "evaluation_interval_unit": eval_schedule.unit,
+            "evaluation_progress_count": evaluation_progress_count(
+                server, method.evaluation_scope, eval_schedule.unit
+            ),
+            "accepted_client_updates": server.accepted_updates,
             "per_task": metrics,
             "note": "Incompatible task metrics are not raw-averaged.",
         },
@@ -672,6 +699,11 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             "split": final_split,
             "server_version": server.version,
             "virtual_time": last_virtual_time,
+            "evaluation_interval_unit": eval_schedule.unit,
+            "evaluation_progress_count": evaluation_progress_count(
+                server, method.evaluation_scope, eval_schedule.unit
+            ),
+            "accepted_client_updates": server.accepted_updates,
             "per_task": metrics,
         },
     )
@@ -687,6 +719,11 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         "max_staleness": max(staleness_values, default=0),
         "update_count": server.received_updates,
         "accepted_update_count": server.accepted_updates,
+        "evaluation_interval_unit": eval_schedule.unit,
+        "evaluation_interval": eval_schedule.interval,
+        "evaluation_progress_count": evaluation_progress_count(
+            server, method.evaluation_scope, eval_schedule.unit
+        ),
         "server_aggregation_count": server.version,
         "server_version": server.version,
         "virtual_completion_time": last_virtual_time,

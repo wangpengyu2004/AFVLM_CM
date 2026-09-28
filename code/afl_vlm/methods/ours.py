@@ -191,6 +191,14 @@ def _normalize_module_sensitivity(
     )
 
 
+def _gate_direction(signed_sum: float, absolute_sum: float, eps: float) -> float:
+    """Return the diagnostic Module-Gate direction; never used for aggregation."""
+
+    if absolute_sum < 0.0 or eps <= 0.0:
+        raise ValueError("Gate direction requires non-negative magnitude and positive eps")
+    return -float(signed_sum) / (float(absolute_sum) + float(eps))
+
+
 class ModuleSensitivityTracker:
     """Track mean absolute Module-Gate sensitivity without joining the graph."""
 
@@ -214,6 +222,9 @@ class ModuleSensitivityTracker:
         self.sums = {
             name: a.detach().float().new_zeros(()) for name, (a, _, _) in self.modules.items()
         }
+        self.signed_sums = {
+            name: a.detach().float().new_zeros(()) for name, (a, _, _) in self.modules.items()
+        }
         self.count = {name: 0 for name in self.modules}
         self._finalize_diagnostics: dict[str, Any] = {}
 
@@ -231,6 +242,7 @@ class ModuleSensitivityTracker:
                 h_b = (b.grad.detach().float() * b.detach().float()).sum()
                 module_gate = 0.5 * (h_a + h_b)
                 self.sums[name].add_(module_gate.abs())
+                self.signed_sums[name].add_(module_gate)
                 self.count[name] += 1
 
     def finalize(self) -> tuple[dict[str, float], bool]:
@@ -240,12 +252,28 @@ class ModuleSensitivityTracker:
         if observed_names:
             torch = __import__("torch")
             packed = torch.stack(
-                [self.sums[name] / self.count[name] for name in observed_names]
+                [
+                    torch.stack((self.sums[name], self.signed_sums[name]))
+                    for name in observed_names
+                ]
             )
             packed_values = packed.detach().float().cpu().tolist()
-            raw_values = dict(zip(observed_names, packed_values, strict=True))
+            raw_values = {
+                name: values[0] / self.count[name]
+                for name, values in zip(observed_names, packed_values, strict=True)
+            }
+            signed_gate_mean = {
+                name: values[1] / self.count[name]
+                for name, values in zip(observed_names, packed_values, strict=True)
+            }
+            gate_direction = {
+                name: _gate_direction(values[1], values[0], self.eps)
+                for name, values in zip(observed_names, packed_values, strict=True)
+            }
         else:
             raw_values = {}
+            signed_gate_mean = {}
+            gate_direction = {}
         all_observed = set(raw_values) == set(self.modules)
         if all_observed:
             module_sensitivity, valid = _normalize_module_sensitivity(
@@ -266,6 +294,18 @@ class ModuleSensitivityTracker:
             },
             "raw_summary": _numeric_summary(list(raw_values.values())),
             "final_summary": _numeric_summary(list(module_sensitivity.values())),
+            "signed_gate_mean": {
+                name: signed_gate_mean.get(name) for name in sorted(self.modules)
+            },
+            "gate_direction": {
+                name: gate_direction.get(name) for name in sorted(self.modules)
+            },
+            "gate_direction_abs_mean": (
+                math.fsum(abs(value) for value in gate_direction.values())
+                / len(gate_direction)
+                if gate_direction
+                else None
+            ),
         }
         return module_sensitivity, valid
 
@@ -498,6 +538,10 @@ class Ours(Method):
         "sensitivity_warmup_steps",
         "sensitivity_uniform_mix",
         "gamma",
+        "frequency_window_size",
+        "frequency_power",
+        "frequency_min",
+        "frequency_max",
         "history_beta",
         "history_lambda",
         "history_strength",
@@ -512,6 +556,7 @@ class Ours(Method):
         self.task_memory: dict[str, dict[str, float]] = {}
         self.task_memory_counts: dict[str, int] = {}
         self.task_weights: dict[str, float] = {}
+        self.task_frequency_window: list[str] = []
         self._server_metadata: dict[str, dict[str, Any]] = {}
         self._model_metadata: dict[str, dict[str, Any]] = {}
         self._tracker: ModuleSensitivityTracker | None = None
@@ -529,6 +574,25 @@ class Ours(Method):
         uniform_mix = self._value("sensitivity_uniform_mix", 0.5)
         if not 0.0 <= uniform_mix <= 1.0:
             raise ValueError("sensitivity_uniform_mix must be in [0, 1]")
+        window_size = self.params.get("frequency_window_size", 18)
+        if (
+            isinstance(window_size, bool)
+            or int(window_size) != window_size
+            or int(window_size) <= 0
+        ):
+            raise ValueError("frequency_window_size must be a positive integer")
+        frequency_power = self._value("frequency_power", 0.5)
+        if not math.isfinite(frequency_power) or frequency_power < 0.0:
+            raise ValueError("frequency_power must be finite and non-negative")
+        frequency_min = self._value("frequency_min", 0.5)
+        frequency_max = self._value("frequency_max", 1.5)
+        if (
+            not math.isfinite(frequency_min)
+            or not math.isfinite(frequency_max)
+            or frequency_min <= 0.0
+            or frequency_min > frequency_max
+        ):
+            raise ValueError("frequency bounds must satisfy 0 < min <= max")
         positive = {
             "gamma": 1.0,
             "history_lambda": 1.0,
@@ -597,6 +661,16 @@ class Ours(Method):
         self.task_memory_counts = {
             task: int(self.task_memory_counts.get(task, 0)) for task in tasks
         }
+        unknown_window_tasks = sorted(set(self.task_frequency_window) - set(tasks))
+        if unknown_window_tasks:
+            raise ValueError(
+                "Task-frequency window contains unknown tasks: "
+                f"{unknown_window_tasks}"
+            )
+        if len(self.task_frequency_window) > int(
+            self.params.get("frequency_window_size", 18)
+        ):
+            raise ValueError("Task-frequency window exceeds frequency_window_size")
 
     def client_runtime_state(self, context: Any) -> dict[str, Any]:
         return {"reset_module_sensitivity_for": context.client_id}
@@ -730,6 +804,56 @@ class Ours(Method):
             "history_strength", 1.0
         ) * memory
 
+    def _frequency_diagnostics(self, task: str) -> dict[str, Any]:
+        """Compute the current task weight from accepted arrivals only."""
+
+        if task not in self.task_weights:
+            raise ValueError(f"Unknown task identity: {task}")
+        tasks = sorted(self.task_weights)
+        counts = {
+            known_task: self.task_frequency_window.count(known_task)
+            for known_task in tasks
+        }
+        task_count = counts[task]
+        task_total = len(tasks)
+        expected = len(self.task_frequency_window) / task_total
+        smoothed_expected = expected + 1.0
+        smoothed_count = task_count + 1.0
+        raw_weight = (smoothed_expected / smoothed_count) ** self._value(
+            "frequency_power", 0.5
+        )
+        lower = self._value("frequency_min", 0.5)
+        upper = self._value("frequency_max", 1.5)
+        weight = min(max(raw_weight, lower), upper)
+        return {
+            "window_size": int(self.params.get("frequency_window_size", 18)),
+            "window_length_before": len(self.task_frequency_window),
+            "task_count": task_total,
+            "counts_before": counts,
+            "current_task_count_before": task_count,
+            "expected_count_before": expected,
+            "smoothed_expected_count": smoothed_expected,
+            "smoothed_current_task_count": smoothed_count,
+            "power": self._value("frequency_power", 0.5),
+            "minimum": lower,
+            "maximum": upper,
+            "raw_weight": raw_weight,
+            "weight": weight,
+            "window_length_after": len(self.task_frequency_window),
+            "counts_after": dict(counts),
+            "current_task_count_after": task_count,
+        }
+
+    def _append_frequency_task(self, task: str) -> dict[str, int]:
+        self.task_frequency_window.append(task)
+        window_size = int(self.params.get("frequency_window_size", 18))
+        if len(self.task_frequency_window) > window_size:
+            del self.task_frequency_window[: len(self.task_frequency_window) - window_size]
+        return {
+            known_task: self.task_frequency_window.count(known_task)
+            for known_task in sorted(self.task_weights)
+        }
+
     def _fuse_modules(
         self,
         current: Mapping[str, Any],
@@ -799,8 +923,9 @@ class Ours(Method):
             module: self._historical_precision(module)
             for module in sorted(self._server_metadata)
         }
+        frequency = self._frequency_diagnostics(update.task)
         diagnostics = {
-            "schema_version": 3,
+            "schema_version": 4,
             "method_variant": "module_gate",
             "client": {
                 "update_id": update.update_id,
@@ -831,6 +956,7 @@ class Ours(Method):
                 "reliability_function": "exponential",
                 "gamma": self._value("gamma", 1.0),
             },
+            "frequency": frequency,
             "aggregation": {
                 "accepted": False,
                 "rejection_reason": None,
@@ -886,7 +1012,7 @@ class Ours(Method):
                 module_sensitivity=module_sensitivity[module],
                 reliability=reliability,
                 history_precision=self._historical_precision(module),
-                client_weight=1.0,
+                client_weight=frequency["weight"],
                 history_lambda=self._value("history_lambda", 1.0),
                 alpha_max=self._value("alpha_max", 0.5),
                 eps=self._value("eps", 1e-12),
@@ -900,9 +1026,17 @@ class Ours(Method):
         for module, sensitivity in module_sensitivity.items():
             task_memory[module] = (
                 history_beta * task_memory.get(module, 0.0)
-                + (1.0 - history_beta) * reliability * sensitivity
+                + (1.0 - history_beta) * sensitivity
             )
         self.task_memory_counts[update.task] = task_memory_count_before + 1
+        counts_after = self._append_frequency_task(update.task)
+        diagnostics["frequency"].update(
+            {
+                "window_length_after": len(self.task_frequency_window),
+                "counts_after": counts_after,
+                "current_task_count_after": counts_after[update.task],
+            }
+        )
 
         task_memory_raw_after = {
             module: float(self.task_memory[update.task][module])
@@ -919,6 +1053,7 @@ class Ours(Method):
         diagnostics["aggregation"] = {
             "accepted": True,
             "rejection_reason": None,
+            "frequency_weight": frequency["weight"],
             "module_alpha_by_module": dict(alphas),
             "alpha_summary": _numeric_summary(list(alphas.values())),
         }
@@ -938,6 +1073,7 @@ class Ours(Method):
         metadata = {
             **common,
             "reliability": reliability,
+            "frequency_weight": frequency["weight"],
             "module_alphas": alphas,
             "mean_module_alpha": sum(alpha_values) / len(alpha_values),
             "min_module_alpha": min(alpha_values),
@@ -955,22 +1091,23 @@ class Ours(Method):
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "state_schema_version": 3,
+            "state_schema_version": 4,
             "method_variant": "module_gate",
             "params": copy.deepcopy(self.params),
             "task_memory": copy.deepcopy(self.task_memory),
             "task_memory_counts": copy.deepcopy(self.task_memory_counts),
             "task_weights": copy.deepcopy(self.task_weights),
+            "task_frequency_window": list(self.task_frequency_window),
             "lora_metadata": copy.deepcopy(self._server_metadata),
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        if int(state.get("state_schema_version", 0)) != 3 or state.get(
+        if int(state.get("state_schema_version", 0)) != 4 or state.get(
             "method_variant"
         ) != "module_gate":
             raise ValueError(
-                "Checkpoint is not a Module-Gate state-schema-v3 checkpoint; "
-                "Rank-Gate memory cannot be reused as Module-Gate memory"
+                "Checkpoint is not a Module-Gate state-schema-v4 checkpoint; "
+                "older memory cannot reconstruct the accepted-task frequency window"
             )
         super().load_state_dict(state)
         unknown = set(self.params) - self.allowed_params
@@ -992,6 +1129,12 @@ class Ours(Method):
         self.task_weights = {
             str(task): float(value) for task, value in state.get("task_weights", {}).items()
         }
+        window = state.get("task_frequency_window")
+        if not isinstance(window, list) or any(not isinstance(task, str) for task in window):
+            raise ValueError("task_frequency_window must be a list of task strings")
+        if len(window) > int(self.params.get("frequency_window_size", 18)):
+            raise ValueError("task_frequency_window exceeds frequency_window_size")
+        self.task_frequency_window = list(window)
         self._server_metadata = {
             str(module): {str(key): value for key, value in metadata.items()}
             for module, metadata in state.get("lora_metadata", {}).items()

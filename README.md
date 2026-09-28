@@ -259,7 +259,7 @@ python tools/validate_afvlm_cm_data.py --setting 2
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_e1_bs1_ga4_r10_s42 \
+  --profile module_gate_freqw18_e1_bs1_ga4_r10_s42 \
   --reuse_plans_from default_e1_bs1_ga4_r10_s42
 ```
 
@@ -274,7 +274,7 @@ python tools/generate_system_profiles.py --list
 
 ```bash
 python tools/select_runtime_backend.py \
-  --config experiment_profiles/module_gate_e1_bs1_ga4_r10_s42/configs/2clients/ours.yaml
+  --config experiment_profiles/module_gate_freqw18_e1_bs1_ga4_r10_s42/configs/2clients/ours.yaml
 ```
 
 正常应输出 `client_ddp`。`fedcompass`、`fedasmu`、`masfl`、`adamasfl` 和 `pilot`
@@ -286,7 +286,7 @@ python tools/select_runtime_backend.py \
 
 ```bash
 PYTHONUNBUFFERED=1 \
-bash scripts/run_one.sh ours 2 module_gate_e1_bs1_ga4_r10_s42 \
+bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42 \
   2>&1 | tee ours-module-gate-2clients.log
 ```
 
@@ -296,7 +296,7 @@ bash scripts/run_one.sh ours 2 module_gate_e1_bs1_ga4_r10_s42 \
 tmux new -s afvlm-ours
 conda activate afvlm-cm
 cd /userhome/bcx/AFVLM_CM
-PYTHONUNBUFFERED=1 bash scripts/run_one.sh ours 2 module_gate_e1_bs1_ga4_r10_s42 \
+PYTHONUNBUFFERED=1 bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42 \
   2>&1 | tee ours-module-gate-2clients.log
 ```
 
@@ -322,7 +322,7 @@ watch -n 2 nvidia-smi
 本次输出目录为：
 
 ```text
-runs/llava/afvlm_cm/profiles/module_gate_e1_bs1_ga4_r10_s42/2clients/ours/seed42/
+runs/llava/afvlm_cm/profiles/module_gate_freqw18_e1_bs1_ga4_r10_s42/2clients/ours/seed42/
 ```
 
 常用文件包括 `train.log`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、
@@ -336,14 +336,14 @@ runs/llava/afvlm_cm/profiles/module_gate_e1_bs1_ga4_r10_s42/2clients/ours/seed42
 
 ```bash
 PYTHONUNBUFFERED=1 \
-bash scripts/run_one.sh fedasync 2 module_gate_e1_bs1_ga4_r10_s42 \
+bash scripts/run_one.sh fedasync 2 module_gate_freqw18_e1_bs1_ga4_r10_s42 \
   2>&1 | tee fedasync-2clients.log
 ```
 
 依次运行 12 个 baseline（不包含 `ours`）：
 
 ```bash
-bash scripts/run_baselines.sh 2 module_gate_e1_bs1_ga4_r10_s42
+bash scripts/run_baselines.sh 2 module_gate_freqw18_e1_bs1_ga4_r10_s42
 ```
 
 将第二个参数改为 `5` 或 `10` 即选择 5/10 clients per task。8 卡 DDP 中
@@ -564,7 +564,7 @@ python tools/estimate_task_compute_factors.py \
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
-- `ours`：Module-Gate 敏感度感知异步 LoRA 聚合；在每个真实 optimizer step 读取整个 LoRA 模块的 gate 梯度，使用绝对值时间平均、客户端内均值归一化与均匀下限，结合完整模块 `BA` 功能陈旧度、偏差修正的分任务历史记忆和模块级共享 A/B 融合；不增加训练参数、不使用 SVD，也不包含快慢任务到达频率校正。
+- `ours`：Module-Gate 敏感度感知异步 LoRA 聚合；在每个真实 optimizer step 读取整个 LoRA 模块的 gate 梯度，使用绝对值时间平均、客户端内均值归一化与均匀下限，结合完整模块 `BA` 功能陈旧度、直接由客户端敏感度更新的分任务历史记忆、成功聚合窗口上的任务频率校正和模块级共享 A/B 融合；不增加训练参数，也不使用 SVD。
 
 ### 观察 `ours` 是否正常工作
 
@@ -574,9 +574,11 @@ python tools/estimate_task_compute_factors.py \
 
 - `sensitivity.module_by_module`：每个 LoRA module 的最终敏感度；
 - `sensitivity.transform`：绝对值统计方式、原始/最终分布、均值归一化、均匀混合系数和下限；
+- `sensitivity.transform.signed_gate_mean`、`gate_direction`、`gate_direction_abs_mean`：仅用于分析的有符号 Gate 方向；
 - `sensitivity.observations_by_module`、分布摘要和 top module；
 - `functional_staleness`：版本陈旧度、server drift、local update、相对功能陈旧度、可靠度函数及 gamma；
 - `aggregation.module_alpha_by_module`：每个模块实际使用的共享 A/B 聚合系数；
+- `frequency`：聚合前窗口计数、本次任务权重，以及成功聚合后的窗口计数；
 - `memory`：当前任务的原始/偏差修正记忆、接受次数和跨任务历史精度在聚合前后的值；
 - rejected update 的拒绝原因和未变化的 memory。
 
@@ -624,11 +626,11 @@ bash scripts/run_one.sh ours 2
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_e1_bs1_ga4_r10_s42 \
+  --profile module_gate_freqw18_e1_bs1_ga4_r10_s42 \
   --reuse_plans_from default_e1_bs1_ga4_r10_s42
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-bash scripts/run_one.sh ours 2 module_gate_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42
 ```
 
 完整 Module-Gate 统计、功能距离、聚合公式和限制见 `docs/ours.md`。
@@ -724,7 +726,24 @@ output:
 
 ## 评估与输出
 
-项目采用常见异步联邦学习评估协议：以**成功的服务器模型更新数**作为评估间隔。每达到 `evaluation.eval_every_server_updates`，复制当前服务器联邦状态并在公共 validation 集上分别评估六个任务；评估过程不计入虚拟训练时间，也不改变训练状态。全部 TrainPlan 到达事件完成后，先执行方法的结尾处理（例如刷新 FedBuff 残余缓冲），再用最终服务器状态在公共 test 集上评估。
+项目以**已真正纳入当前模型的客户端更新数**作为所有方法统一的周期评估预算。默认
+`evaluation.interval_unit: incorporated_client_updates` 和
+`evaluation.eval_every_client_updates: 10`。FedAsync 与 `ours` 每次有效聚合纳入一个客户端更新，
+所以仍然每 10 次有效聚合评估；FedBuff 只有在 buffer flush 后才按该 buffer 的实际更新数推进，
+FedCompass/同步方法则按本次分组或轮次包含的客户端数推进。若一次聚合跨过阈值，评估聚合后的
+当前全局模型，并同时记录目标阈值和实际计数，不会对同一个模型重复评估。Local-only 按已经
+写入各客户端本地状态的完成更新计数。评估过程不计入虚拟训练时间，也不改变训练状态。
+
+每条 `events.jsonl` 会记录 `accepted_update_count_after` 和
+`evaluation_update_count_after`；周期记录会在 `task_metrics.jsonl` 中额外保存
+`crossed_update_thresholds`、`evaluation_progress_count`、`accepted_client_updates` 和触发位置。
+全部 TrainPlan 到达事件完成后，先执行方法的结尾处理；FedBuff/MasFL 等方法在结尾纳入的残余
+更新也会推进评估预算，随后再用最终模型在公共 test 集上评估。
+
+旧不可变 profile 中的 `interval_unit: server_updates` 会作为兼容别名，沿用其数值间隔但自动迁移到
+新的客户端更新预算，因此现有 profile 拉取新代码后也能使用公平评估。正式论文实验仍建议从更新后的
+基础配置创建一个新 profile，使 `resolved_config.yaml` 明确写出新语义；可以使用
+`--reuse_plans_from` 原样复用旧 system profile 和 TrainPlan。
 
 所有存在服务器聚合的算法都以 `server_global` 为主评估结果。Pilot 仍使用任务路由，但使用当前服务器状态及同任务服务器端客户端视觉适配器的均值，不使用个性化 LoRA 替代全局主结果。Local-only 没有全局模型，因此是唯一例外：分别用每个客户端本地模型测试其所属任务的同一公共测试集，再在任务内等权平均，输出协议标记为 `client_local_mean`。
 
@@ -778,7 +797,7 @@ ruff check code scripts tools
 - 当前训练入口保存可独立复评的最终联邦检查点，但尚未提供从任意中间异步事件恢复并继续训练的 CLI；这需要同时恢复仍在途的客户端作业快照。
 - Flickr30k 指令当前每条只有一个参考答案；内置 CIDEr 使用标准 1--4 gram TF-IDF 余弦构造，但与拥有五参考标注的官方 COCO caption scorer 不能宣称数值完全等价。
 - Pilot 的联合阶段适配和 FedASMU 的确定性刷新策略必须在论文中按上述差异披露。
-- `ours` 已实现，但其 sensitivity 是虚拟 Module-Gate 的局部一阶变化幅度，即各 optimizer step 的 `|dL/dz_l|` 平均，并非完整 Fisher、Hessian 或真实任务泛化重要性；当前只支持 LoRA-only 联邦状态，也暂不补偿快慢任务的到达频率。`ours` 不在 baseline 批处理里，应使用独立命令运行。
+- `ours` 已实现，但其 sensitivity 是虚拟 Module-Gate 的局部一阶变化幅度，即各 optimizer step 的 `|dL/dz_l|` 平均，并非完整 Fisher、Hessian 或真实任务泛化重要性；当前只支持 LoRA-only 联邦状态。任务频率校正基于最近成功聚合标签，而不是对真实设备速度的直接估计。`ours` 不在 baseline 批处理里，应使用独立命令运行。
 
 ## 主要论文与数据来源
 

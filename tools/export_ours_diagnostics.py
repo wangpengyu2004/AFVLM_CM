@@ -58,12 +58,15 @@ def export_diagnostics(
             client = item["client"]
             sensitivity = item["sensitivity"]
             functional = item["functional_staleness"]
+            frequency = item.get("frequency", {})
             aggregation = item["aggregation"]
             memory = item["memory"]
             module_summary = sensitivity["module_summary"]
             transform = sensitivity.get("transform", {})
             raw_summary = transform.get("raw_summary", {})
             raw_by_module = transform.get("raw_by_module", {})
+            signed_gate_mean = transform.get("signed_gate_mean", {})
+            gate_direction = transform.get("gate_direction", {})
             final_summary = transform.get("final_summary", module_summary)
             alpha_summary = aggregation["alpha_summary"]
             before_summary = memory["task_memory_before_summary"]
@@ -91,6 +94,21 @@ def export_diagnostics(
                     "reliability": _summary_value(functional, "reliability"),
                     "reliability_function": functional.get("reliability_function", ""),
                     "gamma": _summary_value(functional, "gamma"),
+                    "frequency_weight": _summary_value(frequency, "weight"),
+                    "frequency_raw_weight": _summary_value(frequency, "raw_weight"),
+                    "frequency_window_size": _summary_value(frequency, "window_size"),
+                    "frequency_window_length_before": _summary_value(
+                        frequency, "window_length_before"
+                    ),
+                    "frequency_window_length_after": _summary_value(
+                        frequency, "window_length_after"
+                    ),
+                    "frequency_task_count_before": _summary_value(
+                        frequency, "current_task_count_before"
+                    ),
+                    "frequency_task_count_after": _summary_value(
+                        frequency, "current_task_count_after"
+                    ),
                     "sensitivity_valid": sensitivity["valid"],
                     "sensitivity_gate": transform.get("gate", "module_gate"),
                     "sensitivity_statistic": transform.get("statistic", ""),
@@ -101,6 +119,9 @@ def export_diagnostics(
                     ),
                     "raw_sensitivity_mean": _summary_value(raw_summary, "mean"),
                     "final_sensitivity_mean": _summary_value(final_summary, "mean"),
+                    "gate_direction_abs_mean": _summary_value(
+                        transform, "gate_direction_abs_mean"
+                    ),
                     "module_sensitivity_mean": _summary_value(module_summary, "mean"),
                     "module_sensitivity_std": _summary_value(module_summary, "std"),
                     "module_sensitivity_min": _summary_value(module_summary, "min"),
@@ -124,6 +145,8 @@ def export_diagnostics(
                         **common,
                         "module": module,
                         "raw_module_sensitivity": raw_by_module.get(module, ""),
+                        "signed_gate_mean": signed_gate_mean.get(module, ""),
+                        "gate_direction": gate_direction.get(module, ""),
                         "module_sensitivity": module_sensitivity,
                         "observations": observations[module],
                         "module_alpha": alphas.get(module, ""),

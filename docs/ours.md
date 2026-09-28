@@ -5,10 +5,11 @@ asynchronous federated LLaVA instruction tuning. Its main line is:
 
 ```text
 module importance + functional staleness + task-specific historical memory
++ sliding-window task-frequency correction
 ```
 
-It does not add a trainable gate, change the PEFT structure, perform SVD, align
-LoRA ranks across clients, or maintain task-arrival-frequency weights. Only
+It does not add a trainable gate, change the PEFT structure, perform SVD, or
+align LoRA ranks across clients. Only
 LoRA A/B tensors and one sensitivity scalar per LoRA module are communicated.
 
 ## 1. LoRA scope and validation
@@ -56,6 +57,17 @@ C_raw[k,l] = mean_m |h[k,l,m]|
 Absolute value is applied before averaging, so positive and negative steps do
 not cancel. Unlike a squared statistic, it does not quadratically amplify an
 occasional large gate response.
+
+For diagnostics only, the client also retains the signed sum and reports:
+
+```text
+signed_gate_mean[k,l] = mean_m h[k,l,m]
+gate_direction[k,l]   = -sum_m h[k,l,m]
+                         / (sum_m |h[k,l,m]| + eps)
+```
+
+`gate_direction_abs_mean` is the mean absolute direction over observed
+modules. These values never enter sensitivity, staleness, memory, or fusion.
 
 The current version performs no sqrt transform, quantile cap, or sensitivity
 clipping. It first normalizes across all modules of the same client and then
@@ -121,7 +133,7 @@ changes that task's memory:
 
 ```text
 m[q_k,l] <- history_beta m[q_k,l]
-            + (1-history_beta) rho[k,t] C[k,l]
+            + (1-history_beta) C[k,l]
 n[q_k]   <- n[q_k] + 1
 ```
 
@@ -140,23 +152,34 @@ Omega[t,l] = base_precision
 ```
 
 The memory used for one arrival is the state before fusing that arrival. The
-source task memory is updated only after fusion.
+source task memory is updated only after fusion. Reliability and frequency do
+not scale this EMA, so stale or infrequent tasks do not receive weaker future
+protection solely because of their system behavior.
 
-This is not task-arrival-frequency correction. The method does not estimate
-arrival rates and does not compute an `omega_frequency` multiplier. Per-task
-memory prevents fast tasks from directly overwriting slow-task memory, but it
-does not increase how often a slow task contributes an update.
+## 6. Sliding-window task-frequency correction
 
-## 6. Module-wise LoRA fusion
+The server retains task labels for the latest `W=18` successfully aggregated
+updates. Rejected updates are not inserted. Before the current update is
+aggregated, let `n[q,t]` be its task count in the current window and `Q` the
+number of tasks:
+
+```text
+w[q,t] = clip((((|window|/Q)+1)/(n[q,t]+1))^frequency_power,
+              frequency_min, frequency_max)
+```
+
+Defaults are power `0.5` and bounds `[0.5, 1.5]`. The current task enters the
+FIFO window only after successful fusion, so its own label cannot change the
+weight used for that fusion. The window is method state and is checkpointed.
+
+## 7. Module-wise LoRA fusion
 
 Client precision and server protection are:
 
 ```text
-P_client[k,l] = rho[k,t] C[k,l]
+P_client[k,l] = rho[k,t] w[q_k,t] C[k,l]
 P_server[t,l] = history_lambda Omega[t,l]
 ```
-
-There is deliberately no frequency term. The module coefficient is:
 
 ```text
 alpha[k,l] = P_client[k,l]
@@ -177,7 +200,7 @@ added to the current server. Factor-space interpolation is not identical to
 dense `BA` interpolation, but it preserves rank and the existing PEFT state
 interface without SVD.
 
-## 7. Configuration
+## 8. Configuration
 
 `configs/methods/ours.yaml` contains:
 
@@ -188,6 +211,10 @@ method:
     sensitivity_warmup_steps: 1
     sensitivity_uniform_mix: 0.5
     gamma: 1.0
+    frequency_window_size: 18
+    frequency_power: 0.5
+    frequency_min: 0.5
+    frequency_max: 1.5
     history_beta: 0.9
     history_lambda: 1.0
     history_strength: 1.0
@@ -197,10 +224,10 @@ method:
     min_update_energy: 0.0000000000000001
 ```
 
-There are intentionally no parameters for rank sensitivity, sensitivity
-power/quantile compression, or task-arrival-frequency correction.
+There are intentionally no parameters for rank sensitivity or sensitivity
+power/quantile compression.
 
-## 8. DDP and optimizer-step semantics
+## 9. DDP and optimizer-step semantics
 
 `ours` remains DDP-capable. All visible GPUs train the same client. With eight
 GPUs, per-device batch 16, and gradient accumulation 4, one optimizer step has
@@ -221,40 +248,41 @@ added later, gradients must be unscaled before the Module-Gate hook. The
 virtual TrainPlan, base version, planned arrival, and aggregation order are
 unchanged by this method revision.
 
-## 9. Diagnostics and checkpoints
+## 10. Diagnostics and checkpoints
 
-Every arrival writes schema-version-3 `ours_diagnostics`, including:
+Every arrival writes schema-version-4 `ours_diagnostics`, including:
 
 - raw and final module-sensitivity summaries;
 - per-module sensitivity and observation count;
 - module-functional server drift and local update energy;
 - relative staleness, reliability, and gamma;
+- pre-update window counts, frequency weight, and post-success window state;
+- per-module signed gate mean, direction, and mean absolute direction;
 - per-module alpha;
 - raw and bias-corrected task memory and accepted-update counts;
-- no arrival-rate or frequency-correction state.
 
 `tools/export_ours_diagnostics.py` exports update-level and module-level CSV
 files. There is no rank-level CSV because Module-Gate does not produce or
 upload rank sensitivity.
 
-Module-Gate uses state schema version 3. Rank-Gate checkpoints and their task
-memory are rejected because the stored sensitivity semantics are incompatible.
+Module-Gate uses state schema version 4. Older checkpoints are rejected because
+they cannot reconstruct the ordered accepted-task frequency window.
 
-## 10. Running
+## 11. Running
 
 Create a new immutable profile so an old Rank-Gate snapshot is not reused. For
 batch size 16 while preserving an existing virtual system and TrainPlan:
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_e1_bs16_ga4_r10_s42 \
+  --profile module_gate_freqw18_e1_bs16_ga4_r10_s42 \
   --reuse_plans_from ddp_e1_bs16_ga4_r10_s42
 ```
 
 Run on all visible GPUs:
 
 ```bash
-bash scripts/run_one.sh ours 2 module_gate_e1_bs16_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs16_ga4_r10_s42
 ```
 
 Use setting `5` or `10` for the corresponding existing AFVLM-CM partition.

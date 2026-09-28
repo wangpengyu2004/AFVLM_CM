@@ -6,6 +6,7 @@ import unittest
 from afl_vlm.federation.types import ClientSpec, ServerContext, Update
 from afl_vlm.methods.ours import (
     Ours,
+    _gate_direction,
     _normalize_module_sensitivity,
     compute_functional_staleness,
     lora_functional_distance_sq,
@@ -62,14 +63,19 @@ def update(
     base_a: float = 0.0,
     base_b: float | None = None,
     sensitivity: tuple[float, float] = (1.0, 1.0),
+    task: str = "vqa",
+    client_id: str | None = None,
+    update_id: str | None = None,
 ) -> Update:
     base = state(base_a, base_b)
     local = state(local_a, local_b)
+    client_id = client_id or f"{task}/client_0"
+    update_id = update_id or f"{client_id}-r0"
     return Update(
-        update_id="vqa/client_0-r0",
-        client_id="vqa/client_0",
-        task="vqa",
-        dataset="aokvqa",
+        update_id=update_id,
+        client_id=client_id,
+        task=task,
+        dataset=task,
         num_samples=4,
         local_round=0,
         base_version=0,
@@ -91,6 +97,10 @@ def update(
 
 
 class ModuleFunctionalDistanceTests(unittest.TestCase):
+    def test_gate_direction_uses_signed_over_absolute_sum(self) -> None:
+        self.assertAlmostEqual(_gate_direction(-2.0, 4.0, 1e-12), 0.5)
+        self.assertAlmostEqual(_gate_direction(2.0, 4.0, 1e-12), -0.5)
+
     def test_module_sensitivity_normalization_preserves_mean_and_floor(self) -> None:
         values, valid = _normalize_module_sensitivity(
             {"q": 0.01, "v": 1.99}, uniform_mix=0.5
@@ -155,7 +165,7 @@ class OursMethodTests(unittest.TestCase):
         self.assertAlmostEqual(method.task_memory["vqa"][MODULE], 0.1)
         self.assertEqual(method.task_memory["cls"], {MODULE: 0.0})
         diagnostics = mutation.metadata["ours_diagnostics"]
-        self.assertEqual(diagnostics["schema_version"], 3)
+        self.assertEqual(diagnostics["schema_version"], 4)
         self.assertEqual(diagnostics["method_variant"], "module_gate")
         self.assertTrue(diagnostics["aggregation"]["accepted"])
         self.assertEqual(diagnostics["sensitivity"]["module_by_module"][MODULE], 1.0)
@@ -173,6 +183,9 @@ class OursMethodTests(unittest.TestCase):
         self.assertAlmostEqual(
             diagnostics["memory"]["historical_precision_after"][MODULE], 1.5
         )
+        self.assertEqual(diagnostics["frequency"]["window_length_before"], 0)
+        self.assertEqual(diagnostics["frequency"]["window_length_after"], 1)
+        self.assertAlmostEqual(diagnostics["frequency"]["weight"], 1.0)
 
     def test_functional_staleness_reduces_reliability_and_module_alpha(self) -> None:
         fresh = self.configured()
@@ -183,6 +196,45 @@ class OursMethodTests(unittest.TestCase):
         self.assertAlmostEqual(stale_mutation.metadata["relative_staleness"], 4.0)
         self.assertAlmostEqual(stale_mutation.metadata["reliability"], math.exp(-4.0))
         self.assertLess(stale_mutation.applied_weight, fresh_mutation.applied_weight)
+
+    def test_history_memory_uses_sensitivity_without_reliability(self) -> None:
+        method = self.configured()
+        mutation = method.on_arrival(update(), ServerContext(state(2.0), 3, 2))[0]
+
+        self.assertLess(mutation.metadata["reliability"], 0.1)
+        self.assertAlmostEqual(method.task_memory["vqa"][MODULE], 0.1)
+        self.assertAlmostEqual(
+            mutation.metadata["ours_diagnostics"]["memory"]["task_memory_after"][MODULE],
+            1.0,
+        )
+
+    def test_frequency_weight_uses_pre_update_success_window(self) -> None:
+        method = self.configured(alpha_max=1.0)
+        method.task_frequency_window = ["vqa"] * 18
+        mutation = method.on_arrival(
+            update(task="cls"), ServerContext(state(0.0), 0, 2)
+        )[0]
+        frequency = mutation.metadata["ours_diagnostics"]["frequency"]
+
+        self.assertAlmostEqual(frequency["raw_weight"], math.sqrt(10.0))
+        self.assertAlmostEqual(frequency["weight"], 1.5)
+        self.assertEqual(frequency["window_length_before"], 18)
+        self.assertEqual(frequency["counts_before"], {"cls": 0, "vqa": 18})
+        self.assertEqual(frequency["window_length_after"], 18)
+        self.assertEqual(frequency["counts_after"], {"cls": 1, "vqa": 17})
+        self.assertAlmostEqual(mutation.metadata["module_alphas"][MODULE], 0.6)
+
+    def test_rejected_update_does_not_enter_frequency_window(self) -> None:
+        method = self.configured()
+        method.task_frequency_window = ["vqa"]
+        mutation = method.on_arrival(
+            update(local_a=0.0, task="cls"), ServerContext(state(0.0), 0, 2)
+        )[0]
+
+        self.assertFalse(mutation.increment_version)
+        self.assertEqual(method.task_frequency_window, ["vqa"])
+        frequency = mutation.metadata["ours_diagnostics"]["frequency"]
+        self.assertEqual(frequency["counts_before"], frequency["counts_after"])
 
     def test_no_effective_update_is_rejected_without_advancing_version(self) -> None:
         method = self.configured()
@@ -230,6 +282,7 @@ class OursMethodTests(unittest.TestCase):
         self.assertEqual(restored.task_memory, method.task_memory)
         self.assertEqual(restored.task_memory_counts, method.task_memory_counts)
         self.assertEqual(restored.task_weights, method.task_weights)
+        self.assertEqual(restored.task_frequency_window, method.task_frequency_window)
         self.assertEqual(restored._server_metadata, method._server_metadata)
 
     def test_rank_gate_checkpoint_is_rejected(self) -> None:
@@ -253,6 +306,10 @@ class OursMethodTests(unittest.TestCase):
     def test_invalid_module_sensitivity_configuration_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "uniform_mix"):
             Ours({"sensitivity_uniform_mix": 1.1})
+        with self.assertRaisesRegex(ValueError, "frequency_window_size"):
+            Ours({"frequency_window_size": 0})
+        with self.assertRaisesRegex(ValueError, "frequency bounds"):
+            Ours({"frequency_min": 2.0, "frequency_max": 1.0})
         with self.assertRaisesRegex(ValueError, "Unknown parameter"):
             Ours({"frequency_tau": 0.5})
 

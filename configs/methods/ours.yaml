@@ -6,6 +6,11 @@ method:
     # C = (1-eta) + eta * raw/mean(raw); eta=0.5 gives a 0.5 floor.
     sensitivity_uniform_mix: 0.5
     gamma: 1.0
+    # Accepted-update task-frequency correction over the latest W arrivals.
+    frequency_window_size: 18
+    frequency_power: 0.5
+    frequency_min: 0.5
+    frequency_max: 1.5
     history_beta: 0.9
     history_lambda: 1.0
     history_strength: 1.0

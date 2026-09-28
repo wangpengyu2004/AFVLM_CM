@@ -95,6 +95,7 @@ All methods call one shared FCIT-compatible evaluator:
 - Grounding reports FCIT's strict `IoU > 0.5` accuracy in percent and the
   additional raw mean IoU requested for AFVLM-CM.
 
-It records protocol, split, server version, virtual time, and a metric
+It records protocol, split, server version, incorporated-client-update
+milestones, actual evaluation progress, virtual time, and a metric
 dictionary per task. It never raw-averages incompatible task metrics. Caption
 METEOR requires a working Java runtime, as required by `pycocoevalcap`.

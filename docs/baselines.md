@@ -11,9 +11,13 @@ count, batch size, gradient accumulation, and local epochs; it estimates virtual
 duration but does not truncate training. FedCompass is the intentional exception
 because bounded local-iteration allocation is part of its scheduler.
 
-Primary evaluation is always the current server federated state at a common
-server-update checkpoint and the final server state after method finalization.
-Local-only is the sole exception because no server model exists. Pilot's
+Primary evaluation is always the current server federated state at common
+incorporated-client-update milestones and the final server state after method
+finalization. Buffered, grouped, and synchronous aggregations advance this
+budget by their actual number of contributing updates; one model is evaluated
+once after a threshold-crossing aggregation. Local-only is the sole state-scope
+exception because no server model exists, and uses completed local updates for
+the same budget. Pilot's
 server-global evaluation uses task routing with a task-wise mean of its
 server-held client visual adapters; personalized LoRA states are not used as
 the primary score.
@@ -99,6 +103,8 @@ Paper: [UniFed-LoRA: Exploiting Semantic Task Correlation for Heterogeneous Mult
 estimate one mean-absolute Module-Gate sensitivity per LoRA module during the
 normal backward pass; the server uses complete-module functional staleness,
 bias-corrected per-task historical sensitivity, and module-wise precision
-fusion. Task-arrival-frequency correction is not part of the current method.
+fusion. A bounded sliding window over successfully aggregated task labels
+corrects the current client precision; task memory itself is updated directly
+from client sensitivity and is not reliability/frequency weighted.
 It is excluded from baseline batches because it is the proposed method, not
 because it is unavailable. Full equations and commands are in `docs/ours.md`.
