@@ -141,19 +141,18 @@ python tools/estimate_task_compute_factors.py \
 
 当前可编辑基础配置使用 FP16，并通过 `runtime.devices: all` 自动使用全部可见 GPU。旧的
 `default_e1_bs1_ga4_r10_s42` 是历史不可变单执行器/BF16 快照，不会因修改基础配置
-自动变化。先基于相同 Plan 创建新的 V100 八卡快照：
+自动变化。当前默认 batch size 已改为 4，因此需创建新的 V100 八卡 system profile 与
+TrainPlan，不能复用 batch-size-1 Plan：
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42 \
-  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+  --profile v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 
-bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 ```
 
 旧 profile 的 `worker_queue: fifo` 是不可变历史快照，仍会按原 FIFO 策略运行。使用新名称
-创建 EDF profile 时可以复用旧 TrainPlan，从而只切换物理执行策略，不重新采样客户端
-速度、网络延迟或计划到达顺序。
+创建 batch-size-4 profile 时会依据当前本地数据重新计算本地 optimizer steps 与计划耗时。
 
 V100 没有原生 BF16 支持，因此新 profile 必须保持 `model.dtype: fp16`。普通运行不需要
 写 GPU 编号；如果临时只允许程序看到部分卡，可以在命令前设置

@@ -270,19 +270,19 @@ they cannot reconstruct the ordered accepted-task frequency window.
 
 ## 11. Running
 
-Create a new immutable profile so an old Rank-Gate snapshot is not reused. For
-batch size 16 while preserving an existing virtual system and TrainPlan:
+Create a new immutable profile so an old Rank-Gate snapshot is not reused. The
+current batch size is 4, so generate a new virtual system and TrainPlan rather
+than reusing a profile created for a different batch size:
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_freqw18_e1_bs16_ga4_r10_s42 \
-  --reuse_plans_from ddp_e1_bs16_ga4_r10_s42
+  --profile module_gate_freqw18_e1_bs4_ga4_r10_s42
 ```
 
 Run on all visible GPUs:
 
 ```bash
-bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs16_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs4_ga4_r10_s42
 ```
 
 Use setting `5` or `10` for the corresponding existing AFVLM-CM partition.

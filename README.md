@@ -252,15 +252,14 @@ test -d data/AFVLM_CM/dataset
 python tools/validate_afvlm_cm_data.py --setting 2
 ```
 
-### 3. 生成新的不可变实验 profile，并保留原虚拟 Plan
+### 3. 生成新的不可变实验 profile 和虚拟 Plan
 
-这次改变的是方法实现和物理执行器，不需要重随机生成客户端速度或到达顺序，因此复用
-原 profile 的 system profile 与 TrainPlan：
+当前默认 `batch_size=4`。batch size 会改变每轮本地 optimizer step 数与计划训练耗时，
+因此必须生成新的 system profile 与 TrainPlan，不能复用旧的 batch-size-1 Plan：
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_freqw18_e1_bs1_ga4_r10_s42 \
-  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+  --profile module_gate_freqw18_e1_bs4_ga4_r10_s42
 ```
 
 如果提示同名 profile 已存在，先用下面命令查看；确认它就是本次配置时直接使用，不要覆盖。
@@ -274,7 +273,7 @@ python tools/generate_system_profiles.py --list
 
 ```bash
 python tools/select_runtime_backend.py \
-  --config experiment_profiles/module_gate_freqw18_e1_bs1_ga4_r10_s42/configs/2clients/ours.yaml
+  --config experiment_profiles/module_gate_freqw18_e1_bs4_ga4_r10_s42/configs/2clients/ours.yaml
 ```
 
 正常应输出 `client_ddp`。`fedcompass`、`fedasmu`、`masfl`、`adamasfl` 和 `pilot`
@@ -286,7 +285,7 @@ python tools/select_runtime_backend.py \
 
 ```bash
 PYTHONUNBUFFERED=1 \
-bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42 \
+bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs4_ga4_r10_s42 \
   2>&1 | tee ours-module-gate-2clients.log
 ```
 
@@ -296,7 +295,7 @@ bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42 \
 tmux new -s afvlm-ours
 conda activate afvlm-cm
 cd /userhome/bcx/AFVLM_CM
-PYTHONUNBUFFERED=1 bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42 \
+PYTHONUNBUFFERED=1 bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs4_ga4_r10_s42 \
   2>&1 | tee ours-module-gate-2clients.log
 ```
 
@@ -322,7 +321,7 @@ watch -n 2 nvidia-smi
 本次输出目录为：
 
 ```text
-runs/llava/afvlm_cm/profiles/module_gate_freqw18_e1_bs1_ga4_r10_s42/2clients/ours/seed42/
+runs/llava/afvlm_cm/profiles/module_gate_freqw18_e1_bs4_ga4_r10_s42/2clients/ours/seed42/
 ```
 
 常用文件包括 `train.log`、`events.jsonl`、`updates.jsonl`、`task_metrics.jsonl`、
@@ -336,19 +335,19 @@ runs/llava/afvlm_cm/profiles/module_gate_freqw18_e1_bs1_ga4_r10_s42/2clients/our
 
 ```bash
 PYTHONUNBUFFERED=1 \
-bash scripts/run_one.sh fedasync 2 module_gate_freqw18_e1_bs1_ga4_r10_s42 \
+bash scripts/run_one.sh fedasync 2 module_gate_freqw18_e1_bs4_ga4_r10_s42 \
   2>&1 | tee fedasync-2clients.log
 ```
 
 依次运行 12 个 baseline（不包含 `ours`）：
 
 ```bash
-bash scripts/run_baselines.sh 2 module_gate_freqw18_e1_bs1_ga4_r10_s42
+bash scripts/run_baselines.sh 2 module_gate_freqw18_e1_bs4_ga4_r10_s42
 ```
 
 将第二个参数改为 `5` 或 `10` 即选择 5/10 clients per task。8 卡 DDP 中
-`training.batch_size` 是**每卡** micro-batch；默认 `batch_size=1`、
-`gradient_accumulation=4` 时，全局有效 batch 为 `1 × 4 × 8 = 32`。GPU 数量属于实验
+`training.batch_size` 是**每卡** micro-batch；默认 `batch_size=4`、
+`gradient_accumulation=4` 时，全局有效 batch 为 `4 × 4 × 8 = 128`。GPU 数量属于实验
 条件，正式对比中应保持一致并记录。
 
 ## 从修改参数到服务器运行的完整流程
@@ -532,10 +531,9 @@ DDP 进程组。每张 GPU 生成六个任务各自互不重叠的样本分片�
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42 \
-  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+  --profile v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 
-bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 ```
 
 每张 V100 会占用一份完整 7B FP16 模型及一个客户端的激活/优化器状态；这和原先 `device_map: auto` 把一个模型切到多卡不同。正常情况下无需设置 `CUDA_VISIBLE_DEVICES`。如果服务器还有其他任务、只想临时使用部分卡，可以选择性地设置该环境变量；程序会自动使用其中所有可见设备。
@@ -544,7 +542,7 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 
 ```bash
 python tools/estimate_task_compute_factors.py \
-  runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42/2clients/fedasync/seed42
+  runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42/2clients/fedasync/seed42
 ```
 
 把输出因子写入 `configs/base.yaml` 后创建不复用旧 Plan的新 profile。任务固有耗时使用 `task_compute_factors`，设备差异使用 `speed_factor`，二者分开保存。
@@ -626,11 +624,10 @@ bash scripts/run_one.sh ours 2
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_freqw18_e1_bs1_ga4_r10_s42 \
-  --reuse_plans_from default_e1_bs1_ga4_r10_s42
+  --profile module_gate_freqw18_e1_bs4_ga4_r10_s42
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs4_ga4_r10_s42
 ```
 
 完整 Module-Gate 统计、功能距离、聚合公式和限制见 `docs/ours.md`。
@@ -638,14 +635,14 @@ bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs1_ga4_r10_s42
 使用前文创建的正式 V100 八卡快照：
 
 ```bash
-bash scripts/run_one.sh fedavg 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
-bash scripts/run_one.sh fedasync 5 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedavg 2 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh fedasync 5 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 ```
 
 profile 结果写入独立目录，例如：
 
 ```text
-runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42/2clients/fedavg/seed42/
+runs/llava/afvlm_cm/profiles/v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42/2clients/fedavg/seed42/
 ```
 
 将最后一个参数改为 5 或 10 即选择对应数据集；例如：
@@ -677,7 +674,7 @@ bash scripts/run_baselines.sh 10
 对一个保存的 profile 批量运行：
 
 ```bash
-bash scripts/run_baselines.sh 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
+bash scripts/run_baselines.sh 2 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 ```
 
 ### 命令行训练进度
@@ -685,7 +682,7 @@ bash scripts/run_baselines.sh 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
 训练进度条默认开启，直接使用原有命令即可，不需要重新生成 system profile 或 TrainPlan：
 
 ```bash
-bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42
+bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 ```
 
 命令行会依次显示：
@@ -705,13 +702,13 @@ gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_a
 进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取
 已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
 
-`batch_size` 是每张 GPU 的真实多模态 micro-batch 大小：文本在当前 batch 内动态 padding，图像组成同一个 batch tensor，并通过一次 LLaVA forward/backward 处理。原 worker pool 的有效批量是 `batch_size × gradient_accumulation`；DDP 的有效批量还要乘以 world size。例如八卡下 `batch_size: 1`、`gradient_accumulation: 4` 的有效批量是 32。修改 batch、卡数或执行策略后必须创建新的实验 profile。
+`batch_size` 是每张 GPU 的真实多模态 micro-batch 大小：文本在当前 batch 内动态 padding，图像组成同一个 batch tensor，并通过一次 LLaVA forward/backward 处理。原 worker pool 的有效批量是 `batch_size × gradient_accumulation`；DDP 的有效批量还要乘以 world size。例如八卡下 `batch_size: 4`、`gradient_accumulation: 4` 的有效批量是 128。修改 batch、卡数或执行策略后必须创建新的实验 profile。
 
 若需要把终端输出重定向到文件，建议同时打开 Python 非缓冲输出：
 
 ```bash
 PYTHONUNBUFFERED=1 \
-  bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs1_ga4_r10_s42 \
+  bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42 \
   2>&1 | tee fedasync-2clients.log
 ```
 
