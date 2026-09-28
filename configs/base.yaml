@@ -16,7 +16,7 @@ runtime:
 
 training:
   local_epochs: 1
-  batch_size: 1
+  batch_size: 4
   gradient_accumulation: 4
   learning_rate: 0.00002
   # The active Grounding conversations fit the native LLaVA 2k context.
