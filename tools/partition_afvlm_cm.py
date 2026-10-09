@@ -50,7 +50,7 @@ TASKS = (
         "Grounding",
         "Grounding/train_11w.json",
         "Grounding/test_6000.json",
-        12_000,
+        4_500,
     ),
 )
 
@@ -286,7 +286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("data/AFVLM_CM/partitioned_fcitev1_72k"),
+        default=Path("data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5"),
     )
     parser.add_argument("--client_settings", nargs="+", type=int, default=[2, 5, 10])
     parser.add_argument("--eval_size", type=int, default=1_000)
@@ -313,7 +313,7 @@ def main() -> int:
         raise ValueError("--client_settings must contain unique positive values")
 
     summary: dict[str, Any] = {
-        "version": "fcit_eval_v1_72k",
+        "version": "fcit_eval_v2_grounding4k5_64k5",
         "seed": args.seed,
         "task_order": [spec.task for spec in TASKS],
         "total_selected_train_records": sum(spec.train_cap for spec in TASKS),
@@ -368,7 +368,7 @@ def main() -> int:
     write_json(output_dir / "metadata/dataset_summary.json", summary, pretty=True)
     report = "\n".join(
         [
-            "# AFVLM-CM FCIT-compatible 72k partition",
+            "# AFVLM-CM FCIT-compatible 64.5k partition",
             "",
             f"Seed: {args.seed}",
             "",

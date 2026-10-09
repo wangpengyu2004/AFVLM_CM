@@ -185,8 +185,8 @@ This report records the implementation scope and engineering validation. No trai
 - `data/AFVLM_CM/partitioned/10_clients`: 60 clients (10 per task).
 - Each setting contains `cls`, `caption`, `vqa`, `chart_vqa`, `visual_reasoning`, and `grounding`.
 - Each task contains the existing `client_N.json`, `statistics.json`, `val.json`, and `test.json` files.
-- Per-setting training totals remain: cls 15,000; caption 20,000; vqa 12,000; chart_vqa 10,805; visual_reasoning 12,000; grounding 20,000.
-- Integrity: 161 files, 164,752,723 bytes, aggregate SHA-256 `2ebc769eae578da93a7aa0a80ffb5921c0d6e53e7e53db1e1137af50d9116931` under the documented validator convention.
+- Per-setting training totals are: cls 13,000; caption 15,000; vqa 11,000; chart_vqa 9,500; visual_reasoning 11,500; grounding 4,500, for 64,500 records in total.
+- Integrity: 158 files, 82,449,713 bytes, aggregate SHA-256 `3cec6e041b4bad67aab4107112bf7a971ca977533aa2287db0ba0d5d4cacda8a` under the documented validator convention.
 
 ## Required paths
 

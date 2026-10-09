@@ -29,25 +29,25 @@ data/AFVLM_CM/
 | `visual_reasoning` | FigureQA | answer accuracy | `FigureQA/images/` |
 | `grounding` | COCO grounding | mean IoU、IoU@0.5 accuracy | 与 AOKVQA 共用 `COCO2014/` |
 
-每个任务目录包含 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。当前固定版本为 `fcit_eval_v1_72k`，六任务训练记录数依次为 13,000 / 15,000 / 11,000 / 9,500 / 11,500 / 12,000，总计 72,000；2/5/10 clients/task 三档复用同一任务池，只改变客户端划分。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 固定该版本的静态完整性摘要。
+每个任务目录包含 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。当前固定版本为 `fcit_eval_v2_grounding4k5_64k5`，六任务训练记录数依次为 13,000 / 15,000 / 11,000 / 9,500 / 11,500 / 4,500，总计 64,500。该版本只缩减 Grounding 训练池；其多轮结构、validation/final 以及其他五个任务均保持不变。2/5/10 clients/task 三档复用同一任务池，只改变客户端划分。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 固定该版本的静态完整性摘要。
 
 数据读取器兼容该 benchmark 实际存在的三种标注形式：LLaVA `conversations`、扁平的 `text + answer`，以及 Grounding 测试集的 `text + answer_bbox`。Grounding 训练会保留完整多轮对话并让每个 assistant 回答参与 loss；validation/final 会把每个 user/assistant 对展开成独立 query。Caption 的 validation/test 每张图片保留五个参考 caption。`max_text_length` 默认使用 LLaVA 的 2k 上下文；若某个多轮样本仍超长，collator 会明确报错而不会静默截掉后面的 assistant 回答。正常训练和独立评估不会在启动时全量扫描图片；样本真正进入 batch 时才读取对应图片。
 
-### 重建固定 72k 分区
+### 重建固定 64.5k 分区
 
 下面命令从 FCIT 指令文件构建一个新候选目录；如果目标目录非空会直接拒绝，不会覆盖当前 `partitioned/`：
 
 ```bash
 python tools/partition_afvlm_cm.py \
   --source_root data/AFVLM_CM/instruction \
-  --output_dir data/AFVLM_CM/partitioned_fcitev1_72k
+  --output_dir data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5
 ```
 
 验证候选目录后，再人工备份旧目录并启用新目录。数据目录不上传 GitHub，因此电脑端和服务器端都要保存/同步同一个固定分区：
 
 ```bash
-mv data/AFVLM_CM/partitioned data/AFVLM_CM/partitioned_legacy_89805
-mv data/AFVLM_CM/partitioned_fcitev1_72k data/AFVLM_CM/partitioned
+mv data/AFVLM_CM/partitioned data/AFVLM_CM/partitioned_fcitev1_72k
+mv data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5 data/AFVLM_CM/partitioned
 python tools/validate_afvlm_cm_data.py --all
 ```
 
@@ -389,6 +389,7 @@ nano configs/methods/fedasync.yaml
 | `local_epochs`、`batch_size`、`gradient_accumulation` | 否 | 创建新 profile，不传 `--reuse_plans_from` |
 | 六个 `task_compute_factors` | 否 | 创建新 profile，不传 `--reuse_plans_from` |
 | `federation.rounds`、随机种子或系统异构性生成规则 | 否 | 创建新 profile，不传 `--reuse_plans_from` |
+| 数据分区或任一客户端的样本数 | 否 | 创建新 profile，不传 `--reuse_plans_from` |
 | 只把客户端档位从 2 换成 5 或 10 | 不需要修改配置 | 运行时修改第二个参数 |
 
 ### 3A. 参数不影响 Plan：复用旧 Plan

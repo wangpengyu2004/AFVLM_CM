@@ -16,14 +16,16 @@ Every setting contains `cls`, `caption`, `vqa`, `chart_vqa`,
 `visual_reasoning`, and `grounding`. Every task directory contains the
 existing `client_N.json`, `statistics.json`, `val.json`, and `test.json`.
 Training totals per setting are 13,000 / 15,000 / 11,000 / 9,500 / 11,500 /
-12,000 in canonical task order, or 72,000 stored records in total. Every
+4,500 in canonical task order, or 64,500 stored records in total. Only the
+Grounding training pool is reduced; the other five tasks and every validation
+and final split remain unchanged. Every
 client-count setting reuses exactly the same task pool; only its client
 partition changes. Runtime code never repartitions these records.
 
-The active partition version is `fcit_eval_v1_72k`. The integrity manifest in
-`configs/datasets/afvlm_cm_integrity.json` records 158 files, 108,209,141
-bytes, and aggregate SHA-256
-`12acaf7ef39c1b3a1bcb40bcf8f8a11d81beda353b10f77aebaed197915ad74d`.
+The active partition version is `fcit_eval_v2_grounding4k5_64k5`. The
+integrity manifest in `configs/datasets/afvlm_cm_integrity.json` records the
+exact file count, byte count, and aggregate SHA-256 for this local-data
+version.
 
 ## Loader interface
 
