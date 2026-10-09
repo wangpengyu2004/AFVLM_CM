@@ -22,6 +22,7 @@ def register_method(name: str) -> Callable[[type[Method]], type[Method]]:
 
 def _load_builtins() -> None:
     from afl_vlm.methods import fedasmu, fedcompass, masfl, ours, standard  # noqa: F401
+    from afl_vlm.methods.continual_merge import method as continual_merge  # noqa: F401
     from afl_vlm.methods.pilot import method as pilot  # noqa: F401
     from afl_vlm.methods.unifed_lora import method as unifed_lora  # noqa: F401
 

@@ -1,0 +1,19 @@
+# NUFILT (ICLR 2026), server-only null filter + projection-aware residual fitting.
+# Ranks are capped by the nonzero compact LoRA subspace, not dense backbone rank.
+method:
+  name: nufilt_lora
+  params:
+    merge_weight: 0.5
+    staleness:
+      type: constant
+    filter_rank: 8
+    projection_rank: 8
+    adaptation_rank: 8
+    inner_steps: 50
+    inner_lr: 1.0e-3
+    init_std: 0.02
+    stability_weight: 1.0
+    plasticity_weight: 1.0
+    eps: 1.0e-8
+federation:
+  mode: asynchronous

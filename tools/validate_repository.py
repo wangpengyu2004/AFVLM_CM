@@ -36,7 +36,11 @@ EXPECTED_METHODS = (
     "pilot",
     "unifed_lora",
     "ours",
+    "opcm_lora",
+    "dop_lora",
+    "nufilt_lora",
 )
+LEGACY_METHODS = set(EXPECTED_METHODS) - {"opcm_lora", "dop_lora", "nufilt_lora"}
 SETTINGS = (2, 5, 10)
 
 
@@ -70,7 +74,10 @@ def validate_profiles(errors: list[str]) -> int:
                 errors.append(f"profile {profile_root.name}: manifest name mismatch")
             if tuple(manifest.get("settings", ())) != SETTINGS:
                 errors.append(f"profile {profile_root.name}: setting list mismatch")
-            if set(manifest.get("methods", ())) != set(EXPECTED_METHODS):
+            # An immutable historical snapshot must not be rewritten just because
+            # the registry gained optional methods after that profile was created.
+            profile_methods = set(manifest.get("methods", ()))
+            if not LEGACY_METHODS <= profile_methods <= set(EXPECTED_METHODS):
                 errors.append(f"profile {profile_root.name}: method list mismatch")
             expected_hashes = manifest.get("files_sha256", {})
             for relative, expected_hash in expected_hashes.items():
@@ -87,7 +94,7 @@ def validate_profiles(errors: list[str]) -> int:
                 plan = load_train_plan(plan_path)
                 configs = profile_root / "configs" / f"{setting}clients"
                 paths = sorted(configs.glob("*.yaml"))
-                if {path.stem for path in paths} != set(EXPECTED_METHODS):
+                if {path.stem for path in paths} != profile_methods:
                     errors.append(
                         f"profile {profile_root.name}/{setting}: config method set mismatch"
                     )
@@ -152,8 +159,9 @@ def main() -> None:
     experiments = sorted(
         (ROOT / "configs" / "experiments" / "llava" / "afvlm_cm").glob("*clients/*.yaml")
     )
-    if len(experiments) != 39:
-        errors.append(f"expected 39 experiment configs, found {len(experiments)}")
+    expected_count = len(EXPECTED_METHODS) * len(SETTINGS)
+    if len(experiments) != expected_count:
+        errors.append(f"expected {expected_count} experiment configs, found {len(experiments)}")
     for path in experiments:
         try:
             config = load_config(path)
@@ -206,7 +214,10 @@ def main() -> None:
                         f"expected {expected_output}"
                     )
             expected_plan = f"plans/afvlm_cm/{setting}clients/async_train_plan.json"
-            async_methods = ("fedasync", "fedbuff", "fedasmu", "masfl", "adamasfl", "ours")
+            async_methods = (
+                "fedasync", "fedbuff", "fedasmu", "masfl", "adamasfl", "ours",
+                "opcm_lora", "dop_lora", "nufilt_lora",
+            )
             for method in async_methods:
                 method_cfg = resolved[method]
                 if method_cfg["federation"]["train_plan"] != expected_plan:

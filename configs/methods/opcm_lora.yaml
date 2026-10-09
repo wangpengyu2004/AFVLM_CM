@@ -1,0 +1,11 @@
+# OPCM (NeurIPS 2025), asynchronous fixed-rank functional LoRA adaptation.
+method:
+  name: opcm_lora
+  params:
+    merge_weight: 0.5
+    staleness:
+      type: constant
+    retain: 0.5
+    eps: 1.0e-8
+federation:
+  mode: asynchronous

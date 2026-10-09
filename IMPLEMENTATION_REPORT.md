@@ -312,3 +312,46 @@ example `bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42`.
   dependency; it was installed into `.venv` before the full regression rerun.
   Existing formatter differences were not mass-rewritten. No CUDA/PyTorch
   execution, model loading, training, model/data download or GitHub push occurred.
+
+## Continual merging adapters — 2026-10-10
+
+- Added isolated `opcm_lora` (NeurIPS2025), `dop_lora` (NeurIPS2025) and
+  `nufilt_lora` (ICLR2026), with primary-paper/official-code equation mapping in
+  `docs/continual_merging.md`. They are explicitly fixed-task asynchronous
+  functional-LoRA adaptations, not exact independent-expert reproductions.
+- Preserved OPCM block/diagonal filtering and global norm scaling; DOP weighted
+  left/right projection objectives, MGDA and coefficient EMA; NUFILT null filter
+  plus projection-aware temporary residual-gate fitting. No calibration data or
+  LLaVA forward is used by server fitting.
+- Joint thin QR converts global/local/download BA products to small exact cores;
+  incoming increment is local BA minus immutable-download BA. Candidates are
+  relaxed and truncated back to the same rank; compression error is logged.
+  Nonzero pretrained adapters, non-LoRA federated keys and incompatible shapes
+  are rejected. Frozen backbone/model structure remains unchanged.
+- Added9 inherited experiment configs,3 method configs and an independent merge
+  batch script. All3 methods declare ordinary-epoch DDP capability. The original
+  baseline batch and existing runners, methods, training, data and metrics are
+  unchanged. Legacy immutable13-method profiles remain valid and unmodified;
+  fresh profiles include16 methods/48 configs.
+- Verified72 non-training regression checks (10 new), syntax, Ruff, all48 YAML
+  inheritance/fair-field checks, old profile hashes, unchanged68k dataset manifest
+  and whitespace. Used CPU tensor algebra only in ignored local.venv; no model
+  weights, image download, GPU/VLM training or GitHub upload. Numerical checks
+  are not evidence of target-server distributed training or paper performance.
+- Existing uncommitted68k dataset changes were preserved, not regenerated.
+
+### Pre-publication review
+
+- Corrected numerical-rank detection to exclude FP32 null-space roundoff.
+  Corrected OPCM's previous-scale recurrence for partially zero modules;
+  DOP/NUFILT now retain unchanged module A/B coordinates.
+- All76 non-training regressions pass (14 continual-merging checks), including
+  immutable snapshots, partial-zero updates, rank truncation and shared-server
+  version/acceptance counting. Syntax, full-tree Ruff and48 resolved configs
+  with one legacy immutable profile pass. No LLaVA model or training was run.
+- CPU tensor checks use local PyTorch2.14.1, not the target server CUDA/runtime.
+  Distributed training, GPU numerical behavior, performance and scientific
+  reproduction equivalence remain unverified by these engineering checks.
+- This publication excludes separate68k dataset builder/manifest/documentation
+  edits. Those local changes are preserved. Methods use the actual machine's
+  dataset and require a newly generated compatible profile for their configs.

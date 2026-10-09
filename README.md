@@ -150,24 +150,24 @@ configs/
 ├── base.yaml
 ├── models/llava15_7b_lora.yaml
 ├── datasets/afvlm_cm_{2,5,10}clients.yaml
-├── methods/{local,...,unifed_lora,ours}.yaml
+├── methods/{local,...,unifed_lora,ours,opcm_lora,dop_lora,nufilt_lora}.yaml
 └── experiments/llava/afvlm_cm/
-    ├── 2clients/    # 13 个可直接运行配置
-    ├── 5clients/    # 13 个可直接运行配置
-    └── 10clients/   # 13 个可直接运行配置
+    ├── 2clients/    # 16 个可直接运行配置
+    ├── 5clients/    # 16 个可直接运行配置
+    └── 10clients/   # 16 个可直接运行配置
 ```
 
 这三类目录职责不同，不能互相替代：
 
 | 目录 | 作用 | 是否应修改/删除 |
 |---|---|---|
-| `configs/methods/` | 各算法的可编辑参数源；39 个实验入口通过 `inherits` 读取它们，创建新 profile 时也从这里解析当前方法参数 | 可以按实验需要修改；不能删除 |
+| `configs/methods/` | 各算法的可编辑参数源；48 个实验入口通过 `inherits` 读取它们，创建新 profile 时也从这里解析当前方法参数 | 可以按实验需要修改；不能删除 |
 | `plans/afvlm_cm/` | 默认兼容运行使用的 system profile 与 TrainPlan；保证 `bash scripts/run_one.sh <method> <setting>` 和原始实验 YAML 仍可直接运行 | 不要手工修改；当前不能删除 |
 | `experiment_profiles/` | 已冻结的完整配置、system profile 和 TrainPlan 快照，用于正式实验复现和切换旧实验 | 不要修改或覆盖；新参数应创建新 profile |
 
 因此，平时应修改 `configs/base.yaml`、`configs/models/` 或 `configs/methods/`，然后生成新的 `experiment_profiles/<name>/`。正式运行优先指定 profile；`plans/` 仅作为默认兼容入口保留。
 
-同一规模的所有方法继承相同模型、LoRA、客户端优化器、学习率、本地 epoch、batch size、随机种子、数据与评估配置。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。每个 profile 同时保存完全解析后的 39 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
+同一规模的所有方法继承相同模型、LoRA、客户端优化器、学习率、本地 epoch、batch size、随机种子、数据与评估配置。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。新 profile 保存完全解析后的 48 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径；历史 39 份配置的 profile 仍保留原状，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
 
 普通方法的本地训练量只由 `training.local_epochs` 控制，不再同时设置通用的 `base_local_steps`。TrainPlan 中记录的 `local_steps` 是根据客户端样本数、batch size、梯度累积和 `local_epochs` 推导出的预计优化器步数，只用于虚拟耗时和算法钩子，不会截断普通客户端训练。FedCompass 是唯一例外：其计算能力感知调度器必须动态分配本地迭代，因此使用 `min_local_steps` / `max_local_steps` 作为方法专属边界。
 
@@ -413,7 +413,7 @@ python tools/generate_system_profiles.py \
   --profile e2_bs1_ga4_r20_s42
 ```
 
-此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 39 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
+此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 48 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
 
 如果需要新的随机种子，可显式指定：
 
@@ -774,9 +774,28 @@ python scripts/evaluate.py \
 
 数据接口和每种 baseline 的组件/方程/适配边界另见 `docs/AFVLM_CM.md` 与 `docs/baselines.md`。提出方法的 Module-Gate 公式、配置和运行流程见 `docs/ours.md`。
 
+## 持续模型融合基线（新增）
+
+新增三个独立的服务器端异步持续融合适配：`opcm_lora`（NeurIPS 2025，奇异方向投影与范数控制）、`dop_lora`（NeurIPS 2025，双投影/MGDA）、`nufilt_lora`（ICLR 2026，零空间过滤与投影感知残差适配）。它们不是普通 FedAvg，也不是原论文独立专家/持续学习场景的精确复现。保留固定任务客户端；按原 Plan 聚合，使用不可变下载快照提取 `B_local A_local - B_base A_base`，融合后压回原 LoRA rank。冻结主干不变，不增加客户端可训练参数或校准数据。
+
+完整公式、选择依据、上游版本、压缩误差日志及适配限制见 [持续融合说明](docs/continual_merging.md)。三个方法的默认能力策略都选择单客户端 DDP；支持共同 server_global 六任务评估。原 `run_baselines.sh` 的方法顺序不改，持续融合组独立执行。
+
+先确认 `configs/base.yaml` 的实际参数及本地数据，再创建新快照（名称不会设置参数）：
+
+```bash
+python tools/generate_system_profiles.py --profile merging_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh opcm_lora 2 merging_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh dop_lora 2 merging_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh nufilt_lora 2 merging_e1_bs4_ga4_r10_s42
+# 或顺序跑这三个方法；将2替换为5或10可切换客户端数
+bash scripts/run_merging_baselines.sh 2 merging_e1_bs4_ga4_r10_s42
+```
+
+旧 immutable profile 不会被改写，也不自动具有新增方法配置。新增方法本身不改变Plan，可创建新profile并用 `--reuse_plans_from <旧快照名>` 复用兼容Plan；这仍使用当前配置模板，需自行核对数据、seed、模型和训练设置一致。更改客户端数据量后不能复用旧Plan。同一比较的旧基线与 `ours` 应使用同一快照和实际有效batch。此处profile名称是人工标签，方法支持服务器的实际分区规模，不会修改或同步本地数据。
+
 ## 静态工程检查
 
-以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、39 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
+以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、48 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
 
 ```bash
 python -m compileall -q code scripts tools

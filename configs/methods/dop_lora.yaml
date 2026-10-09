@@ -1,0 +1,17 @@
+# DOP (NeurIPS 2025), compact-coordinate dual-projection/MGDA adaptation.
+# inner_steps belong to server matrix fitting, never client optimizer steps.
+method:
+  name: dop_lora
+  params:
+    merge_weight: 0.5
+    staleness:
+      type: constant
+    inner_steps: 50
+    inner_lr: 1.0e-4
+    retain: 1.0
+    normalize_gradients: true
+    mgda_ema_beta: 0.99
+    mgda_initial_alpha: 0.5
+    eps: 1.0e-8
+federation:
+  mode: asynchronous

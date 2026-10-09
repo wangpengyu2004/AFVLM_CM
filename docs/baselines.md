@@ -22,6 +22,16 @@ server-global evaluation uses task routing with a task-wise mean of its
 server-held client visual adapters; personalized LoRA states are not used as
 the primary score.
 
+## Optional continual merging adapters
+
+The optional continual-merging group adds `opcm_lora`, `dop_lora`, and
+`nufilt_lora` in an isolated package. These are explicitly **asynchronous
+fixed-rank LoRA adaptations**, not exact independent-expert reproductions.
+They use the original client training/evaluation/Plan interfaces and default
+capability-selected client DDP. The original baseline batch is unchanged;
+run them separately using `scripts/run_merging_baselines.sh`.
+See [continual merging equations, sources and limitations](continual_merging.md).
+
 ## Reference and classical FL
 
 - **Local-only:** persistent per-client LoRA states, no global mutation.
