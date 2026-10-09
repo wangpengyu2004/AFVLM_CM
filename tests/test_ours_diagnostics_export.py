@@ -71,6 +71,7 @@ class OursDiagnosticsExportTests(unittest.TestCase):
                 "weight": 1.2,
             },
             "aggregation": {
+                "rule": "base_relative_delta",
                 "accepted": True,
                 "rejection_reason": None,
                 "module_alpha_by_module": {module: 0.2},
@@ -113,6 +114,8 @@ class OursDiagnosticsExportTests(unittest.TestCase):
             with Path(result["module_csv"]).open(encoding="utf-8-sig", newline="") as handle:
                 module_rows = list(csv.DictReader(handle))
             self.assertEqual(update_rows[0]["relative_staleness"], "0.75")
+            self.assertEqual(update_rows[0]["aggregation_rule"], "base_relative_delta")
+            self.assertEqual(module_rows[0]["aggregation_rule"], "base_relative_delta")
             self.assertEqual(update_rows[0]["sensitivity_statistic"], "mean_absolute_gate")
             self.assertEqual(update_rows[0]["frequency_weight"], "1.2")
             self.assertEqual(update_rows[0]["gate_direction_abs_mean"], "0.5")
@@ -120,6 +123,14 @@ class OursDiagnosticsExportTests(unittest.TestCase):
             self.assertEqual(module_rows[0]["signed_gate_mean"], "-1.0")
             self.assertEqual(module_rows[0]["gate_direction"], "0.5")
             self.assertEqual(module_rows[0]["module_alpha"], "0.2")
+
+            # Old events lack the additive rule label; do not mislabel their semantics.
+            diagnostics["aggregation"].pop("rule")
+            events.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            legacy = export_diagnostics(events, root / "legacy")
+            for key in ("update_csv", "module_csv"):
+                with Path(legacy[key]).open(encoding="utf-8-sig", newline="") as handle:
+                    self.assertEqual(next(csv.DictReader(handle))["aggregation_rule"], "")
 
     def test_ignores_only_an_incomplete_trailing_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

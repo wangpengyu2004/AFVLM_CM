@@ -1,5 +1,7 @@
 method:
   name: ours
+  # Aggregation: current + module_alpha * (local - immutable downloaded base).
+  # Sensitivity, reliability, frequency and history coefficients are unchanged.
   params:
     # Module-Gate: mean absolute gate magnitude, once per real optimizer step.
     sensitivity_warmup_steps: 1

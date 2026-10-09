@@ -1,4 +1,4 @@
-# Proposed method: Module-Gate Sensitivity-Aware Asynchronous LoRA Consolidation
+# Proposed method: Module-Gate Sensitivity-Aware Asynchronous LoRA Updates
 
 The registered method `ours` implements the Module-Gate design for fixed-task
 asynchronous federated LLaVA instruction tuning. Its main line is:
@@ -172,7 +172,7 @@ Defaults are power `0.5` and bounds `[0.5, 1.5]`. The current task enters the
 FIFO window only after successful fusion, so its own label cannot change the
 weight used for that fusion. The window is method state and is checkpointed.
 
-## 7. Module-wise LoRA fusion
+## 7. Module-wise base-relative LoRA increment aggregation
 
 Client precision and server protection are:
 
@@ -191,14 +191,32 @@ The default `alpha_max=0.5`. One coefficient is shared by the complete A and B
 of the same module:
 
 ```text
-A[t+1,l] = A[t,l] + alpha[k,l] (A[k,l] - A[t,l])
-B[t+1,l] = B[t,l] + alpha[k,l] (B[k,l] - B[t,l])
+A[t+1,l] = A[t,l] + alpha[k,l] (A[k,l] - A[b_k,l])
+B[t+1,l] = B[t,l] + alpha[k,l] (B[k,l] - B[b_k,l])
 ```
 
-The endpoint is the client's final local state, not a stale delta directly
-added to the current server. Factor-space interpolation is not identical to
-dense `BA` interpolation, but it preserves rank and the existing PEFT state
-interface without SVD.
+`b_k` is the exact immutable snapshot downloaded when this client started,
+not the current global model or an inferred version. The server adds the
+client's local-training increment to its current A/B tensors. It does not
+interpolate toward the stale endpoint or subtract a fraction of the server
+drift. A fresh update (`t=b_k`) is algebraically identical to endpoint mixing.
+Sensitivity, functional reliability, frequency weight, alpha clipping, and
+the post-success history/window updates are otherwise unchanged.
+
+The history precision now damps the added increment; it is not an exact
+precision-weighted fusion of two model endpoints. An unconstrained quadratic
+surrogate in parameter movement `s_l` gives the same uncapped coefficient:
+
+```text
+min_s P_client[k,l] ||s - (theta[k,l]-theta[b_k,l])||^2
+      + P_server[t,l] ||s||^2
+```
+
+The actual coefficient also includes `eps` and the configured cap. This is a
+step-size interpretation, not a convergence or task-preservation guarantee.
+The increment remains stale and can conflict with other tasks. Factor-space
+A/B increments are not identical to adding a dense `Delta(BA)`; they preserve
+the existing LoRA rank and PEFT state interface without SVD.
 
 ## 8. Configuration
 
@@ -259,14 +277,20 @@ Every arrival writes schema-version-4 `ours_diagnostics`, including:
 - pre-update window counts, frequency weight, and post-success window state;
 - per-module signed gate mean, direction, and mean absolute direction;
 - per-module alpha;
+- `aggregation.rule = base_relative_delta`, identifying this aggregation revision;
 - raw and bias-corrected task memory and accepted-update counts;
 
 `tools/export_ours_diagnostics.py` exports update-level and module-level CSV
-files. There is no rank-level CSV because Module-Gate does not produce or
-upload rank sensitivity.
+files. Both include `aggregation_rule`. Legacy events without a rule label
+export an empty field, rather than being relabelled as incremental updates.
+There is no rank-level CSV because Module-Gate does not produce or upload
+rank sensitivity.
 
 Module-Gate uses state schema version 4. Older checkpoints are rejected because
 they cannot reconstruct the ordered accepted-task frequency window.
+This aggregation revision keeps the same memory/checkpoint data layout but
+changes the update semantics. Do not continue an old endpoint-mixing run as
+the same experiment; use a separate output/profile for the new variant.
 
 ## 11. Running
 
@@ -276,14 +300,22 @@ than reusing a profile created for a different batch size:
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_freqw18_e1_bs4_ga4_r10_s42
+  --profile module_gate_delta_grounding8k_e1_bs4_ga4_r10_s42
 ```
 
 Run on all visible GPUs:
 
 ```bash
-bash scripts/run_one.sh ours 2 module_gate_freqw18_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_delta_grounding8k_e1_bs4_ga4_r10_s42
 ```
 
 Use setting `5` or `10` for the corresponding existing AFVLM-CM partition.
 Do not resume an old Rank-Gate output directory or checkpoint.
+
+Changing only the aggregation formula does not require a different system
+profile or TrainPlan. When the data partition and scheduling/training settings
+are unchanged, add `--reuse_plans_from <compatible_profile>` to the generation
+command to copy the identical Plan into the new profile/output. Do not reuse
+a Plan from the old 64.5k/72k partition with the new Grounding-8k/68k data, or
+from a different batch/epoch configuration. Existing immutable configs and
+Plans are never rewritten by this aggregation change.

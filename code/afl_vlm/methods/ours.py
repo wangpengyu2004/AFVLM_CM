@@ -5,6 +5,8 @@ no trainable parameter, never materializes a dense LoRA update, and performs no
 SVD or rank alignment. Module sensitivity is collected from the existing local
 backward pass; the server uses it for functional staleness and computes one
 shared aggregation coefficient for both A and B of each LoRA module.
+Aggregation adds the client's base-relative A/B increment to the current
+server state; it does not interpolate toward the stale client endpoint.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from afl_vlm.methods.registry import register_method
 from afl_vlm.models.base import LoRAState, clone_state
 
 _LORA_PARAMETER = re.compile(r"^(?P<module>.+)\.lora_(?P<side>[AB])(?:\.[^.]+)?\.weight$")
+_AGGREGATION_RULE = "base_relative_delta"
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,14 +390,19 @@ def _as_float(value: Any) -> float:
     return float(value.detach().double().cpu().item()) if hasattr(value, "detach") else float(value)
 
 
-def _blend_value(current: Any, client: Any, alpha: float) -> Any:
-    if isinstance(current, list) and isinstance(client, list):
-        if len(current) != len(client):
+def _add_local_increment(current: Any, client: Any, base: Any, alpha: float) -> Any:
+    """Add alpha * (client - immutable base), without modifying any input."""
+
+    if isinstance(current, list) and isinstance(client, list) and isinstance(base, list):
+        if len(current) != len(client) or len(current) != len(base):
             raise ValueError("LoRA tensor shapes differ")
         return [
-            _blend_value(left, right, alpha) for left, right in zip(current, client, strict=True)
+            _add_local_increment(now, local, initial, alpha)
+            for now, local, initial in zip(current, client, base, strict=True)
         ]
-    return current + alpha * (client - current)
+    if _shape(current) != _shape(client) or _shape(current) != _shape(base):
+        raise ValueError("LoRA tensor shapes differ")
+    return current + alpha * (client - base)
 
 
 def compute_functional_staleness(
@@ -858,17 +866,22 @@ class Ours(Method):
         self,
         current: Mapping[str, Any],
         client: Mapping[str, Any],
+        base: Mapping[str, Any],
         alphas: Mapping[str, float],
     ) -> LoRAState:
-        if set(current) != set(client):
-            raise ValueError("Current and client LoRA state keys differ")
+        """Apply base-relative increments with one coefficient per A/B module."""
+
+        if set(current) != set(client) or set(current) != set(base):
+            raise ValueError("Current, client and base LoRA state keys differ")
         result = clone_state(current)
         covered: set[str] = set()
         for module, metadata in self._server_metadata.items():
             alpha = float(alphas[module])
             for key in ("a_name", "b_name"):
                 name = str(metadata[key])
-                result[name] = _blend_value(current[name], client[name], alpha)
+                result[name] = _add_local_increment(
+                    current[name], client[name], base[name], alpha
+                )
                 covered.add(name)
         if covered != set(current):
             raise ValueError("Some federated parameters are outside Module-Gate LoRA modules")
@@ -958,6 +971,7 @@ class Ours(Method):
             },
             "frequency": frequency,
             "aggregation": {
+                "rule": _AGGREGATION_RULE,
                 "accepted": False,
                 "rejection_reason": None,
                 "module_alpha_by_module": {},
@@ -986,6 +1000,7 @@ class Ours(Method):
             },
         }
         common = {
+            "aggregation_rule": _AGGREGATION_RULE,
             "version_staleness": version_staleness,
             "server_drift": drift,
             "local_update": local,
@@ -1019,7 +1034,9 @@ class Ours(Method):
             )
             for module in sorted(self._server_metadata)
         }
-        new_state = self._fuse_modules(server_context.global_state, update.local_state, alphas)
+        new_state = self._fuse_modules(
+            server_context.global_state, update.local_state, update.base_state, alphas
+        )
 
         history_beta = self._value("history_beta", 0.9)
         task_memory = self.task_memory.setdefault(update.task, {})
@@ -1051,6 +1068,7 @@ class Ours(Method):
             for module in sorted(self._server_metadata)
         }
         diagnostics["aggregation"] = {
+            "rule": _AGGREGATION_RULE,
             "accepted": True,
             "rejection_reason": None,
             "frequency_weight": frequency["weight"],

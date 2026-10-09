@@ -286,3 +286,29 @@ example `bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42`.
 - Immutable partition file count, byte count, and digest.
 - The currently installed Python packages report no broken requirements; TOML parsing succeeds.
 - No training, 7B loading, model/image download, commit, or push was performed.
+
+## Ours incremental aggregation revision 2026-10-09
+
+- `ours` now applies `current + alpha_module * (client_local - client_base)`
+  to both A and B of each module. The base is the client's immutable download
+  snapshot. It no longer interpolates toward a stale endpoint.
+- Module-Gate sensitivity, functional staleness/reliability, frequency correction,
+  history memory, alpha calculation/cap, rejection handling and event ordering
+  are unchanged. Other baseline code and shared training/evaluation runners
+  were not modified in this revision.
+- New arrivals carry `aggregation.rule = base_relative_delta`; both exported
+  diagnostics CSVs contain `aggregation_rule`. Older events without this marker
+  remain unlabelled rather than being relabelled as a new experiment.
+- No method hyperparameter changed. Only changing this formula permits reuse
+  of an otherwise compatible Plan; new data or local-work settings still
+  require compatible regenerated Plans. Use a separate output/profile rather
+  than continuing an endpoint-mixing experiment under the same identity.
+- Non-training verification: 62 unit regression checks, syntax compilation,
+  Ruff lint, 39 resolved configurations, registry/profile/data integrity and
+  whitespace checks succeeded. Tests covered stale positive/negative increments,
+  fresh-update equivalence, module-specific A/B coefficients, input immutability,
+  base-key/shape mismatch, and new/legacy diagnostic exports.
+- The local check environment initially lacked the already-declared `tqdm`
+  dependency; it was installed into `.venv` before the full regression rerun.
+  Existing formatter differences were not mass-rewritten. No CUDA/PyTorch
+  execution, model loading, training, model/data download or GitHub push occurred.

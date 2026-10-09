@@ -80,6 +80,7 @@ def export_diagnostics(
                 "base_version": client["base_version"],
                 "receive_version": client["receive_version"],
                 "server_version_after": event.get("server_version_after"),
+                "aggregation_rule": aggregation.get("rule", ""),
             }
             update_rows.append(
                 {

@@ -563,7 +563,9 @@ python tools/estimate_task_compute_factors.py \
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
-- `ours`：Module-Gate 敏感度感知异步 LoRA 聚合；在每个真实 optimizer step 读取整个 LoRA 模块的 gate 梯度，使用绝对值时间平均、客户端内均值归一化与均匀下限，结合完整模块 `BA` 功能陈旧度、直接由客户端敏感度更新的分任务历史记忆、成功聚合窗口上的任务频率校正和模块级共享 A/B 融合；不增加训练参数，也不使用 SVD。
+- `ours`：Module-Gate 敏感度感知异步 LoRA 聚合；在每个真实 optimizer step 读取整个 LoRA 模块的 gate 梯度，使用绝对值时间平均、客户端内均值归一化与均匀下限，结合完整模块 `BA` 功能陈旧度、直接由客户端敏感度更新的分任务历史记忆和成功聚合窗口上的任务频率校正。聚合使用模块级共享 A/B 系数的增量式更新：`theta_server += alpha_module * (theta_client - theta_base)`；`theta_base` 是该客户端开始训练时的不可变下载快照，不是当前服务器参数。不增加训练参数，也不使用 SVD。
+
+仅切换 `ours` 的聚合公式不需要改变 Plan；数据分区、batch、epochs 和系统参数均一致时可以复用同一 Plan，但应使用新 profile/输出目录区分实验。若同时换到 Grounding-8k 数据，则不能复用旧数据分区的 Plan。α 的计算、训练和评估流程不变；历史精度在新公式中约束增量幅度，不再解释为两个模型端点的精度加权融合。详见 [方法说明](docs/ours.md)。
 
 ### 观察 `ours` 是否正常工作
 
@@ -577,6 +579,7 @@ python tools/estimate_task_compute_factors.py \
 - `sensitivity.observations_by_module`、分布摘要和 top module；
 - `functional_staleness`：版本陈旧度、server drift、local update、相对功能陈旧度、可靠度函数及 gamma；
 - `aggregation.module_alpha_by_module`：每个模块实际使用的共享 A/B 聚合系数；
+- `aggregation.rule`：新版本记录为 `base_relative_delta`，导出 CSV 时对应 `aggregation_rule`；旧日志缺少标记时留空，不改写旧实验含义；
 - `frequency`：聚合前窗口计数、本次任务权重，以及成功聚合后的窗口计数；
 - `memory`：当前任务的原始/偏差修正记忆、接受次数和跨任务历史精度在聚合前后的值；
 - rejected update 的拒绝原因和未变化的 memory。

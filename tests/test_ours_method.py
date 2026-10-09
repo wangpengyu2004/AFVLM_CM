@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import copy
 import math
 import unittest
 
 from afl_vlm.federation.types import ClientSpec, ServerContext, Update
 from afl_vlm.methods.ours import (
     Ours,
+    _add_local_increment,
     _gate_direction,
     _normalize_module_sensitivity,
     compute_functional_staleness,
@@ -168,6 +170,7 @@ class OursMethodTests(unittest.TestCase):
         self.assertEqual(diagnostics["schema_version"], 4)
         self.assertEqual(diagnostics["method_variant"], "module_gate")
         self.assertTrue(diagnostics["aggregation"]["accepted"])
+        self.assertEqual(diagnostics["aggregation"]["rule"], "base_relative_delta")
         self.assertEqual(diagnostics["sensitivity"]["module_by_module"][MODULE], 1.0)
         self.assertEqual(
             diagnostics["sensitivity"]["observations_by_module"][MODULE], 2
@@ -196,6 +199,68 @@ class OursMethodTests(unittest.TestCase):
         self.assertAlmostEqual(stale_mutation.metadata["relative_staleness"], 4.0)
         self.assertAlmostEqual(stale_mutation.metadata["reliability"], math.exp(-4.0))
         self.assertLess(stale_mutation.applied_weight, fresh_mutation.applied_weight)
+
+    def test_stale_update_adds_base_relative_increment_without_server_rollback(self) -> None:
+        method = self.configured()
+        incoming = update(local_a=1.2, local_b=0.8, base_a=1.0, base_b=1.0)
+        current = state(2.0, 0.55)
+        before = copy.deepcopy((current, incoming.base_state, incoming.local_state, incoming.delta))
+
+        mutation = method.on_arrival(incoming, ServerContext(current, 3, 2))[0]
+        alpha = mutation.metadata["module_alphas"][MODULE]
+
+        self.assertGreater(alpha, 0.0)
+        self.assertEqual(mutation.metadata["aggregation_rule"], "base_relative_delta")
+        for name, initial, increment in ((A, 2.0, 0.2), (B, 0.55, -0.2)):
+            for row in mutation.new_state[name]:
+                for value in row:
+                    self.assertAlmostEqual(value, initial + alpha * increment)
+        self.assertGreater(mutation.new_state[A][0][0], current[A][0][0])
+        self.assertNotAlmostEqual(mutation.new_state[A][0][0], 2.0 + alpha * (1.2 - 2.0))
+        self.assertEqual(
+            (current, incoming.base_state, incoming.local_state, incoming.delta), before
+        )
+
+    def test_fresh_nonzero_base_is_equivalent_to_endpoint_interpolation(self) -> None:
+        method = self.configured()
+        incoming = update(local_a=1.2, local_b=0.8, base_a=1.0, base_b=1.0)
+        current = state(1.0)
+        mutation = method.on_arrival(incoming, ServerContext(current, 0, 2))[0]
+        alpha = mutation.metadata["module_alphas"][MODULE]
+
+        for name in (A, B):
+            for row, values in enumerate(mutation.new_state[name]):
+                for column, value in enumerate(values):
+                    expected = (
+                        (1.0 - alpha) * current[name][row][column]
+                        + alpha * incoming.local_state[name][row][column]
+                    )
+                    self.assertAlmostEqual(value, expected)
+
+    def test_each_module_increment_uses_its_own_shared_a_b_alpha(self) -> None:
+        method = self.configured()
+        other = "base_model.model.layers.1.self_attn.v_proj"
+        other_a = f"{other}.lora_A.default.weight"
+        other_b = f"{other}.lora_B.default.weight"
+        method._server_metadata[other] = {
+            **metadata()[MODULE], "a_name": other_a, "b_name": other_b
+        }
+        current = {**state(3.0), other_a: [[5.0, 5.0]] * 2, other_b: [[5.0, 5.0]] * 2}
+        base = {**state(1.0), other_a: [[2.0, 2.0]] * 2, other_b: [[2.0, 2.0]] * 2}
+        local = {**state(2.0), other_a: [[4.0, 4.0]] * 2, other_b: [[4.0, 4.0]] * 2}
+        result = method._fuse_modules(current, local, base, {MODULE: 0.2, other: 0.4})
+
+        for name in (A, B):
+            self.assertEqual(result[name], [[3.2, 3.2], [3.2, 3.2]])
+        for name in (other_a, other_b):
+            self.assertEqual(result[name], [[5.8, 5.8], [5.8, 5.8]])
+
+    def test_increment_rejects_mismatched_base_keys_and_shapes(self) -> None:
+        method = self.configured()
+        with self.assertRaisesRegex(ValueError, "state keys differ"):
+            method._fuse_modules(state(2.0), state(1.0), {A: [[0.0]]}, {MODULE: 0.5})
+        with self.assertRaisesRegex(ValueError, "tensor shapes differ"):
+            _add_local_increment([[2.0, 2.0]], [[1.0, 1.0]], [[0.0]], 0.5)
 
     def test_history_memory_uses_sensitivity_without_reliability(self) -> None:
         method = self.configured()
@@ -245,6 +310,7 @@ class OursMethodTests(unittest.TestCase):
         self.assertEqual(mutation.metadata["rejected"], "no_effective_update")
         diagnostics = mutation.metadata["ours_diagnostics"]
         self.assertFalse(diagnostics["aggregation"]["accepted"])
+        self.assertEqual(diagnostics["aggregation"]["rule"], "base_relative_delta")
         self.assertEqual(
             diagnostics["aggregation"]["rejection_reason"], "no_effective_update"
         )
