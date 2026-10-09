@@ -748,9 +748,11 @@ FedCompass/同步方法则按本次分组或轮次包含的客户端数推进。
 所有 baseline 与 `ours` 固定调用同一个 FCIT-compatible evaluator，不允许方法覆盖任务指标：
 
 - ImageNet-R、AOKVQA：去除首尾空白后忽略大小写的 exact match，输出百分比；
-- DVQA、FigureQA：沿用 FCIT 的 `prediction in reference`（忽略大小写）规则，输出百分比；
+- DVQA、FigureQA：使用去除首尾空白、忽略大小写的完整答案 exact match，空白预测始终计错，输出百分比。该规则修正原 FCIT 子串匹配会将空答案和部分答案误计为正确的问题；
 - Flickr30k：对每图五个参考 caption 调用 `pycocoevalcap`，报告 BLEU-1..4、METEOR、ROUGE-L、CIDEr 以及七项的 `FCIT_caption_average`，均为原始 scorer 值乘 100；
 - Grounding：每个 query 单独解码，严格以 `IoU > 0.5` 计正确并输出百分比，同时额外保留 0--1 范围的 `mean_IoU`。
+
+DVQA、FigureQA 的旧子串匹配结果与新 exact-match 结果不能直接混用；论文比较时所有方法必须使用同一新规则重新评估。此修复只改变判分，不改变训练、数据分区或 TrainPlan，已有最终检查点可复评。
 
 默认 `generation_max_new_tokens: 128` 与 FCIT 推理长度一致，`generate()` 使用确定性 greedy decoding。任务间指标量纲不同，因此不生成没有意义的六任务 raw average。
 

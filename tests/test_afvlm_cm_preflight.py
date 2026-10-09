@@ -219,7 +219,7 @@ class AFVLMPreflightTests(unittest.TestCase):
 
             self.assertEqual(cls.metric([" cat "], ["CAT"]), {"accuracy": 100.0})
             self.assertEqual(
-                reasoning.metric(["A"], ["The answer is A"]),
+                reasoning.metric([" yes "], ["YES"]),
                 {"answer_accuracy": 100.0},
             )
             metrics = grounding.metric(
@@ -228,6 +228,33 @@ class AFVLMPreflightTests(unittest.TestCase):
             )
             self.assertEqual(metrics["mean_IoU"], 0.5)
             self.assertEqual(metrics["IoU@0.5_accuracy"], 50.0)
+
+    def test_chart_and_reasoning_require_complete_nonempty_answers(self) -> None:
+        common = {"partition_dir": ".", "image_root": ".", "require_images": False}
+        cases = (
+            ("", "yes", 0.0),
+            (" \t\n", "yes", 0.0),
+            ("", "", 0.0),
+            ("e", "yes", 0.0),
+            ("1", "10", 0.0),
+            ("no", "none", 0.0),
+            ("yes and no", "yes", 0.0),
+            (" Yes ", "YES", 100.0),
+            (" NO ", "no", 100.0),
+            ("10", " 10 ", 100.0),
+        )
+        for task in ("chart_vqa", "visual_reasoning"):
+            adapter = AFVLMTaskAdapter(task, common)
+            for prediction, reference, expected in cases:
+                with self.subTest(task=task, prediction=prediction, reference=reference):
+                    self.assertEqual(
+                        adapter.metric([prediction], [reference]),
+                        {"answer_accuracy": expected},
+                    )
+            self.assertEqual(
+                adapter.metric(["yes", "", "1", " no "], ["YES", "yes", "10", "NO"]),
+                {"answer_accuracy": 50.0},
+            )
 
     def test_caption_passes_five_references_to_shared_coco_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

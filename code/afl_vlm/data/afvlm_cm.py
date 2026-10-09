@@ -427,8 +427,11 @@ class AFVLMTaskAdapter(TaskAdapter):
             }
         normalized_references = [str(reference) for reference in references]
         if self.task_key in {"chart_vqa", "visual_reasoning"}:
+            # Exact answers prevent empty strings and partial numeric/text
+            # fragments from receiving credit under substring matching.
             correct = sum(
-                _fcit_text(prediction) in _fcit_text(reference)
+                bool(_fcit_text(prediction))
+                and _fcit_text(prediction) == _fcit_text(reference)
                 for prediction, reference in zip(
                     predictions, normalized_references, strict=True
                 )

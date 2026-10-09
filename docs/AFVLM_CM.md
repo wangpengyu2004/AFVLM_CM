@@ -90,12 +90,17 @@ within each fixed task on the same common held-out split.
 All methods call one shared FCIT-compatible evaluator:
 
 - ImageNet-R and transformed AOKVQA use stripped, case-insensitive exact match;
-- DVQA and FigureQA retain FCIT's stripped, case-insensitive
-  `prediction in reference` rule;
+- DVQA and FigureQA use stripped, case-insensitive exact match, with empty
+  predictions always incorrect. This corrects FCIT's substring rule, which can
+  incorrectly credit empty predictions and incomplete answers;
 - Flickr30k uses `pycocoevalcap` over five references and reports BLEU-1--4,
   METEOR, ROUGE-L, CIDEr, and their FCIT average (all multiplied by 100);
 - Grounding reports FCIT's strict `IoU > 0.5` accuracy in percent and the
   additional raw mean IoU requested for AFVLM-CM.
+
+Results from the former DVQA/FigureQA substring rule must be re-evaluated with
+the same corrected rule for all methods before comparison. Existing model
+checkpoints and TrainPlans remain usable because only scoring changes.
 
 It records protocol, split, server version, incorporated-client-update
 milestones, actual evaluation progress, virtual time, and a metric
