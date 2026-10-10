@@ -93,6 +93,21 @@ class OursDiagnosticsExportTests(unittest.TestCase):
                 "historical_precision_after": {module: 1.075},
                 "task_memory_before_summary": {"mean": 0.1},
                 "task_memory_after_summary": {"mean": 0.15},
+                "historical_precision_unweighted_before": {module: 1.0},
+                "historical_precision_unweighted_after": {module: 1.0},
+                "history_age_before": {
+                    "enabled": True, "boost": 1.0, "time_scale": 18.0,
+                    "accepted_updates": 2, "finished_at": {"cls": 1},
+                    "pending_updates": {"cls": 0, "vqa": 2},
+                    "age_by_task": {"cls": 1, "vqa": 0},
+                    "weight_by_task": {"cls": 1.05, "vqa": 1.0},
+                },
+                "history_age_after": {
+                    "accepted_updates": 3, "finished_at": {"cls": 1},
+                    "pending_updates": {"cls": 0, "vqa": 1},
+                    "age_by_task": {"cls": 2, "vqa": 0},
+                    "weight_by_task": {"cls": 1.1, "vqa": 1.0},
+                },
             },
         }
         event = {
@@ -123,14 +138,35 @@ class OursDiagnosticsExportTests(unittest.TestCase):
             self.assertEqual(module_rows[0]["signed_gate_mean"], "-1.0")
             self.assertEqual(module_rows[0]["gate_direction"], "0.5")
             self.assertEqual(module_rows[0]["module_alpha"], "0.2")
+            self.assertEqual(update_rows[0]["history_age_enabled"], "True")
+            self.assertEqual(update_rows[0]["history_accepted_updates_after"], "3")
+            self.assertEqual(
+                json.loads(update_rows[0]["history_task_weights_before"]),
+                {"cls": 1.05, "vqa": 1.0},
+            )
+            self.assertEqual(
+                json.loads(update_rows[0]["history_tasks_finished_at_after"]), {"cls": 1}
+            )
+            self.assertEqual(module_rows[0]["historical_precision_unweighted_before"], "1.0")
 
             # Old events lack the additive rule label; do not mislabel their semantics.
             diagnostics["aggregation"].pop("rule")
+            for key in (
+                "history_age_before", "history_age_after",
+                "historical_precision_unweighted_before", "historical_precision_unweighted_after",
+            ):
+                diagnostics["memory"].pop(key)
             events.write_text(json.dumps(event) + "\n", encoding="utf-8")
             legacy = export_diagnostics(events, root / "legacy")
             for key in ("update_csv", "module_csv"):
                 with Path(legacy[key]).open(encoding="utf-8-sig", newline="") as handle:
-                    self.assertEqual(next(csv.DictReader(handle))["aggregation_rule"], "")
+                    row = next(csv.DictReader(handle))
+                    self.assertEqual(row["aggregation_rule"], "")
+                    field = (
+                        "history_task_weights_before" if key == "update_csv"
+                        else "historical_precision_unweighted_before"
+                    )
+                    self.assertEqual(row[field], "")
 
     def test_ignores_only_an_incomplete_trailing_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

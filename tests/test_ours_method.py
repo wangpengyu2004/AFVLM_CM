@@ -4,7 +4,8 @@ import copy
 import math
 import unittest
 
-from afl_vlm.federation.types import ClientSpec, ServerContext, Update
+from afl_vlm.federation.server import FederatedServer
+from afl_vlm.federation.types import ClientSpec, ScheduledEvent, ServerContext, Update
 from afl_vlm.methods.ours import (
     Ours,
     _add_local_increment,
@@ -391,6 +392,249 @@ class OursMethodTests(unittest.TestCase):
         method = Ours()
         with self.assertRaisesRegex(ValueError, "LoRA-only"):
             method.configure_server({"mm_projector.weight": [[0.0]]}, [client("c", "vqa")])
+
+
+class TemporalHistoryTests(unittest.TestCase):
+    def configured(
+        self,
+        jobs: list[tuple[str, str, int]] | None = None,
+        **params: object,
+    ) -> Ours:
+        method = Ours({
+            "history_age_enabled": True,
+            "history_age_boost": 1.0,
+            "history_age_time_scale": 2.0,
+            **params,
+        })
+        method.configure_server(state(0.0), [
+            client("vqa/client_0", "vqa"),
+            client("vqa/client_1", "vqa"),
+            client("cls/client_0", "cls"),
+        ])
+        jobs = jobs if jobs is not None else [
+            ("vqa", "vqa/client_0", 0),
+            ("cls", "cls/client_0", 0),
+            ("cls", "cls/client_0", 1),
+            ("cls", "cls/client_0", 2),
+        ]
+        method.configure_schedule([
+            ScheduledEvent(
+                event_id=index, client_id=client_id, task=task, dataset=task,
+                local_round=local_round, start_time=float(index),
+                arrival_time=float(index + 1), speed_factor=1.0,
+                estimated_train_time=1.0, network_delay=0.0, local_steps=1,
+            )
+            for index, (task, client_id, local_round) in enumerate(jobs)
+        ])
+        return method
+
+    def incoming(self, task: str, local_round: int = 0, **kwargs: object) -> Update:
+        incoming = update(task=task, **kwargs)
+        incoming.local_round = local_round
+        incoming.update_id = f"{incoming.client_id}-r{local_round}"
+        return incoming
+
+    def test_retirement_waits_for_all_clients_and_out_of_order_rounds(self) -> None:
+        method = self.configured([
+            ("vqa", "vqa/client_0", 0),
+            ("vqa", "vqa/client_0", 1),
+            ("vqa", "vqa/client_1", 0),
+            ("cls", "cls/client_0", 0),
+        ])
+        server = FederatedServer(None, method, 3, initial_state=state(0.0))
+        server.receive(self.incoming("vqa", 1))
+        self.assertNotIn("vqa", method.task_finished_at)
+        server.receive(self.incoming("vqa", client_id="vqa/client_1"))
+        self.assertEqual(method.task_pending_updates["vqa"], 1)
+        self.assertEqual(method._task_history_age_weight("vqa"), 1.0)
+        server.receive(self.incoming("vqa"))
+        self.assertEqual(method.task_finished_at["vqa"], server.accepted_updates)
+        self.assertEqual(method._task_history_age_weight("vqa"), 1.0)
+        self.assertEqual(method.task_pending_updates["cls"], 1)
+
+    def test_only_completed_task_weight_grows_with_successful_update_age(self) -> None:
+        method = self.configured()
+        server = FederatedServer(None, method, 3, initial_state=state(0.0))
+        server.receive(self.incoming("vqa"))
+        vqa_memory = copy.deepcopy(method.task_memory["vqa"])
+        first = server.receive(self.incoming("cls"))[0].metadata["ours_diagnostics"]
+        self.assertEqual(first["memory"]["history_age_before"]["weight_by_task"]["vqa"], 1.0)
+        expected = 1.0 + (1.0 - math.exp(-0.5))
+        self.assertAlmostEqual(method._task_history_age_weight("vqa"), expected)
+        self.assertEqual(method._task_history_age_weight("cls"), 1.0)
+        second = server.receive(self.incoming("cls", 1))[0].metadata["ours_diagnostics"]
+        self.assertAlmostEqual(
+            second["memory"]["history_age_before"]["weight_by_task"]["vqa"], expected
+        )
+        self.assertEqual(method.task_memory["vqa"], vqa_memory)
+        self.assertEqual(method.task_weights, {"cls": 0.5, "vqa": 0.5})
+        self.assertEqual(method.history_accepted_updates, server.accepted_updates)
+        self.assertGreater(
+            second["memory"]["historical_precision_before"][MODULE],
+            second["memory"]["historical_precision_unweighted_before"][MODULE],
+        )
+
+    def test_weighted_precision_does_not_renormalize_or_scale_base(self) -> None:
+        method = self.configured(history_strength=2.0, base_precision=3.0)
+        method.task_memory = {"vqa": {MODULE: 0.2}, "cls": {MODULE: 0.4}}
+        method.task_memory_counts = {"vqa": 1, "cls": 1}
+        method.task_finished_at = {"vqa": 0}
+        method.history_accepted_updates = 2
+        weight = 1.0 + (1.0 - math.exp(-1.0))
+        self.assertAlmostEqual(method._historical_precision(MODULE), 3.0 + 2.0 * (weight + 2.0))
+        self.assertAlmostEqual(method._historical_precision(MODULE, apply_age_weight=False), 9.0)
+        method.history_accepted_updates = 10**9
+        self.assertAlmostEqual(method._task_history_age_weight("vqa"), 2.0)
+
+    def test_rejected_terminal_job_retires_task_without_advancing_clock(self) -> None:
+        method = self.configured()
+        server = FederatedServer(None, method, 3, initial_state=state(0.0))
+        rejected = server.receive(self.incoming("vqa", local_a=0.0))[0]
+        self.assertEqual(method.task_finished_at["vqa"], 0)
+        self.assertEqual(method.history_accepted_updates, 0)
+        self.assertEqual(method.task_memory_counts["vqa"], 0)
+        self.assertEqual(method.task_frequency_window, [])
+        self.assertEqual(
+            rejected.metadata["ours_diagnostics"]["memory"]["history_age_after"]["finished_at"],
+            {"vqa": 0},
+        )
+        server.receive(self.incoming("cls"))
+        age = method.history_accepted_updates
+        precision = method._historical_precision(MODULE)
+        server.receive(self.incoming("cls", 1, local_a=0.0))
+        self.assertEqual(method.history_accepted_updates, age)
+        self.assertEqual(method.history_accepted_updates, server.accepted_updates)
+        self.assertAlmostEqual(method._historical_precision(MODULE), precision)
+
+    def test_disabled_and_zero_boost_match_original_alpha_memory_and_frequency(self) -> None:
+        original = self.configured(history_age_enabled=False)
+        zero_boost = self.configured(history_age_boost=0.0)
+        original_server = FederatedServer(None, original, 3, initial_state=state(0.0))
+        zero_server = FederatedServer(None, zero_boost, 3, initial_state=state(0.0))
+        for task, local_round in (("vqa", 0), ("cls", 0), ("cls", 1), ("cls", 2)):
+            left = original_server.receive(self.incoming(task, local_round))[0]
+            right = zero_server.receive(self.incoming(task, local_round))[0]
+            self.assertEqual(left.applied_weight, right.applied_weight)
+            self.assertEqual(original_server.state, zero_server.state)
+            self.assertEqual(original.task_memory, zero_boost.task_memory)
+            self.assertEqual(original.task_frequency_window, zero_boost.task_frequency_window)
+
+    def test_temporal_state_round_trip_preserves_next_aggregation(self) -> None:
+        method = self.configured()
+        server = FederatedServer(None, method, 3, initial_state=state(0.0))
+        server.receive(self.incoming("vqa"))
+        server.receive(self.incoming("cls"))
+        saved = method.state_dict()
+        restored = Ours()
+        restored.load_state_dict(saved)
+        self.assertEqual(restored.state_dict(), saved)
+        self.assertEqual(restored.task_pending_updates, method.task_pending_updates)
+        left = method.on_arrival(self.incoming("cls", 1), server.context())[0]
+        right = restored.on_arrival(self.incoming("cls", 1), server.context())[0]
+        self.assertEqual(left.new_state, right.new_state)
+        self.assertEqual(left.metadata, right.metadata)
+
+    def test_legacy_checkpoint_keeps_age_disabled_and_missing_enabled_state_fails(self) -> None:
+        method = self.configured(history_age_enabled=False)
+        saved = method.state_dict()
+        saved.pop("history_age_state")
+        saved["params"].pop("history_age_enabled")
+        restored = Ours()
+        restored.load_state_dict(saved)
+        self.assertEqual(restored._task_history_age_weight("vqa"), 1.0)
+        saved["params"]["history_age_enabled"] = True
+        with self.assertRaisesRegex(ValueError, "missing history_age_state"):
+            Ours().load_state_dict(saved)
+
+    def test_enabled_requires_exact_plan_and_refuses_duplicate_arrivals(self) -> None:
+        method = self.configured()
+        with self.assertRaisesRegex(ValueError, "absent"):
+            method.on_arrival(self.incoming("cls", 99), ServerContext(state(0.0), 0, 3))
+        method.on_arrival(self.incoming("vqa"), ServerContext(state(0.0), 0, 3))
+        with self.assertRaisesRegex(ValueError, "already resolved"):
+            method.on_arrival(self.incoming("vqa"), ServerContext(state(0.0), 1, 3))
+        method.history_planned_jobs = {}
+        with self.assertRaisesRegex(RuntimeError, "configure_schedule"):
+            method.on_arrival(self.incoming("cls"), ServerContext(state(0.0), 1, 3))
+
+    def test_invalid_temporal_parameters_and_checkpoint_are_rejected(self) -> None:
+        for key, value in (
+            ("history_age_enabled", "true"),
+            ("history_age_boost", -1),
+            ("history_age_time_scale", 0),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                Ours({key: value})
+        method = self.configured()
+        method.on_arrival(self.incoming("vqa"), ServerContext(state(0.0), 0, 3))
+        saved = method.state_dict()
+        saved["history_age_state"]["finished_at"]["vqa"] = 2
+        with self.assertRaisesRegex(ValueError, "completion time"):
+            Ours().load_state_dict(saved)
+
+    def test_other_methods_schedule_hook_leaves_algorithm_state_unchanged(self) -> None:
+        from afl_vlm.methods.registry import create_method, method_names
+
+        for name in method_names():
+            if name == "ours":
+                continue
+            with self.subTest(method=name):
+                baseline = create_method(name)
+                before = copy.deepcopy(baseline.state_dict())
+                baseline.configure_schedule([])
+                self.assertEqual(baseline.state_dict(), before)
+
+    def test_reconfigured_schedule_preserves_completion_and_rejects_different_plan(self) -> None:
+        method = self.configured()
+        method.on_arrival(self.incoming("vqa"), ServerContext(state(0.0), 0, 3))
+        restored = Ours()
+        restored.load_state_dict(method.state_dict())
+        restored.configure_server(state(0.0), [
+            client("vqa/client_0", "vqa"), client("cls/client_0", "cls"),
+        ])
+        events = [
+            ScheduledEvent(
+                event_id=index, client_id=client_id, task=task, dataset=task,
+                local_round=local_round, start_time=0.0, arrival_time=1.0,
+                speed_factor=1.0, estimated_train_time=1.0, network_delay=0.0, local_steps=1,
+            )
+            for index, ((client_id, local_round), task) in enumerate(
+                method.history_planned_jobs.items()
+            )
+        ]
+        original_events = copy.deepcopy(events)
+        restored.configure_schedule(events)
+        self.assertEqual(restored.task_finished_at, method.task_finished_at)
+        self.assertEqual(restored.task_pending_updates, method.task_pending_updates)
+        self.assertEqual(events, original_events)
+        with self.assertRaisesRegex(ValueError, "differs"):
+            restored.configure_schedule(events[:-1])
+
+    def test_age_only_changes_precision_and_increment_coefficient(self) -> None:
+        enhanced = self.configured()
+        original = self.configured(history_age_enabled=False)
+        enhanced_server = FederatedServer(None, enhanced, 3, initial_state=state(0.0))
+        original_server = FederatedServer(None, original, 3, initial_state=state(0.0))
+        for task in ("vqa", "cls"):
+            enhanced_server.receive(self.incoming(task))
+            original_server.receive(self.incoming(task))
+        self.assertEqual(enhanced_server.state, original_server.state)
+        before = copy.deepcopy(enhanced_server.state)
+        incoming = self.incoming("cls", 1)
+        changed = enhanced_server.receive(copy.deepcopy(incoming))[0]
+        unchanged = original_server.receive(copy.deepcopy(incoming))[0]
+        self.assertLess(changed.applied_weight, unchanged.applied_weight)
+        for field in ("reliability", "frequency_weight", "relative_staleness"):
+            self.assertEqual(changed.metadata[field], unchanged.metadata[field])
+        self.assertEqual(enhanced.task_memory, original.task_memory)
+        self.assertEqual(enhanced.task_memory_counts, original.task_memory_counts)
+        self.assertEqual(enhanced.task_frequency_window, original.task_frequency_window)
+        alpha = changed.metadata["module_alphas"][MODULE]
+        for name in (A, B):
+            self.assertAlmostEqual(
+                enhanced_server.state[name][0][0],
+                before[name][0][0] + alpha * incoming.delta[name][0][0],
+            )
 
 
 if __name__ == "__main__":

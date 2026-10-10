@@ -434,6 +434,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "The persisted TrainPlan does not match the system profile task compute factors"
             )
+    method.configure_schedule(plan)
     records = event_records(plan)
     _write_json(output / "train_plan.json", records)
     record_by_event = {int(item["event_id"]): item for item in records}

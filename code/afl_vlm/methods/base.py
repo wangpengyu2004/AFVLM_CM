@@ -11,6 +11,7 @@ from typing import Any
 from afl_vlm.federation.types import (
     ClientContext,
     MethodCapabilities,
+    ScheduledEvent,
     ServerContext,
     ServerMutation,
     Update,
@@ -51,6 +52,10 @@ class Method(ABC):
 
     def configure_server(self, initial_state: LoRAState, clients: list[Any]) -> None:
         """Initialize server-only algorithm state without requiring a GPU model."""
+        return None
+
+    def configure_schedule(self, events: list[ScheduledEvent]) -> None:
+        """Observe the final virtual Plan without changing scheduling or local work."""
         return None
 
     def validate_runtime(self) -> None:

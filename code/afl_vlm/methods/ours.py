@@ -18,7 +18,13 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from afl_vlm.federation.types import MethodCapabilities, ServerContext, ServerMutation, Update
+from afl_vlm.federation.types import (
+    MethodCapabilities,
+    ScheduledEvent,
+    ServerContext,
+    ServerMutation,
+    Update,
+)
 from afl_vlm.methods.base import Method
 from afl_vlm.methods.registry import register_method
 from afl_vlm.models.base import LoRAState, clone_state
@@ -553,6 +559,9 @@ class Ours(Method):
         "history_beta",
         "history_lambda",
         "history_strength",
+        "history_age_enabled",
+        "history_age_boost",
+        "history_age_time_scale",
         "base_precision",
         "alpha_max",
         "eps",
@@ -565,6 +574,12 @@ class Ours(Method):
         self.task_memory_counts: dict[str, int] = {}
         self.task_weights: dict[str, float] = {}
         self.task_frequency_window: list[str] = []
+        self.history_accepted_updates = 0
+        self.history_planned_jobs: dict[tuple[str, int], str] = {}
+        self.history_resolved_jobs: set[tuple[str, int]] = set()
+        self.task_pending_updates: dict[str, int] = {}
+        self.task_finished_at: dict[str, int] = {}
+        self._client_tasks: dict[str, str] = {}
         self._server_metadata: dict[str, dict[str, Any]] = {}
         self._model_metadata: dict[str, dict[str, Any]] = {}
         self._tracker: ModuleSensitivityTracker | None = None
@@ -616,6 +631,14 @@ class Ours(Method):
         history_strength = self._value("history_strength", 1.0)
         if not math.isfinite(history_strength) or history_strength < 0.0:
             raise ValueError("history_strength must be finite and non-negative")
+        if not isinstance(self.params.get("history_age_enabled", False), bool):
+            raise ValueError("history_age_enabled must be boolean")
+        history_age_boost = self._value("history_age_boost", 1.0)
+        if not math.isfinite(history_age_boost) or history_age_boost < 0.0:
+            raise ValueError("history_age_boost must be finite and non-negative")
+        history_age_time_scale = self._value("history_age_time_scale", 18.0)
+        if not math.isfinite(history_age_time_scale) or history_age_time_scale <= 0.0:
+            raise ValueError("history_age_time_scale must be finite and positive")
         if self._value("alpha_max", 0.5) > 1.0:
             raise ValueError("alpha_max must be <= 1")
 
@@ -659,6 +682,7 @@ class Ours(Method):
         if not tasks:
             raise ValueError("Module-Gate requires client task identities")
         self.task_weights = {task: 1.0 / len(tasks) for task in tasks}
+        self._client_tasks = {str(client.id): str(client.task) for client in clients}
         self.task_memory = {
             task: {
                 module: float(self.task_memory.get(task, {}).get(module, 0.0))
@@ -679,6 +703,90 @@ class Ours(Method):
             self.params.get("frequency_window_size", 18)
         ):
             raise ValueError("Task-frequency window exceeds frequency_window_size")
+
+    def configure_schedule(self, events: list[ScheduledEvent]) -> None:
+        """Track exact virtual jobs; GPU completion and silence never retire a task."""
+
+        if not self.params.get("history_age_enabled", False):
+            return
+        jobs: dict[tuple[str, int], str] = {}
+        for event in events:
+            job = (event.client_id, event.local_round)
+            if job in jobs:
+                raise ValueError(f"Duplicate temporal-history Plan job: {job}")
+            if event.local_round < 0 or self._client_tasks.get(event.client_id) != event.task:
+                raise ValueError(f"Invalid temporal-history Plan job: {job}")
+            jobs[job] = event.task
+        if not jobs or set(jobs.values()) != set(self.task_weights):
+            raise ValueError("Temporal-history Plan must contain every configured task")
+        if self.history_planned_jobs and jobs != self.history_planned_jobs:
+            raise ValueError("Temporal-history checkpoint Plan differs from the current Plan")
+        self.history_planned_jobs = jobs
+        self.task_pending_updates = {
+            task: sum(
+                known_task == task and job not in self.history_resolved_jobs
+                for job, known_task in jobs.items()
+            )
+            for task in self.task_weights
+        }
+
+    def _validate_history_arrival(self, update: Update) -> None:
+        if not self.params.get("history_age_enabled", False):
+            return
+        if not self.history_planned_jobs:
+            raise RuntimeError("Temporal history requires configure_schedule before aggregation")
+        job = (update.client_id, update.local_round)
+        if self.history_planned_jobs.get(job) != update.task:
+            raise ValueError(f"Update is absent from the temporal-history Plan: {job}")
+        if job in self.history_resolved_jobs:
+            raise ValueError(f"Temporal-history Plan job was already resolved: {job}")
+
+    def _task_history_age_weight(self, task: str) -> float:
+        if not self.params.get("history_age_enabled", False) or task not in self.task_finished_at:
+            return 1.0
+        age = self.history_accepted_updates - self.task_finished_at[task]
+        return 1.0 + self._value("history_age_boost", 1.0) * (
+            -math.expm1(-age / self._value("history_age_time_scale", 18.0))
+        )
+
+    def _history_age_diagnostics(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.params.get("history_age_enabled", False)),
+            "clock": "accepted_client_updates",
+            "accepted_updates": self.history_accepted_updates,
+            "boost": self._value("history_age_boost", 1.0),
+            "time_scale": self._value("history_age_time_scale", 18.0),
+            "finished_at": dict(self.task_finished_at),
+            "pending_updates": dict(self.task_pending_updates),
+            "age_by_task": {
+                task: self.history_accepted_updates - self.task_finished_at[task]
+                if task in self.task_finished_at else 0
+                for task in sorted(self.task_weights)
+            },
+            "weight_by_task": {
+                task: self._task_history_age_weight(task) for task in sorted(self.task_weights)
+            },
+        }
+
+    def _finish_history_arrival(
+        self, update: Update, accepted: bool, diagnostics: dict[str, Any]
+    ) -> None:
+        """Resolve an arrival once; only successful aggregation advances the clock."""
+
+        if accepted:
+            self.history_accepted_updates += 1
+        if self.params.get("history_age_enabled", False):
+            job = (update.client_id, update.local_round)
+            self.history_resolved_jobs.add(job)
+            self.task_pending_updates[update.task] -= 1
+            if self.task_pending_updates[update.task] == 0:
+                self.task_finished_at[update.task] = self.history_accepted_updates
+        memory = diagnostics["memory"]
+        memory["history_age_after"] = self._history_age_diagnostics()
+        memory["historical_precision_unweighted_after"] = {
+            module: self._historical_precision(module, apply_age_weight=False)
+            for module in sorted(self._server_metadata)
+        }
 
     def client_runtime_state(self, context: Any) -> dict[str, Any]:
         return {"reset_module_sensitivity_for": context.client_id}
@@ -803,9 +911,11 @@ class Ours(Method):
             correction, self._value("eps", 1e-12)
         )
 
-    def _historical_precision(self, module: str) -> float:
+    def _historical_precision(self, module: str, *, apply_age_weight: bool = True) -> float:
         memory = sum(
-            weight * self._corrected_task_memory(task, module)
+            weight
+            * (self._task_history_age_weight(task) if apply_age_weight else 1.0)
+            * self._corrected_task_memory(task, module)
             for task, weight in self.task_weights.items()
         )
         return self._value("base_precision", 1.0) + self._value(
@@ -894,6 +1004,7 @@ class Ours(Method):
         reason: str,
         metadata: Mapping[str, Any],
     ) -> list[ServerMutation]:
+        self._finish_history_arrival(update, False, metadata["ours_diagnostics"])
         return [
             ServerMutation(
                 clone_state(context.global_state),
@@ -905,6 +1016,7 @@ class Ours(Method):
         ]
 
     def on_arrival(self, update: Update, server_context: ServerContext) -> list[ServerMutation]:
+        self._validate_history_arrival(update)
         if not update.metadata.get("_module_gate_validated"):
             self._validate_client_update(update)
         if update.task not in self.task_weights:
@@ -934,6 +1046,11 @@ class Ours(Method):
         task_memory_count_before = int(self.task_memory_counts.get(update.task, 0))
         historical_precision_before = {
             module: self._historical_precision(module)
+            for module in sorted(self._server_metadata)
+        }
+        history_age_before = self._history_age_diagnostics()
+        historical_precision_unweighted_before = {
+            module: self._historical_precision(module, apply_age_weight=False)
             for module in sorted(self._server_metadata)
         }
         frequency = self._frequency_diagnostics(update.task)
@@ -991,6 +1108,12 @@ class Ours(Method):
                 "task_memory_after": dict(task_memory_before),
                 "historical_precision_before": historical_precision_before,
                 "historical_precision_after": dict(historical_precision_before),
+                "historical_precision_unweighted_before": historical_precision_unweighted_before,
+                "historical_precision_unweighted_after": dict(
+                    historical_precision_unweighted_before
+                ),
+                "history_age_before": history_age_before,
+                "history_age_after": copy.deepcopy(history_age_before),
                 "task_memory_before_summary": _numeric_summary(
                     list(task_memory_before.values())
                 ),
@@ -1046,6 +1169,9 @@ class Ours(Method):
                 + (1.0 - history_beta) * sensitivity
             )
         self.task_memory_counts[update.task] = task_memory_count_before + 1
+        self._finish_history_arrival(
+            update, sum(alphas.values()) / len(alphas) > 0.0, diagnostics
+        )
         counts_after = self._append_frequency_task(update.task)
         diagnostics["frequency"].update(
             {
@@ -1116,6 +1242,19 @@ class Ours(Method):
             "task_memory_counts": copy.deepcopy(self.task_memory_counts),
             "task_weights": copy.deepcopy(self.task_weights),
             "task_frequency_window": list(self.task_frequency_window),
+            "history_age_state": {
+                "schema_version": 1,
+                "accepted_updates": self.history_accepted_updates,
+                "planned_jobs": [
+                    {"client_id": client_id, "local_round": local_round, "task": task}
+                    for (client_id, local_round), task in sorted(self.history_planned_jobs.items())
+                ],
+                "resolved_jobs": [
+                    {"client_id": client_id, "local_round": local_round}
+                    for client_id, local_round in sorted(self.history_resolved_jobs)
+                ],
+                "finished_at": dict(self.task_finished_at),
+            },
             "lora_metadata": copy.deepcopy(self._server_metadata),
         }
 
@@ -1157,3 +1296,76 @@ class Ours(Method):
             str(module): {str(key): value for key, value in metadata.items()}
             for module, metadata in state.get("lora_metadata", {}).items()
         }
+        age_state = state.get("history_age_state")
+        if age_state is None:
+            if self.params.get("history_age_enabled", False):
+                raise ValueError("Temporal-history checkpoint is missing history_age_state")
+            # Legacy profiles stay disabled; no completion timing is inferred.
+            self.history_accepted_updates = 0
+            self.history_planned_jobs = {}
+            self.history_resolved_jobs = set()
+            self.task_pending_updates = {}
+            self.task_finished_at = {}
+            return
+        if not isinstance(age_state, Mapping) or age_state.get("schema_version") != 1:
+            raise ValueError("Unsupported temporal-history state schema")
+
+        def count(value: Any, label: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Invalid temporal-history {label}: {value}")
+            return value
+
+        def job_key(row: Any) -> tuple[str, int]:
+            if not isinstance(row, Mapping) or not isinstance(row.get("client_id"), str):
+                raise ValueError("Invalid temporal-history job record")
+            return row["client_id"], count(row.get("local_round"), "local_round")
+
+        self.history_accepted_updates = count(age_state.get("accepted_updates"), "accepted_updates")
+        planned_rows = age_state.get("planned_jobs")
+        resolved_rows = age_state.get("resolved_jobs")
+        finished_rows = age_state.get("finished_at")
+        if not isinstance(planned_rows, list) or not isinstance(resolved_rows, list):
+            raise ValueError("Temporal-history jobs must be lists")
+        if not isinstance(finished_rows, Mapping):
+            raise ValueError("Temporal-history finished_at must be a mapping")
+        self.history_planned_jobs = {}
+        for row in planned_rows:
+            job = job_key(row)
+            task = row.get("task")
+            if task not in self.task_weights or job in self.history_planned_jobs:
+                raise ValueError("Invalid or duplicate temporal-history planned job")
+            self.history_planned_jobs[job] = task
+        self.history_resolved_jobs = set()
+        for row in resolved_rows:
+            job = job_key(row)
+            if job not in self.history_planned_jobs or job in self.history_resolved_jobs:
+                raise ValueError("Invalid or duplicate temporal-history resolved job")
+            self.history_resolved_jobs.add(job)
+        self.task_finished_at = {}
+        for task, value in finished_rows.items():
+            finished_at = count(value, "finished_at")
+            if task not in self.task_weights or finished_at > self.history_accepted_updates:
+                raise ValueError("Invalid temporal-history completion time")
+            self.task_finished_at[task] = finished_at
+        if not self.history_planned_jobs:
+            if self.history_resolved_jobs or self.task_finished_at or (
+                self.params.get("history_age_enabled", False) and self.history_accepted_updates
+            ):
+                raise ValueError("Temporal-history completion state has no Plan")
+            self.task_pending_updates = {}
+            return
+        if set(self.history_planned_jobs.values()) != set(self.task_weights):
+            raise ValueError("Temporal-history checkpoint Plan is missing tasks")
+        self.task_pending_updates = {
+            task: sum(
+                known_task == task and job not in self.history_resolved_jobs
+                for job, known_task in self.history_planned_jobs.items()
+            )
+            for task in self.task_weights
+        }
+        if set(self.task_finished_at) != {
+            task for task, pending in self.task_pending_updates.items() if pending == 0
+        }:
+            raise ValueError("Temporal-history completion state disagrees with unresolved jobs")
+        if self.history_accepted_updates > len(self.history_resolved_jobs):
+            raise ValueError("Temporal-history accepted updates exceed resolved jobs")

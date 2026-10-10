@@ -308,6 +308,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         initial_state = state_to_device(initial_state, aggregation_device)
         server = FederatedServer(None, method, len(partitions), initial_state=initial_state)
         method.configure_server(server.state, profiles)
+        method.configure_schedule(plan)
 
         def handle_message(message: Any) -> None:
             if isinstance(message, WorkerStatus):

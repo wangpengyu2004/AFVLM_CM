@@ -148,13 +148,54 @@ With uniform target-task prior `pi[q]=1/Q`, the protected server precision is:
 
 ```text
 Omega[t,l] = base_precision
-             + history_strength sum_q pi[q] m_hat[q,l]
+             + history_strength sum_q pi[q] a[q,t] m_hat[q,l]
 ```
 
 The memory used for one arrival is the state before fusing that arrival. The
 source task memory is updated only after fusion. Reliability and frequency do
 not scale this EMA, so stale or infrequent tasks do not receive weaker future
 protection solely because of their system behavior.
+
+### Optional age-weighted protection of finished tasks
+
+The current method template enables `history_age_enabled`. Only historical
+precision synthesis changes; the raw EMA, its bias correction, functional
+staleness, frequency correction and base-relative A/B increment remain the same.
+When disabled (also the default if the flag is absent in a legacy profile),
+`a[q,t]=1` and the original historical precision is recovered exactly.
+
+```text
+u          = number of successfully aggregated client updates so far
+u_finish[q]= u when every planned (client_id, local_round) job of task q is resolved
+age[q,t]   = u - u_finish[q]
+
+a[q,t] = 1                                      if q is unfinished
+a[q,t] = 1 + history_age_boost
+             * (1-exp(-age[q,t]/history_age_time_scale))  otherwise
+```
+
+The exact virtual Plan is observed through `configure_schedule`; it is not
+modified. A task retires only after all its clients' planned arrivals are handled,
+including a rejected terminal arrival. Physical GPU completion, inactivity in
+the frequency window, and finishing one client's last round do not retire a task.
+Rejected or zero-weight arrivals do not advance `u`; accepted arrivals advance it
+once. The current arrival reads the existing weight before advancing the counter.
+A newly retired task starts at age zero and weight one.
+
+Defaults are boost `1.0` and time scale `18.0` accepted updates. The multiplier
+grows smoothly from one towards two. These are tunable initial settings, not
+empirically established optimum values. Tasks with no accepted history still
+contribute zero regardless of multiplier. All original task priors remain
+`pi[q]=1/Q`; weighted priors are NOT renormalized and completed tasks are NOT
+removed. The frequency window and its fixed-Q calculation are unchanged by
+this extension. The time-scale value is independent of the frequency-window size.
+
+No parameter anchor, old-update replay, extra forward/backward or client upload
+is introduced. Increased Omega only damps subsequent movements in important
+modules; it cannot restore already-lost knowledge or distinguish harmful updates
+from beneficial transfer. Excessive protection may slow the remaining tasks.
+Compare disabled, zero-boost and positive-boost runs under the same Plan and
+training budget; tune on validation, never by selecting a test-set result.
 
 ## 6. Sliding-window task-frequency correction
 
@@ -236,6 +277,9 @@ method:
     history_beta: 0.9
     history_lambda: 1.0
     history_strength: 1.0
+    history_age_enabled: true
+    history_age_boost: 1.0
+    history_age_time_scale: 18.0
     base_precision: 1.0
     alpha_max: 0.5
     eps: 0.000000000001
@@ -279,10 +323,19 @@ Every arrival writes schema-version-4 `ours_diagnostics`, including:
 - per-module alpha;
 - `aggregation.rule = base_relative_delta`, identifying this aggregation revision;
 - raw and bias-corrected task memory and accepted-update counts;
+- temporal-history enable flag, boost, time scale and accepted-update clock;
+- each task's pending Plan jobs, completion counter, age and protection multiplier,
+  before/after the arrival;
+- per-module historical precision both with and without temporal weighting;
 
 `tools/export_ours_diagnostics.py` exports update-level and module-level CSV
 files. Both include `aggregation_rule`. Legacy events without a rule label
 export an empty field, rather than being relabelled as incremental updates.
+Temporal fields in legacy events also remain empty. The update CSV contains JSON
+maps `history_task_weights_before/after`, `history_task_ages_before/after`,
+`history_tasks_finished_at_before/after`, and `history_pending_updates_before/after`;
+the module CSV adds `historical_precision_unweighted_before/after` for comparison
+with actual `historical_precision_before/after`.
 There is no rank-level CSV because Module-Gate does not produce or upload
 rank sensitivity.
 
@@ -291,6 +344,11 @@ they cannot reconstruct the ordered accepted-task frequency window.
 This aggregation revision keeps the same memory/checkpoint data layout but
 changes the update semantics. Do not continue an old endpoint-mixing run as
 the same experiment; use a separate output/profile for the new variant.
+Temporal-history runs additionally checkpoint `history_age_state` (sub-schema 1):
+the exact Plan jobs, resolved jobs, successful-update counter and task retirement
+times. Loading it validates completion consistency. A legacy checkpoint without
+these fields is accepted only with temporal history disabled; it is never assigned
+invented completion times. This does not add interrupted-training resume support.
 
 ## 11. Running
 
@@ -319,3 +377,21 @@ command to copy the identical Plan into the new profile/output. Do not reuse
 a Plan from the old 64.5k/72k partition with the new Grounding-8k/68k data, or
 from a different batch/epoch configuration. Existing immutable configs and
 Plans are never rewritten by this aggregation change.
+
+For this temporal-protection revision, create a separate profile from the current
+templates. If data, seed and scheduling/training settings match your existing
+profile, reuse its identical Plan (replace `YOUR_EXISTING_PROFILE`):
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile module_gate_age_e1_bs4_ga4_r10_s42 \
+  --reuse_plans_from YOUR_EXISTING_PROFILE
+bash scripts/run_one.sh ours 2 module_gate_age_e1_bs4_ga4_r10_s42
+```
+
+The profile name is a label, not a parameter override. New snapshots read current
+`configs/` values, so check them against the old experiment. If data or the local
+training budget changed, omit `--reuse_plans_from`. Old immutable profiles are
+unchanged and do not automatically activate temporal protection. For an ablation,
+set `history_age_enabled: false` in `configs/methods/ours.yaml` and create another
+new profile with the same compatible Plan.

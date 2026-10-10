@@ -71,6 +71,13 @@ def export_diagnostics(
             alpha_summary = aggregation["alpha_summary"]
             before_summary = memory["task_memory_before_summary"]
             after_summary = memory["task_memory_after_summary"]
+            age_before = memory.get("history_age_before", {})
+            age_after = memory.get("history_age_after", {})
+
+            def age_json(section: Mapping[str, Any], key: str) -> str:
+                if key not in section:
+                    return ""
+                return json.dumps(section[key], sort_keys=True, ensure_ascii=False)
             common = {
                 "event_id": event.get("event_id"),
                 "update_id": client["update_id"],
@@ -135,6 +142,19 @@ def export_diagnostics(
                     "task_memory_count_before": memory.get("task_memory_count_before", ""),
                     "task_memory_count_after": memory.get("task_memory_count_after", ""),
                     "history_strength": memory.get("history_strength", ""),
+                    "history_age_enabled": age_before.get("enabled", ""),
+                    "history_age_boost": age_before.get("boost", ""),
+                    "history_age_time_scale": age_before.get("time_scale", ""),
+                    "history_accepted_updates_before": age_before.get("accepted_updates", ""),
+                    "history_accepted_updates_after": age_after.get("accepted_updates", ""),
+                    "history_task_weights_before": age_json(age_before, "weight_by_task"),
+                    "history_task_weights_after": age_json(age_after, "weight_by_task"),
+                    "history_task_ages_before": age_json(age_before, "age_by_task"),
+                    "history_task_ages_after": age_json(age_after, "age_by_task"),
+                    "history_tasks_finished_at_before": age_json(age_before, "finished_at"),
+                    "history_tasks_finished_at_after": age_json(age_after, "finished_at"),
+                    "history_pending_updates_before": age_json(age_before, "pending_updates"),
+                    "history_pending_updates_after": age_json(age_after, "pending_updates"),
                 }
             )
             modules = sensitivity["module_by_module"]
@@ -165,6 +185,12 @@ def export_diagnostics(
                         "historical_precision_after": memory[
                             "historical_precision_after"
                         ][module],
+                        "historical_precision_unweighted_before": memory.get(
+                            "historical_precision_unweighted_before", {}
+                        ).get(module, ""),
+                        "historical_precision_unweighted_after": memory.get(
+                            "historical_precision_unweighted_after", {}
+                        ).get(module, ""),
                     }
                 )
 

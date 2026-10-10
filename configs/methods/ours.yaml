@@ -1,7 +1,7 @@
 method:
   name: ours
   # Aggregation: current + module_alpha * (local - immutable downloaded base).
-  # Sensitivity, reliability, frequency and history coefficients are unchanged.
+  # Raw sensitivity, reliability, frequency and EMA coefficients are unchanged.
   params:
     # Module-Gate: mean absolute gate magnitude, once per real optimizer step.
     sensitivity_warmup_steps: 1
@@ -16,6 +16,12 @@ method:
     history_beta: 0.9
     history_lambda: 1.0
     history_strength: 1.0
+    # Only completed tasks gain bounded protection as accepted updates pass.
+    # a_q = 1 + boost * (1-exp(-age/time_scale)); unfinished tasks keep a_q=1.
+    # Set false for the original historical precision (old profiles default false).
+    history_age_enabled: true
+    history_age_boost: 1.0
+    history_age_time_scale: 18.0
     base_precision: 1.0
     alpha_max: 0.5
     eps: 0.000000000001
