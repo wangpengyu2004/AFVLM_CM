@@ -21,7 +21,10 @@ from afl_vlm.models.base import (
 )
 
 
-def _proximal_loss(base_loss: Any, model: Any, context: Mapping[str, Any], mu: float) -> Any:
+def _proximal_loss(
+    base_loss: Any, model: Any, context: Mapping[str, Any], mu: float,
+    *, differentiate_penalty: bool = True,
+) -> Any:
     """Download-anchored proximal objective, over federated trainables only."""
     if mu == 0:
         return base_loss
@@ -32,9 +35,36 @@ def _proximal_loss(base_loss: Any, model: Any, context: Mapping[str, Any], mu: f
         if reference is None:
             reference = context["base_state"][name].detach().to(parameter.device).float()
             device_anchor[name] = reference
-        value = (parameter.float() - reference).square().sum()
+        # FedAsync's derivative is injected at its optimizer-boundary hook.
+        # Do not attach a second path to LoRA leaves beside reentrant backward.
+        current = parameter if differentiate_penalty else parameter.detach()
+        value = (current.float() - reference).square().sum()
         penalty = value if penalty is None else penalty + value
     return base_loss if penalty is None else base_loss + 0.5 * mu * penalty
+
+
+def _add_proximal_gradient(model: Any, context: Mapping[str, Any], mu: float) -> None:
+    """Add exact d[mu/2 ||theta-anchor||²] once after accumulated/DDP-averaged CE.
+
+    Parameters/anchors are identical across ranks, so this deterministic term
+    needs no new all-reduce and no accumulation/world-size division. Not decay:
+    it is part of the gradient before AdamW, using the downloaded model anchor.
+    """
+    if mu == 0:
+        return
+    import torch
+
+    anchor = context.setdefault("proximal_device_anchor", {})
+    with torch.no_grad():
+        for name, parameter in model.named_federated_parameters():
+            if name not in anchor:
+                anchor[name] = context["base_state"][name].detach().to(parameter.device).float()
+            gradient = (parameter.detach().float() - anchor[name]) * mu
+            gradient = gradient.to(dtype=parameter.dtype)
+            if parameter.grad is None:
+                parameter.grad = gradient
+            else:
+                parameter.grad.add_(gradient)
 
 
 class _RoundAggregator(Method):
@@ -250,14 +280,23 @@ class FedAsync(Method):
     def local_loss(self, base_loss: Any, model: Any, batch: Any, context: Mapping[str, Any]) -> Any:
         if self.params.get("proximal_mode", "paper_loss") != "paper_loss":
             return base_loss
-        return _proximal_loss(base_loss, model, context, float(self.params.get("proximal_mu", 0.1)))
+        return _proximal_loss(
+            base_loss, model, context, float(self.params.get("proximal_mu", 0.1)),
+            differentiate_penalty=False,
+        )
 
     def transform_gradients(self, model: Any, context: Mapping[str, Any]) -> None:
-        """Author async_fl: contract weights AFTER backward, BEFORE optimizer.step.
+        """Paper objective gradient or author contraction, before optimizer.step.
 
+        paper_loss adds the exact quadratic derivative after CE accumulation;
+        its numerical loss includes the detached penalty, avoiding duplicate
+        DDP ready hooks with the old reentrant LLaVA checkpoint implementation.
         rho here is their CLI rho (=gamma*paper_rho), NOT a loss coefficient.
         Using AdamW instead of their SGD is an explicit VLM optimizer adaptation.
         """
+        if self.params.get("proximal_mode", "paper_loss") == "paper_loss":
+            _add_proximal_gradient(model, context, float(self.params.get("proximal_mu", 0.1)))
+            return
         if self.params.get("proximal_mode", "paper_loss") != "official_contraction":
             return
         import torch

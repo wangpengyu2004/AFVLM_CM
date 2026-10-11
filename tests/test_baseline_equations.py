@@ -64,7 +64,6 @@ class ClassicalEquations(unittest.TestCase):
     def test_proximal_loss_is_download_anchored_and_differentiable(self) -> None:
         for name, params, mu in (
             ("fedprox", {"mu": 0.01}, 0.01),
-            ("fedasync", {"proximal_mode": "paper_loss", "proximal_mu": 0.1}, 0.1),
         ):
             p = torch.nn.Parameter(torch.tensor([3.0]))
             model = SimpleNamespace(named_federated_parameters=lambda p=p: [("x", p)])

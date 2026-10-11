@@ -47,6 +47,10 @@ LLaVA 的最佳值。共同配置保留语言 LoRA r8/alpha16 和 base.yaml 的�
   [作者 async_fl](https://github.com/congxie1108/async_fl/tree/912ecf33e0fb811ac8551c4f3cdab344cdedfb53)。
   CLI 默认 alpha=.9/rho=1e-5；CIFAR 演示 alpha=.8/rho=.01/client SGD lr=.1。
   当前模板 alpha=.8、constant、`proximal_mode=paper_loss, proximal_mu=.1`，共同本地 AdamW。
+  paper_loss 数值保留 `mu/2 * ||theta-anchor||²`，但正则项不进入 autograd；
+  在完整累积/DDP同步后由已有 gradient hook 解析加入 `mu*(theta-anchor)` 一次，
+  再执行 AdamW。不是移除正则，也不是 weight decay；规避旧版 reentrant checkpoint
+  对同一 LoRA 参数触发额外 ready hook。FedProx 和 contraction 路径不作此改写。
   alpha_decay=.5/milestone800 来源于作者演示，当前120次上传通常不会触发。
   `official_contraction` 在 backward 后、optimizer.step 前把参数拉向下载锚点，保留
   已算的梯度；作者 rho 是 `client_lr * paper_proximal_mu`，不是 loss 的 mu。

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import random
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -536,9 +537,185 @@ class Llava15Adapter(ModelAdapter):
             encoded["labels"] = labels.to(self.device)
         return encoded
 
+    # Full ced4779 AdamW/DDP local-training body. Keep the sampling, no_sync,
+    # optimizer and hooks isolated from single-GPU fairness changes.
+    def _local_train_historical_ddp(
+        self, task_batch_stream: Iterable[Any], train_config: TrainConfig, task_name: str
+    ) -> TrainResult:
+        torch = self._imports()[0]
+        samples = list(task_batch_stream)
+        if not samples:
+            raise ValueError("Local training received no samples")
+        rng = random.Random(train_config.seed)
+        torch.random.default_generator.manual_seed(
+            train_config.seed + train_config.distributed_rank
+        )
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(train_config.seed + train_config.distributed_rank)
+        start = self.snapshot_trainable()
+        gradient_sum = zeros_like(start) if train_config.collect_mean_gradient else None
+        parameter_groups = [
+            {
+                "params": [
+                    p for n, p in self.named_federated_parameters() if "mm_projector" not in n
+                ],
+                "lr": train_config.learning_rate,
+            }
+        ]
+        projector = [p for n, p in self.named_federated_parameters() if "mm_projector" in n]
+        if projector:
+            parameter_groups.append(
+                {
+                    "params": projector,
+                    "lr": float(self._config.get("mm_projector_lr", train_config.learning_rate)),
+                }
+            )
+        optimizer = torch.optim.AdamW(parameter_groups)
+        losses, steps, hook_metadata = [], 0, {}
+        client_context = train_config.context.get("client")
+        client_id = getattr(client_context, "client_id", task_name)
+        local_round = getattr(client_context, "local_round", "?")
+        progress = tqdm(
+            total=train_config.planned_optimizer_steps,
+            desc=f"local {client_id} r{local_round}",
+            unit="step",
+            position=1,
+            leave=False,
+            dynamic_ncols=True,
+            mininterval=0.0,
+            miniters=1,
+            smoothing=0.0,
+            disable=not bool(self._config.get("progress_bar", True)),
+        )
+        self.model.train()
+        self.model.zero_grad(set_to_none=True)
+        epoch = 0
+        while train_config.max_local_steps is not None or epoch < train_config.local_epochs:
+            indices = list(range(len(samples)))
+            rng.shuffle(indices)
+            if train_config.distributed_world_size > 1:
+                samples_per_rank = math.ceil(len(indices) / train_config.distributed_world_size)
+                padded_size = samples_per_rank * train_config.distributed_world_size
+                missing = padded_size - len(indices)
+                if missing:
+                    repeats = math.ceil(missing / len(indices))
+                    indices.extend((indices * repeats)[:missing])
+                shard = slice(
+                    train_config.distributed_rank,
+                    padded_size,
+                    train_config.distributed_world_size,
+                )
+                indices = indices[shard]
+            micro_batches = [
+                indices[offset : offset + train_config.batch_size]
+                for offset in range(0, len(indices), train_config.batch_size)
+            ]
+            for window_start in range(0, len(micro_batches), train_config.gradient_accumulation):
+                window = micro_batches[
+                    window_start : window_start + train_config.gradient_accumulation
+                ]
+                accumulated = None
+                for micro_index, batch_indices in enumerate(window):
+                    encoded = self._encode_batch(
+                        [samples[index] for index in batch_indices],
+                        train_config.max_text_length,
+                    )
+                    synchronize = micro_index == len(window) - 1
+                    sync_context = (
+                        contextlib.nullcontext()
+                        if synchronize or not self._ddp_enabled
+                        else self.model.no_sync()
+                    )
+                    with sync_context:
+                        base_loss = self.model(**encoded).loss
+                        loss = (
+                            train_config.loss_hook(base_loss, self, encoded, train_config.context)
+                            if train_config.loss_hook
+                            else base_loss
+                        )
+                        (loss / len(window)).backward()
+                    detached_loss = loss.detach()
+                    accumulated = (
+                        detached_loss if accumulated is None else accumulated + detached_loss
+                    )
+                if gradient_sum is not None:
+                    for name, parameter in self.named_federated_parameters():
+                        if parameter.grad is not None:
+                            gradient_sum[name] = (
+                                gradient_sum[name] + parameter.grad.detach().float()
+                            )
+                if train_config.gradient_hook:
+                    # This hook runs exactly once per optimizer step: after all
+                    # accumulation micro-batches and before clipping/step. The
+                    # current implementation does not use GradScaler, so the
+                    # gradients are already in their optimization scale.
+                    train_config.context["optimizer_step"] = steps
+                    train_config.context["gradients_unscaled"] = True
+                    train_config.gradient_hook(self, train_config.context)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                steps += 1
+                if accumulated is None:
+                    raise RuntimeError("Gradient accumulation window produced no loss")
+                losses.append(float((accumulated / len(window)).item()))
+                progress.set_postfix(loss=f"{losses[-1]:.4f}", refresh=False)
+                progress.update(1)
+                if train_config.progress_hook:
+                    train_config.progress_hook(
+                        steps, train_config.planned_optimizer_steps, losses[-1]
+                    )
+                if train_config.step_hook:
+                    hook_metadata.update(
+                        train_config.step_hook(
+                            self,
+                            steps,
+                            train_config.planned_optimizer_steps,
+                            train_config.context,
+                        )
+                    )
+                if (
+                    train_config.max_local_steps is not None
+                    and steps >= train_config.max_local_steps
+                ):
+                    break
+            epoch += 1
+            if train_config.max_local_steps is not None and steps >= train_config.max_local_steps:
+                break
+        progress.close()
+        if steps == 0:
+            raise RuntimeError("No optimizer step was executed; lower gradient_accumulation")
+        end = self.snapshot_trainable()
+        return TrainResult(
+            delta=subtract(end, start),
+            losses=losses,
+            optimizer_steps=steps,
+            mean_gradient=scale_state(gradient_sum, 1.0 / steps)
+            if gradient_sum is not None
+            else None,
+            extra=hook_metadata,
+        )
+
     def local_train(
         self, task_batch_stream: Iterable[Any], train_config: TrainConfig, task_name: str
     ) -> TrainResult:
+        # Retain the actual pre-fairness implementation, not just equivalent
+        # indices. Algorithm-required SGD/probe paths must NOT fall into AdamW.
+        if (
+            self._ddp_enabled
+            and train_config.optimizer == "adamw"
+            and not train_config.gradient_estimation_only
+            and self._pilot_connector is None
+        ):
+            resolve_batch_layout(
+                {
+                    "batch_size": train_config.batch_size,
+                    "gradient_accumulation": train_config.gradient_accumulation,
+                    "batch_size_scope": train_config.batch_size_scope,
+                    "reference_world_size": train_config.reference_world_size,
+                },
+                train_config.distributed_world_size,
+            )
+            return self._local_train_historical_ddp(task_batch_stream, train_config, task_name)
         torch = self._imports()[0]
         samples = list(task_batch_stream)
         if not samples:

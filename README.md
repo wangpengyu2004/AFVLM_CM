@@ -533,6 +533,11 @@ worker 完成后先返回未经服务器处理的原始更新；父进程在计�
 分配或 optimizer-step 梯度轨迹；Pilot 的任务/客户端专属 adapter 会随客户端
 产生动态 unused parameters，不与当前重入式梯度检查点强行组合 DDP。两种执行器都只在
 Plan 指定的逻辑 arrival 聚合。UniFed-LoRA 使用独立服务器超网络，避免在每个DDP rank复制完整输出头。
+`ours`/OPCM 的普通 AdamW DDP 训练使用公平性改造前 `ced4779` 的完整本地训练函数，
+与单卡批量对齐隔离；不添加静态图或首窗口同步。FedAsync 的 `paper_loss` 正则
+在已有 optimizer-boundary hook 解析加入梯度，避免给重入式 checkpoint 增加重复反向路径。
+单卡对齐和其他 baseline 必需的 SGD/特殊梯度操作保留。
+根因线索、公式和验证边界见[历史 DDP 与 FedAsync 修复说明](docs/ddp_training_compatibility.md)。
 新 profile 自动识别并保存参考卡数；八卡服务器生成的快照固定参考预算128，
 DDP 保留原每卡4条、累积4次；worker-pool 在单卡复现八个参考分片，累积32次。
 两者保留相同的原始分片补齐、尾批和 micro-batch 平均损失规则。

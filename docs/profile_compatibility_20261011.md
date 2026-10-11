@@ -10,6 +10,12 @@
 - `configs/base.yaml` 本次仅新增解释注释，解析数值与更新前 main 相同：local_epochs=1、batch_size=4、gradient_accumulation=4、lr=2e-5、max_text_length=2048、AdamW。
 - 公共采样器/执行入口有重构，以便单卡客户端匹配八卡批量。原八卡 B4/G4、分片补齐、尾窗口、loss 归一、optimizer/hook 时机保留原规则；不是说公共代码一行没改。已有非训练检查逐批比对旧八卡规则。
 
+后续用户要求恢复历史八卡执行路径，并提供日志确认报错方法为 FedAsync。
+普通 AdamW DDP 独立恢复 `ced4779` 完整本地训练函数，不经过单卡对齐采样器；
+新 baseline 必需的 SGD/特殊梯度路径保留。FedAsync 新增正则改用解析梯度，
+没有给全部 DDP 方法添加静态图或首窗口同步，详见
+[历史 DDP 路径说明](ddp_training_compatibility.md)。以上兼容结论仍不是全仓库回滚或位级复现保证。
+
 这些结论只针对本次更新，不等于拿当前模板与用户服务器上的任意旧 profile 比较过。
 
 ## 是否需要新 profile / Plan
