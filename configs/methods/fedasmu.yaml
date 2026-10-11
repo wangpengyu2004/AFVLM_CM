@@ -1,16 +1,34 @@
+# FedASMU (AAAI 2024), explicitly adapted to private client objective feedback.
+# No server calibration set. Eqs. 1--9 preserved; epoch slots -> optimizer slots.
+# Meta lrs follow the paper's common 1e-4 / RL 1e-3 values, not VLM-tuned results.
 method:
   name: fedasmu
   params:
     mu_alpha: 1.0
     lambda: 1.0
-    sigma: 0.5
-    iota: 0.0
-    tau: 50
-    server_meta_lr: 0.01
+    sigma: 1.0
+    iota: 1.0
+    tau: 99
+    server_meta_lr: 0.0001
+    lambda_lr: 0.0001
+    sigma_lr: 0.0001
+    iota_lr: 0.0001
     mu_beta: 1.0
     gamma: 1.0
     upsilon: 0.5
-    local_meta_lr: 0.01
-    refresh_fraction: 0.5
+    local_meta_lr: 0.0001
+    gamma_lr: 0.0001
+    upsilon_lr: 0.0001
+    request_bins: 8
+    rl_hidden_size: 16
+    rl_lr: 0.001
+    rl_epsilon: 0.1
+    reward_baseline_rate: 0.1
+    q_lr: 0.1
+    q_discount: 0.9
+    controller_seed: 42
+    feedback_objective: arriving_client_train
+    feedback_samples: 4
+    control_max: 100.0
 federation:
   mode: asynchronous

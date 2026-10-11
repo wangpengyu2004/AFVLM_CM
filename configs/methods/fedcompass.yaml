@@ -1,8 +1,14 @@
 method:
   name: fedcompass
   params:
-    min_local_steps: 2
-    max_local_steps: 10000
-    group_window: 0.25
+    # Author server_fedcompass.yaml; work is measured in optimizer steps.
+    min_local_steps: 20
+    max_local_steps: 100
+    speed_momentum: 0.9
+    latest_time_factor: 1.5
+    alpha: 0.9
+    gradient_based: true
+    # Correct the author's increasing polynomial to a decaying weight.
+    staleness: {type: polynomial, a: -0.5}
 federation:
   mode: semi_asynchronous

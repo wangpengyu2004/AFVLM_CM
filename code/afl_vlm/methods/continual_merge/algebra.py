@@ -58,7 +58,11 @@ def compact_coordinates(
 
 
 def spectrum(
-    core: Any, retain: float = 1.0, rank_limit: int | None = None, eps: float = 1e-8
+    core: Any,
+    retain: float = 1.0,
+    rank_limit: int | None = None,
+    eps: float = 1e-8,
+    cutoff_rule: str = "mass_covering",
 ) -> tuple[Any, Any, Any]:
     """Nonzero thin SVD; retain refers to cumulative singular-value mass, not variance."""
     import torch
@@ -70,7 +74,11 @@ def spectrum(
     relative_tolerance = max(eps, torch.finfo(core.dtype).eps * max(core.shape))
     nonzero = int((s > relative_tolerance * s.max().clamp_min(eps)).sum())
     count = nonzero
-    if count and retain < 1.0:
+    if count and cutoff_rule == "author_slice":
+        # DOP author's searchsorted index is used directly as a slice endpoint.
+        # It is not index+1; preserve this paper/code discrepancy explicitly.
+        count = min(count, int(torch.searchsorted(s[:count].cumsum(0) / s[:count].sum(), retain)))
+    elif count and retain < 1.0:
         count = min(
             count, int(torch.searchsorted(s[:count].cumsum(0), retain * s[:count].sum())) + 1
         )
@@ -115,10 +123,14 @@ def refactor(
     )
 
 
-def projection_loss(value: Any, target: Any, u: Any, s: Any, v: Any) -> Any:
+def projection_loss(value: Any, target: Any, u: Any, s: Any, v: Any, space: str = "uv") -> Any:
     """DOP Eq. (2): ||diag(s) U.T E||² + ||E V diag(s)||²."""
     difference = value - target
-    return (s[:, None] * (u.T @ difference)).square().sum() + ((difference @ v) * s).square().sum()
+    left = (s[:, None] * (u.T @ difference)).square().sum()
+    right = ((difference @ v) * s).square().sum()
+    if space not in {"u", "v", "uv"}:
+        raise ValueError("DOP projection space must be u, v, or uv")
+    return left if space == "u" else right if space == "v" else left + right
 
 
 def opcm_filter(incoming: Any, old: Any, retain: float, eps: float) -> tuple[Any, int]:
@@ -133,6 +145,11 @@ def opcm_filter(incoming: Any, old: Any, retain: float, eps: float) -> tuple[Any
         return incoming.clone(), 0
     import torch
 
+    if not 0 < retain <= 1:
+        raise ValueError("OPCM retained singular mass must be in (0, 1]")
+    # Use a count, not a zero-based slice endpoint; protect at least one
+    # direction and all nonzero directions at retain=1 (author boundary fix).
+    # Preserve the previously run AFVLM OPCM floating-point cutoff operation.
     cutoff = min(len(s), int(torch.searchsorted(s.cumsum(0), retain * s.sum())) + 1)
     coordinates = u.T @ incoming @ v
     removed = torch.zeros_like(coordinates)

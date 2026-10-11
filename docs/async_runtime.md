@@ -41,10 +41,18 @@ FLGo 在通信时先为客户端打包服务器消息、再把客户端回复交
   检查点冲突。
 
 执行器选择只影响物理训练。两条路径仍在逻辑 start 冻结下载状态，并按 TrainPlan 的
-arrival 顺序聚合。DDP 不会因为物理完成更早而提前聚合。不过 DDP 的 `batch_size` 是每卡
-batch，有效批量为 `batch_size * gradient_accumulation * world_size`，实际 optimizer steps
-也按填充后的分布式数据分片计算；这些字段会写入运行输出。选择性使用不同执行器意味着
-本地优化轨迹不同，论文对比必须明确披露。
+arrival 顺序聚合。DDP 不会因为物理完成更早而提前聚合。base.yaml 无需手填参考卡数：
+生成 profile 时自动识别可见 CUDA GPU 数，并保存 reference_ddp 元数据到快照。
+以八卡服务器为例，完整预算 B*G*8=128；八卡保留 B4/G4，单卡完整窗口累积32次。
+直接运行可编辑模板时，在训练入口解析、启动 workers 前冻结，worker 不再检测。
+新旧不可变快照都不会因换机器被重新推断；新八卡快照在四卡 DDP 上明确报错。
+普通方法的样本窗口、补齐、micro-batch 权重和真实 optimizer steps 匹配原八卡规则。
+worker-pool 多个 GPU 属于不同客户端，不能相加为一个客户端的批量。
+不引入新的 token 加权目标。原 Plan 名义 local_steps 仍按 B*G 估算虚拟时间，
+真实步数另算；FedCompass 实际步骤成本按参考卡数换算回原虚拟单位。
+缺少 scope 的旧 profile 保留 `per_device` 行为，不被重写。
+算法、dropout、随机数消费与浮点运算顺序仍可能导致不同优化轨迹，不能声称位级一致。
+完整配置及迁移见 [batch_fairness.md](batch_fairness.md)。
 
 ## TrainPlan 不保存全局模型
 
@@ -70,7 +78,8 @@ batch，有效批量为 `batch_size * gradient_accumulation * world_size`，实�
 | Pilot | 服务器保存的客户端个性化状态 | Pilot 模型适配器 | task/text 自适应聚合 |
 | UniFed-LoRA | 超网络按任务描述符条件化的 LoRA | 无 | 更新超网络并聚合 |
 | MasFL/AdaMasFL | 当前全局 LoRA | dispatch 时冻结的控制变量/动量 | 更新服务器控制变量 |
-| FedASMU | 当前全局 LoRA | 客户端自适应系数 | 动态陈旧更新和系数更新 |
+| FedASMU | 当前全局LoRA | gamma/upsilon与学习式请求时隙 | 客户端训练目标反馈学习server系数，再全局插值 |
+| OrthoFL | 上次正交校准后的私有LoRA | 无新adapter | 原模型全局插值；更新下一轮客户端正交校准 |
 | FedCompass | 当前全局 LoRA | 调度器分配的 local steps/group | 组内聚合 |
 
 新增方法不应在 `main.py` 写分支。它应通过 `MethodCapabilities` 声明需求，并实现
@@ -113,10 +122,17 @@ EDF 只决定真实 GPU 先算哪个已经合法启动的作业。服务器仍�
 `system_stats.json` 同时报告虚拟完成时间和真实 wall-clock 秒数。worker 异常会使
 整次运行失败，不会把失败客户端静默重试到另一张卡，也不会丢弃更新。
 
-FedASMU 的中途新鲜模型请求是一个显式逻辑事件：刷新时刻为
-`start_time + refresh_fraction * estimated_train_time`。服务器在该逻辑时刻冻结
+新鲜模型请求是一个显式逻辑事件：FedASMU通过LSTM/Q决定request_step，刷新时刻为
+`start_time + (request_step/physical_optimizer_steps) * estimated_train_time`。服务器在该逻辑时刻冻结
 新鲜状态；worker 到达指定本地步后请求并接收该快照。因此它既能使用更新后的
 全局信息，又不会让物理 GPU 抖动改变方法语义。
+
+FedASMU使用客户端训练目标代理而非精确全局F；其额外目标probe单独记录，虚拟基础
+Plan不包含这部分成本。此类作业暂存到虚拟fresh快照可用才提交物理GPU，避免所有
+workers请求未来状态造成死锁，保留start/base与arrival语义。详见[实现说明](orthofl_fedasmu.md)。
+UniFed-LoRA也默认用client_parallel，避免复制
+完整服务器超网络到所有DDP rank。其实际A/B生成、Pilot分阶段私有状态、Mas初始化
+额外成本及附加个性化评估见 [baseline审查](baseline_audit.md)。
 
 ## 不同任务每步耗时不同
 

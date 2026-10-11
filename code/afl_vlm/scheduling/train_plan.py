@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -79,17 +78,30 @@ def build_train_plan(
     gradient_accumulation: int,
     mode: str,
     method_params: Mapping[str, Any] | None = None,
+    *,
+    optimizer_step_cost_scale: float = 1.0,
 ) -> list[ScheduledEvent]:
     """Build jobs whose ordinary workload is derived only from local epochs.
 
     ``local_steps`` is expected-work metadata for ordinary methods.  FedCompass
     is the sole current scheduling variant that replaces it with a bounded,
     compute-aware step allocation.
+
+    ``optimizer_step_cost_scale`` converts an algorithm-controlled physical
+    step back to the persisted system profile's nominal cost units. Reference
+    DDP uses a larger record budget per step; this is a unit conversion, not a
+    change to speed_factor or network_delay. Ordinary replay keeps the default.
     """
     specs = sorted(clients, key=lambda item: item.id)
     params = dict(method_params or {})
+    if mode == "semi_asynchronous":
+        from afl_vlm.scheduling.compass import build_compass_plan
+
+        return build_compass_plan(specs, rounds, params, optimizer_step_cost_scale)
     if rounds <= 0:
         raise ValueError("rounds must be positive")
+    if not math.isfinite(optimizer_step_cost_scale) or optimizer_step_cost_scale <= 0:
+        raise ValueError("optimizer_step_cost_scale must be finite and positive")
     nominal_steps = {
         item.id: optimizer_steps_for_epochs(
             item.num_samples, local_epochs, batch_size, gradient_accumulation
@@ -104,26 +116,10 @@ def build_train_plan(
         else:
             round_start = 0.0
         provisional: list[ScheduledEvent] = []
-        nominal = [_duration(item, nominal_steps[item.id]) for item in specs]
-        compass_target = max(nominal) if mode == "semi_asynchronous" else 0.0
         for client in specs:
             steps = nominal_steps[client.id]
-            if mode == "semi_asynchronous":
-                steps = round(
-                    compass_target
-                    * client.speed_factor
-                    / (client.base_training_cost * client.task_compute_factor)
-                )
-                steps = max(
-                    int(params.get("min_local_steps", 1)),
-                    min(int(params.get("max_local_steps", max(nominal_steps.values()) * 4)), steps),
-                )
-            start = (
-                round_start
-                if mode in {"synchronous", "semi_asynchronous"}
-                else available[client.id]
-            )
-            train_time = _duration(client, steps)
+            start = round_start if mode == "synchronous" else available[client.id]
+            train_time = _duration(client, steps) * optimizer_step_cost_scale
             arrival = start + train_time + client.network_delay
             provisional.append(
                 ScheduledEvent(
@@ -142,23 +138,10 @@ def build_train_plan(
                 )
             )
         provisional.sort(key=lambda item: (item.arrival_time, item.client_id))
-        if mode == "semi_asynchronous":
-            window = float(params.get("group_window", 0.25))
-            group_id, anchor = local_round * len(specs), None
-            grouped: list[ScheduledEvent] = []
-            for item in provisional:
-                if anchor is None or item.arrival_time - anchor > window:
-                    group_id += 1
-                    anchor = item.arrival_time
-                grouped.append(replace(item, group_id=group_id))
-            provisional = grouped
         for item in provisional:
             events.append(item)
             available[item.client_id] = item.arrival_time
         if mode == "synchronous":
-            barrier = max(item.arrival_time for item in provisional)
-            available = {item.id: barrier for item in specs}
-        elif mode == "semi_asynchronous":
             barrier = max(item.arrival_time for item in provisional)
             available = {item.id: barrier for item in specs}
     events.sort(key=lambda item: (item.arrival_time, item.client_id, item.local_round))
@@ -191,6 +174,7 @@ def event_records(events: list[ScheduledEvent]) -> list[dict[str, Any]]:
             "group_id": item.group_id,
             "group_size": group_sizes.get(item.group_id) if item.group_id is not None else None,
             "task_compute_factor": item.task_compute_factor,
+            **({"scheduler_metadata": item.metadata} if item.metadata else {}),
         }
         for item in events
     ]
@@ -200,7 +184,12 @@ def load_train_plan(path: str | Path) -> list[ScheduledEvent]:
     payload = json.loads(Path(path).resolve().read_text(encoding="utf-8"))
     fields = set(ScheduledEvent.__dataclass_fields__)
     return [
-        ScheduledEvent(**{key: value for key, value in row.items() if key in fields})
+        ScheduledEvent(
+            **{
+                **{key: value for key, value in row.items() if key in fields},
+                "metadata": row.get("scheduler_metadata", row.get("metadata", {})),
+            }
+        )
         for row in payload
     ]
 

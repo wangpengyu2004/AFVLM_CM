@@ -52,9 +52,17 @@ def pilot_aggregate(
             candidates.append((state_norm({key: difference[key] for key in text_keys}), other))
         distances = sorted(candidates, key=lambda item: (item[0], item[1].client_id))[:neighbors]
         peers = [update, *(item[1] for item in distances)]
+        inverse = [1.0 / max(1e-12, item[0]) for item in distances]
+        total_inverse = sum(inverse)
+        # Eq. (12) contains separately normalized size/distance terms whose
+        # combined coefficients need not sum to one. Convex renormalization
+        # avoids unintentionally shrinking every LoRA factor (disclosed fix).
         weights = [
             float(update.num_samples),
-            *[1.0 / max(1e-12, item[0]) for item in distances],
+            *[
+                peer.num_samples * weight / total_inverse
+                for (_, peer), weight in zip(distances, inverse, strict=True)
+            ],
         ]
         state = clone_state(result)
         for key in text_keys:

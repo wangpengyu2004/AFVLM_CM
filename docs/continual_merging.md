@@ -42,7 +42,7 @@ Delta = B_local A_local - B_download A_download
 
 - OPCM 对 `Delta` 做连续投影并融合；原论文独立专家任务向量被替换为客户端本次功能增量。
 - DOP / NUFILT 的新专家目标重基为 `N = O + Delta`。这是到达时的**代数目标**，不重新训练客户端、不替换下载快照或 base_version，也不将 global drift 当作客户端新知识。
-- 每次到达完成一种候选融合 `F*` 后，用 `F_next = O + eta (F* - O)` 放松；默认 `eta=0.5`。配置 `merge_weight=1` 可以关闭放松，但原专家起点/rank 适配仍存在。
+- 每次到达完成一种候选融合 `F*` 后，用 `F_next = O + eta (F* - O)`；DOP/NUFILT模板默认 `eta=1`；OPCM按用户要求恢复之前的 `eta=.5`。旧profile不改写，原专家起点/rank适配仍存在。OPCM原文使用自适应 `lambda_t`，没有本项目额外的 `merge_weight=.5` 参数，不能混同于奇异值保留阈值 `retain=.5`。
 - 默认 `staleness.type=constant`，不会叠加一个人为 FedAsync 衰减。若做扩展消融，可用共同 staleness 函数令 `eta=merge_weight*s(staleness)`，必须明确额外衰减不是上述论文原组件。
 - 默认每个有效到达返回一次 mutation，version/accepted update count 按共同服务器机制递增。即使零功能增量仍计该到达，状态保持不变；不会改变周期评估触发规则。
 
@@ -99,9 +99,9 @@ a = clip(<gp, gp-gs> / (||gs-gp||²+数值保护), 0, 1)
 alpha <- beta alpha + (1-beta) a
 ```
 
-按 `alpha Ls+(1-alpha)Lp` 的原始损失梯度做 core Adam 更新。默认 `mgda_ema_beta=0.99`、初始 alpha=0.5；设 beta=0 可关闭平滑做消融。与作者代码一致，归一化用于系数求解，组合反向仍用原始损失。
+按 `alpha Ls+(1-alpha)Lp` 的原始损失梯度做 core Adam 更新。新模板参考作者 `mgda_ema_beta=.999`、初始 alpha=.8；`ema:false`可关闭平滑。MGDA按作者端点规则取.001/.999；内点按上述分式。归一化用于系数求解，组合反向仍用原始损失。
 
-默认服务器内层 50 步、lr=1e-4；作者实现默认内层预算200步，可在 YAML 改 `inner_steps: 200`。`inner_steps` **不是客户端 optimizer_steps/local_epochs**，不会改变客户端 TrainPlan。
+新模板服务器内层200步、lr=1e-4、retain=.99999，参考作者配置。`inner_steps` **不是客户端 optimizer_steps/local_epochs**，不会改变客户端 TrainPlan。质量覆盖cutoff修正为方向计数，避免作者索引直接切片造成0方向；author_slice仅作显式对照。
 
 这里 core 坐标内的投影损失与其对应密集矩阵一致，但 Adam 是逐坐标预条件，不在正交旋转下等变；core Adam 与原密集矩阵 Adam 的优化轨迹不相同，不能声称逐更新精确复现。
 
@@ -132,7 +132,7 @@ configs/methods/dop_lora.yaml
 configs/methods/nufilt_lora.yaml
 ```
 
-各方法均有 `configs/experiments/llava/afvlm_cm/{2,5,10}clients/<method>.yaml`。继承共同模型/数据/base配置，不复制训练参数。注册器新名称自动进入新生成 profile，总计16方法、48实验配置。原 `scripts/run_baselines.sh` 的12方法序列保持不变，新持续融合组用独立批处理，`ours`仍独立。
+各方法均有 `configs/experiments/llava/afvlm_cm/{2,5,10}clients/<method>.yaml`。继承共同模型/数据/base配置，不复制训练参数。注册器新名称自动进入新生成 profile，总计17方法、51实验配置。主batch当前13个方法（含FedASMU适配/OrthoFL），持续融合组独立，`ours`仍独立；见[最新审查](baseline_audit.md)。
 
 ### 首次运行：用当前真实分区建立一个新快照
 

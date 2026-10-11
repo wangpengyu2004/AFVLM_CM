@@ -121,6 +121,9 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
         if not plan.is_file():
             raise FileNotFoundError(f"Shared asynchronous TrainPlan not found: {plan.resolve()}")
     training = config["training"]
+    from afl_vlm.batching import resolve_batch_layout
+
+    resolve_batch_layout(training)
     for key in ("local_epochs", "batch_size", "gradient_accumulation", "max_text_length"):
         if int(training.get(key, 0)) <= 0:
             raise ValueError(f"training.{key} must be positive")

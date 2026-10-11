@@ -16,16 +16,35 @@ Every setting contains `cls`, `caption`, `vqa`, `chart_vqa`,
 `visual_reasoning`, and `grounding`. Every task directory contains the
 existing `client_N.json`, `statistics.json`, `val.json`, and `test.json`.
 Training totals per setting are 13,000 / 15,000 / 11,000 / 9,500 / 11,500 /
-4,500 in canonical task order, or 64,500 stored records in total. Only the
-Grounding training pool is reduced; the other five tasks and every validation
+8,000 in canonical task order, or 68,000 stored records in total. Only the
+Grounding training pool is expanded from 4,500 to 8,000, retaining all old
+training records; the other five tasks and every validation
 and final split remain unchanged. Every
 client-count setting reuses exactly the same task pool; only its client
 partition changes. Runtime code never repartitions these records.
 
-The active partition version is `fcit_eval_v2_grounding4k5_64k5`. The
+The active partition version is `fcit_eval_v2_grounding8k_68k`. The
 integrity manifest in `configs/datasets/afvlm_cm_integrity.json` records the
 exact file count, byte count, and aggregate SHA-256 for this local-data
 version.
+
+The seeded partition uses uniform sampling without replacement at complete
+instruction-record level, then seeded shuffling and unequal client counts
+bounded at approximately 0.7--1.3 times the within-task mean. This introduces
+quantity heterogeneity, not additional label-skew heterogeneity. Client
+records are disjoint; different queries can share a source image across
+clients or held-out splits. It is not an image-disjoint protocol.
+
+Grounding has 7,215 unique training images and 46,282 assistant responses
+within its 8,000 complete conversations. Its client record counts are:
+
+- 2 clients: `[3420, 4580]`
+- 5 clients: `[2021, 1320, 1619, 1696, 1344]`
+- 10 clients: `[768, 709, 834, 827, 949, 669, 742, 814, 867, 821]`
+
+The prior 64.5k partitions are backed up under
+`data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5`. Regenerate system
+profiles/TrainPlans without `--reuse_plans_from` after changing the data.
 
 ## Loader interface
 
@@ -48,7 +67,8 @@ Grounding training keeps each source record as one LLaVA conversation and
 supervises every assistant response in that conversation. Grounding
 validation/final loading expands every user/assistant pair into a separate
 query, so every referring expression receives its own prediction and IoU.
-The default 2,048-token context covers the active records; an over-length
+The default text-length limit is 2,048 tokens; actual tokenizer lengths of
+the expanded pool have not been checked by loading a model. An over-length
 multi-turn record raises an error instead of silently truncating later
 assistant answers. Caption evaluation samples retain exactly five Flickr30k
 references.

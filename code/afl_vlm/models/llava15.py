@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import math
 import random
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Any
 
 from tqdm.auto import tqdm
 
+from afl_vlm.batching import optimizer_windows, resolve_batch_layout
 from afl_vlm.models.base import (
     LoRAState,
     ModelAdapter,
@@ -196,6 +196,13 @@ class Llava15Adapter(ModelAdapter):
         network = self._network()
         if network is None:
             raise RuntimeError("Model is not loaded")
+        if self._pilot_connector is not None:
+            return [
+                (name, parameter)
+                for name, parameter in network.named_parameters()
+                if ("lora_" in name and "vision_tower" not in name)
+                or "mm_projector.task_adapters." in name
+            ]
         return [
             (name, parameter)
             for name, parameter in network.named_parameters()
@@ -220,17 +227,97 @@ class Llava15Adapter(ModelAdapter):
         for name, parameter in trainable.items():
             parameter.data.copy_(state[name].to(device=parameter.device, dtype=parameter.dtype))
 
+    def mixing_objective_feedback(
+        self,
+        left: LoRAState,
+        right: LoRAState,
+        weight: float,
+        *,
+        samples: list[Any] | None = None,
+        encoded: Mapping[str, Any] | None = None,
+        max_text_length: int | None = None,
+    ) -> dict[str, Any]:
+        """FedASMU-only private-training objective oracle; no optimizer/.grad writes.
+
+        Restore LoRA and all module modes on success or failure. Both measurements
+        disable dropout consistently. This is actual algorithm work, not a test.
+        """
+        import math
+
+        import torch
+
+        from afl_vlm.models.base import add_scaled, state_dot
+
+        if self._ddp_enabled:
+            raise ValueError("FedASMU objective feedback requires a single-GPU client")
+        if not 0 <= weight <= 1:
+            raise ValueError("Feedback mixing weight must lie in [0, 1]")
+        if encoded is None:
+            if not samples:
+                raise ValueError("Client objective feedback requires training samples")
+            encoded = self._encode_batch(
+                samples, max_text_length or int(self._config["max_text_length"])
+            )
+        saved = self.snapshot_trainable()
+        modes = [(module, module.training) for module in self.model.modules()]
+        direction = subtract(right, left)
+        try:
+            self.model.eval()
+            self.load_trainable(left)
+            with torch.no_grad():
+                loss_before = float(self.model(**encoded).loss.float().item())
+            self.load_trainable(add_scaled(left, direction, weight))
+            with torch.enable_grad():
+                loss = self.model(**encoded).loss
+                parameters = dict(self.named_federated_parameters())
+                gradients = torch.autograd.grad(loss, tuple(parameters.values()), allow_unused=True)
+            gradient_state = {
+                name: gradient.detach() if gradient is not None else torch.zeros_like(parameter)
+                for (name, parameter), gradient in zip(parameters.items(), gradients, strict=True)
+            }
+            derivative = state_dot(gradient_state, direction)
+            loss_mixed = float(loss.detach().float().item())
+            if not all(math.isfinite(x) for x in (loss_before, loss_mixed, derivative)):
+                raise ValueError("Non-finite client objective feedback")
+            return {
+                "loss_before": loss_before,
+                "loss_mixed": loss_mixed,
+                "directional_derivative": derivative,
+                "objective_forwards": 2,
+                "objective_backwards": 1,
+                "optimizer_steps": 0,
+                "batch_records": int(encoded["input_ids"].shape[0]),
+                "dropout_disabled": True,
+            }
+        finally:
+            self.load_trainable(saved)
+            for module, training in modes:
+                module.training = training
+
     def install_pilot_extension(
-        self, tasks: list[str], clients: list[str], bottleneck: int
+        self, tasks: list[str], clients: list[str], normalize_difference: bool = True
     ) -> None:
         from afl_vlm.methods.pilot.adapters import build_pilot_connector
 
         network = self._network()
         base = network.base_model.model.model.mm_projector
-        hidden = int(network.config.hidden_size)
-        wrapper = build_pilot_connector(base, hidden, tasks, clients, bottleneck)
+        wrapper = build_pilot_connector(base, tasks, normalize_difference)
         network.base_model.model.model.mm_projector = wrapper
         self._pilot_connector = wrapper
+
+    def named_local_parameters(self) -> list[tuple[str, Any]]:
+        if self._pilot_connector is None:
+            return self.named_federated_parameters()
+        return [
+            (name, value)
+            for name, value in self._network().named_parameters()
+            if value.requires_grad
+        ]
+
+    def load_method_private_state(self, state: Mapping[str, Any]) -> None:
+        if self._pilot_connector is None:
+            raise ValueError("Private visual state requires a Pilot model")
+        self._pilot_connector.load_private(dict(state))
 
     def pilot_auxiliary_losses(self) -> dict[str, Any]:
         return dict(self._pilot_connector.auxiliary_losses) if self._pilot_connector else {}
@@ -268,26 +355,20 @@ class Llava15Adapter(ModelAdapter):
         """
 
         template = str(self._config.get("conversation_template", "v1"))
-        turns = tuple(getattr(sample, "turns", ())) or (
-            (sample.instruction, sample.answer),
-        )
+        turns = tuple(getattr(sample, "turns", ())) or ((sample.instruction, sample.answer),)
         if not include_answer:
             turns = turns[:1]
 
         def build_prompt(completed: int, pending: bool = False) -> str:
             conv = conversation_lib.conv_templates[template].copy()
             for index, (instruction, answer) in enumerate(turns[:completed]):
-                question = (
-                    f"{image_token}\n{instruction}" if index == 0 else instruction
-                )
+                question = f"{image_token}\n{instruction}" if index == 0 else instruction
                 conv.append_message(conv.roles[0], question)
                 conv.append_message(conv.roles[1], answer)
             if pending:
                 index = completed
                 instruction = turns[index][0]
-                question = (
-                    f"{image_token}\n{instruction}" if index == 0 else instruction
-                )
+                question = f"{image_token}\n{instruction}" if index == 0 else instruction
                 conv.append_message(conv.roles[0], question)
                 conv.append_message(conv.roles[1], None)
             return conv.get_prompt()
@@ -462,6 +543,19 @@ class Llava15Adapter(ModelAdapter):
         samples = list(task_batch_stream)
         if not samples:
             raise ValueError("Local training received no samples")
+        layout = resolve_batch_layout(
+            {
+                "batch_size": train_config.batch_size,
+                "gradient_accumulation": train_config.gradient_accumulation,
+                "batch_size_scope": train_config.batch_size_scope,
+                "reference_world_size": train_config.reference_world_size,
+            },
+            train_config.distributed_world_size,
+        )
+        if layout.training_world_size > 1 and not self._ddp_enabled:
+            raise ValueError("Training world size must match the active DDP model")
+        if self._ddp_enabled and (torch.distributed.get_world_size() != layout.training_world_size):
+            raise ValueError("TrainConfig world size differs from the active process group")
         rng = random.Random(train_config.seed)
         torch.random.default_generator.manual_seed(
             train_config.seed + train_config.distributed_rank
@@ -472,13 +566,11 @@ class Llava15Adapter(ModelAdapter):
         gradient_sum = zeros_like(start) if train_config.collect_mean_gradient else None
         parameter_groups = [
             {
-                "params": [
-                    p for n, p in self.named_federated_parameters() if "mm_projector" not in n
-                ],
+                "params": [p for n, p in self.named_local_parameters() if "mm_projector" not in n],
                 "lr": train_config.learning_rate,
             }
         ]
-        projector = [p for n, p in self.named_federated_parameters() if "mm_projector" in n]
+        projector = [p for n, p in self.named_local_parameters() if "mm_projector" in n]
         if projector:
             parameter_groups.append(
                 {
@@ -486,8 +578,14 @@ class Llava15Adapter(ModelAdapter):
                     "lr": float(self._config.get("mm_projector_lr", train_config.learning_rate)),
                 }
             )
-        optimizer = torch.optim.AdamW(parameter_groups)
+        if train_config.optimizer == "adamw":
+            optimizer = torch.optim.AdamW(parameter_groups)
+        elif train_config.optimizer == "sgd":
+            optimizer = torch.optim.SGD(parameter_groups, momentum=0.0, weight_decay=0.0)
+        else:
+            raise ValueError(f"Unsupported local optimizer: {train_config.optimizer}")
         losses, steps, hook_metadata = [], 0, {}
+        step_sample_counts: list[int] = []
         client_context = train_config.context.get("client")
         client_id = getattr(client_context, "client_id", task_name)
         local_round = getattr(client_context, "local_round", "?")
@@ -509,31 +607,14 @@ class Llava15Adapter(ModelAdapter):
         while train_config.max_local_steps is not None or epoch < train_config.local_epochs:
             indices = list(range(len(samples)))
             rng.shuffle(indices)
-            if train_config.distributed_world_size > 1:
-                samples_per_rank = math.ceil(len(indices) / train_config.distributed_world_size)
-                padded_size = samples_per_rank * train_config.distributed_world_size
-                missing = padded_size - len(indices)
-                if missing:
-                    repeats = math.ceil(missing / len(indices))
-                    indices.extend((indices * repeats)[:missing])
-                shard = slice(
-                    train_config.distributed_rank,
-                    padded_size,
-                    train_config.distributed_world_size,
+            for window in optimizer_windows(indices, layout, train_config.distributed_rank):
+                step_sample_counts.append(
+                    sum(len(batch.indices) for batch in window) * layout.training_world_size
                 )
-                indices = indices[shard]
-            micro_batches = [
-                indices[offset : offset + train_config.batch_size]
-                for offset in range(0, len(indices), train_config.batch_size)
-            ]
-            for window_start in range(0, len(micro_batches), train_config.gradient_accumulation):
-                window = micro_batches[
-                    window_start : window_start + train_config.gradient_accumulation
-                ]
                 accumulated = None
-                for micro_index, batch_indices in enumerate(window):
+                for micro_index, batch in enumerate(window):
                     encoded = self._encode_batch(
-                        [samples[index] for index in batch_indices],
+                        [samples[index] for index in batch.indices],
                         train_config.max_text_length,
                     )
                     synchronize = micro_index == len(window) - 1
@@ -549,6 +630,8 @@ class Llava15Adapter(ModelAdapter):
                             if train_config.loss_hook
                             else base_loss
                         )
+                        # EXACT original DDP loss rule. A single GPU averages
+                        # all virtual-rank micro-batches before one optimizer step.
                         (loss / len(window)).backward()
                     detached_loss = loss.detach()
                     accumulated = (
@@ -568,7 +651,8 @@ class Llava15Adapter(ModelAdapter):
                     train_config.context["optimizer_step"] = steps
                     train_config.context["gradients_unscaled"] = True
                     train_config.gradient_hook(self, train_config.context)
-                optimizer.step()
+                if not train_config.gradient_estimation_only:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 steps += 1
                 if accumulated is None:
@@ -608,7 +692,23 @@ class Llava15Adapter(ModelAdapter):
             mean_gradient=scale_state(gradient_sum, 1.0 / steps)
             if gradient_sum is not None
             else None,
-            extra=hook_metadata,
+            extra={
+                **hook_metadata,
+                "local_optimizer": train_config.optimizer,
+                "local_learning_rate": train_config.learning_rate,
+                "gradient_estimation_only": train_config.gradient_estimation_only,
+                "batching": {
+                    **layout.as_dict(),
+                    "loss_normalization": "reference_rank_micro_batch_mean"
+                    if layout.batch_size_scope == "reference_ddp"
+                    else "legacy_micro_batch_mean",
+                    "sample_padding_policy": "reference_distributed_sampler_repeat"
+                    if layout.reference_world_size > 1
+                    else "none",
+                    "optimizer_step_sample_counts": step_sample_counts,
+                    "training_record_count": sum(step_sample_counts),
+                },
+            },
         )
 
     def _evaluation_pass(

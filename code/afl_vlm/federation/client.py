@@ -76,6 +76,7 @@ class FederatedClient:
         """
         model.load_trainable(start_state)
         model._set_context(self.task, self.id)
+        method.prepare_local_model(model, context)
         configured = TrainConfig(
             local_epochs=train_config.local_epochs,
             batch_size=train_config.batch_size,
@@ -98,7 +99,12 @@ class FederatedClient:
             max_local_steps=train_config.max_local_steps,
             distributed_rank=train_config.distributed_rank,
             distributed_world_size=train_config.distributed_world_size,
+            batch_size_scope=train_config.batch_size_scope,
+            reference_world_size=train_config.reference_world_size,
+            optimizer=train_config.optimizer,
+            gradient_estimation_only=train_config.gradient_estimation_only,
         )
+        configured = method.configure_local_training(configured)
         loaded_start_state = model.snapshot_trainable()
         result = model.local_train(self.samples, configured, self.task)
         local_state = add_scaled(loaded_start_state, result.delta, 1.0)
@@ -124,6 +130,7 @@ class FederatedClient:
             group_id=group_id,
             metadata={
                 **dict(result.extra),
+                **method.export_local_metadata(model, context),
                 "group_size": group_size,
                 "federated_parameter_scope": "lora_and_configured_modules",
             },

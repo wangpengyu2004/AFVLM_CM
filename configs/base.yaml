@@ -16,6 +16,8 @@ runtime:
 
 training:
   local_epochs: 1
+  # Reference GPU count is auto-detected and frozen in generated profiles.
+  # With 8 visible GPUs: DDP B4/G4; one-GPU clients automatically use B4/G32.
   batch_size: 4
   gradient_accumulation: 4
   learning_rate: 0.00002

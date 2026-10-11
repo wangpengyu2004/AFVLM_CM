@@ -36,6 +36,7 @@ class ScheduledEvent:
     local_steps: int
     group_id: int | None = None
     task_compute_factor: float = 1.0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -116,3 +117,5 @@ class MethodCapabilities:
     requires_local_state: bool = False
     requires_mean_gradient: bool = False
     requires_group_sensitivity: bool = False
+    requires_initial_gradient: bool = False
+    requires_arrival_objective_feedback: bool = False

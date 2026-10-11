@@ -185,8 +185,10 @@ This report records the implementation scope and engineering validation. No trai
 - `data/AFVLM_CM/partitioned/10_clients`: 60 clients (10 per task).
 - Each setting contains `cls`, `caption`, `vqa`, `chart_vqa`, `visual_reasoning`, and `grounding`.
 - Each task contains the existing `client_N.json`, `statistics.json`, `val.json`, and `test.json` files.
-- Per-setting training totals are: cls 13,000; caption 15,000; vqa 11,000; chart_vqa 9,500; visual_reasoning 11,500; grounding 4,500, for 64,500 records in total.
-- Integrity: 158 files, 82,449,713 bytes, aggregate SHA-256 `3cec6e041b4bad67aab4107112bf7a971ca977533aa2287db0ba0d5d4cacda8a` under the documented validator convention.
+- Per-setting training totals are: cls 13,000; caption 15,000; vqa 11,000; chart_vqa 9,500; visual_reasoning 11,500; grounding 8,000, for 68,000 records in total.
+- Version: `fcit_eval_v2_grounding8k_68k`; only Grounding training partitions changed. Other tasks and all validation/final annotation files remain byte-identical to the 64.5k version.
+- Grounding: 7,215 unique images and 46,282 assistant answers; complete multi-turn records retained. Record-level seeded quantity-heterogeneous partitions, not image-disjoint or label-Dirichlet partitions.
+- Integrity: 158 files, 94,471,289 bytes, aggregate SHA-256 `5e8bf95aeb7cc3aac78901fb3b50ffb5e76625c61a45d3b85e9092a00bf75e81` under the documented validator convention.
 
 ## Required paths
 
@@ -237,7 +239,17 @@ copies a compatible old plan when only non-scheduling parameters change. Both
 single and batch runners accept the profile as an optional final argument, for
 example `bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42`.
 
-## Paper adaptations
+## Paper adaptations (historical; superseded by 2026-10-11 audit)
+
+Current baseline functionality/status is documented in `docs/baseline_audit.md`.
+FedASMU now includes a learned request controller, adaptive coefficients and
+client-side objective feedback without a server calibration dataset. This is
+a disclosed approximation of the paper's global-objective oracle, not an exact
+reproduction; see `docs/orthofl_fedasmu.md`. OrthoFL has also been added with
+separate global aggregation and private-client orthogonal calibration. OPCM
+retains the user's previously run `merge_weight: 0.5`. Pilot is staged with private
+state, UniFed generates actual factors, and Mas variants use real controls/SGD.
+The older descriptions below are not current algorithm-completeness claims.
 
 - FedCompass retains computing-power-aware bounded local-step assignment and grouped semi-asynchronous aggregation inside the shared virtual clock; only federated trainable state is optimized.
 - FedASMU retains dynamic staleness-aware server mixing and a mid-local fresher-global interpolation. A deterministic configurable refresh position and online coefficient updates replace the original full RL request controller.
@@ -245,7 +257,7 @@ example `bash scripts/run_one.sh fedasync 2 default_e1_bs1_ga4_r10_s42`.
 - Pilot isolates task/client visual adapters and CT-MoA in a Pilot-only connector and implements task visual plus nearest-client text-LoRA aggregation. Its two paper stages are jointly optimized here.
 - UniFed-LoRA disables backbone heterogeneity but retains configurable task and modality/architecture/layer/module descriptor conditioning through a server hypernetwork.
 
-## Limitations
+## Historical limitations (see current audit for superseding details)
 
 - No 7B job has been launched; target-machine CUDA, memory, dependency, and checkpoint compatibility still require real-environment confirmation.
 - Current read-only image audit finds 64,934 unique references and 61,304 missing files.

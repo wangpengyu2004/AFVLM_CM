@@ -20,7 +20,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from afl_vlm.federation.types import ClientContext, ClientSpec, ScheduledEvent, Update
-from afl_vlm.models.base import LoRAState, TrainConfig, nested_to_device, state_to_device
+from afl_vlm.models.base import (
+    LoRAState,
+    TrainConfig,
+    load_evaluation_state,
+    nested_to_device,
+    state_to_device,
+)
 
 
 @dataclass(slots=True)
@@ -48,6 +54,20 @@ class EvaluationJob:
     split: str
     shard_index: int
     shard_count: int
+
+
+@dataclass(slots=True)
+class ObjectiveFeedbackJob:
+    job_id: str
+    request: dict[str, Any]
+    max_text_length: int
+
+
+@dataclass(slots=True)
+class ObjectiveFeedbackCompleted:
+    worker_id: int
+    job_id: str
+    feedback: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +144,9 @@ class WorkerFailed:
     traceback_text: str
 
 
-WorkerCommand = TrainJob | EvaluationJob | FreshStateResponse | ShutdownWorker
+WorkerCommand = (
+    TrainJob | EvaluationJob | ObjectiveFeedbackJob | FreshStateResponse | ShutdownWorker
+)
 WorkerMessage = (
     WorkerReady
     | WorkerStatus
@@ -133,6 +155,7 @@ WorkerMessage = (
     | FreshStateRequest
     | TrainCompleted
     | EvaluationCompleted
+    | ObjectiveFeedbackCompleted
     | WorkerFailed
 )
 
@@ -143,6 +166,10 @@ def update_to_device(update: Update, device: Any) -> Update:
     update.delta = state_to_device(update.delta, device)
     if update.mean_gradient is not None:
         update.mean_gradient = state_to_device(update.mean_gradient, device)
+    if "pilot_private_state" in update.metadata:
+        update.metadata["pilot_private_state"] = nested_to_device(
+            update.metadata["pilot_private_state"], device
+        )
     return update
 
 
@@ -189,7 +216,7 @@ def _evaluate_states(
     for client_id, state in states.items():
         task = client_id.split("/", 1)[0]
         status(f"evaluating {client_id} ({split})")
-        model.load_trainable(state)
+        load_evaluation_state(model, state)
         model.set_evaluation_context(task, client_id)
         by_task.setdefault(task, []).append(evaluate_one(client_id, tasks[task], sample_ids[task]))
     return {
@@ -220,8 +247,7 @@ def _evaluate_states_shard(
         targets = [("global", task, None) for task in sorted(tasks)]
     else:
         targets = [
-            (client_id, client_id.split("/", 1)[0], client_id)
-            for client_id in sorted(states)
+            (client_id, client_id.split("/", 1)[0], client_id) for client_id in sorted(states)
         ]
     total = sum(len(sample_ids[task]) for _, task, _ in targets)
     completed = 0
@@ -229,7 +255,7 @@ def _evaluate_states_shard(
     outputs: dict[str, dict[str, list[tuple[int, str, Any]]]] = {}
     for state_key, task, client_id in targets:
         if loaded_state != state_key:
-            model.load_trainable(states[state_key])
+            load_evaluation_state(model, states[state_key])
             loaded_state = state_key
         label = task if state_key == "global" else state_key
         status(f"evaluating {label} ({split}) shard {shard_index + 1}/{shard_count}")
@@ -417,13 +443,24 @@ def _worker_main(
                     )
                 )
                 continue
+            if isinstance(command, ObjectiveFeedbackJob):
+                from afl_vlm.federation.objective_feedback import client_objective_feedback
+
+                current_job = command.job_id
+                request = nested_to_device(command.request, worker_device)
+                samples = data_module.get_client_train_data(request["client_id"])
+                feedback = client_objective_feedback(
+                    model, samples, request, command.max_text_length
+                )
+                output_queue.put(ObjectiveFeedbackCompleted(worker_id, command.job_id, feedback))
+                continue
             if isinstance(command, EvaluationJob):
                 current_job = command.job_id
                 outputs = _evaluate_states_shard(
                     model,
                     data_module,
                     {
-                        key: state_to_device(state, worker_device)
+                        key: nested_to_device(state, worker_device)
                         for key, state in command.states.items()
                     },
                     command.split,
@@ -482,7 +519,9 @@ class ClientWorkerPool:
         self._idle = set(range(len(devices)))
         self._busy: dict[int, str] = {}
         self._pending: list[
-            tuple[tuple[int, float, float, int], int, TrainJob | EvaluationJob]
+            tuple[
+                tuple[int, float, float, int], int, TrainJob | EvaluationJob | ObjectiveFeedbackJob
+            ]
         ] = []
         self._submission_sequence = 0
         self._dispatch_suspended = False
@@ -566,7 +605,7 @@ class ClientWorkerPool:
 
     def submit(
         self,
-        job: TrainJob | EvaluationJob,
+        job: TrainJob | EvaluationJob | ObjectiveFeedbackJob,
         *,
         priority: bool = False,
         defer: bool = False,
@@ -609,7 +648,7 @@ class ClientWorkerPool:
             _, _, job = heapq.heappop(self._pending)
             self._dispatch(job)
 
-    def _dispatch(self, job: TrainJob | EvaluationJob) -> None:
+    def _dispatch(self, job: TrainJob | EvaluationJob | ObjectiveFeedbackJob) -> None:
         worker_id = min(self._idle)
         self._idle.remove(worker_id)
         self._busy[worker_id] = job.job_id
@@ -633,7 +672,7 @@ class ClientWorkerPool:
                     raise RuntimeError(f"GPU worker process exited unexpectedly: {failed}") from exc
                 if timeout is not None:
                     raise
-        if isinstance(message, TrainCompleted | EvaluationCompleted):
+        if isinstance(message, TrainCompleted | EvaluationCompleted | ObjectiveFeedbackCompleted):
             expected = self._busy.pop(message.worker_id, None)
             actual = (
                 f"train:{message.event_id}"

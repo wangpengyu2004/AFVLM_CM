@@ -291,9 +291,16 @@ power/quantile compression.
 
 ## 9. DDP and optimizer-step semantics
 
-`ours` remains DDP-capable. All visible GPUs train the same client. With eight
-GPUs, per-device batch 16, and gradient accumulation 4, one optimizer step has
-effective batch `8 * 16 * 4 = 512`.
+`ours` remains DDP-capable. All visible GPUs train the same client. The profile
+generator auto-detects visible GPUs and freezes reference_ddp metadata; users
+need not put these fields in base.yaml. With reference8 the budget is128.
+Eight ranks preserve existing B4/G4; one-GPU methods
+use B4/G32 and the same reference shard windows. Original padded sampler tails,
+micro-batch loss means and rank averaging are retained, without new token
+weighting. Hooks still run once per optimizer step after accumulation/sync.
+Legacy profiles retain per-device semantics: old eight-rank B4/G4 runs have
+budget128, but old one-GPU B4/G4 runs have budget16.
+See [batch fairness and migration](batch_fairness.md).
 
 The training hook order is:
 

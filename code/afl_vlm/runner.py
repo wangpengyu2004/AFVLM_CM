@@ -14,6 +14,11 @@ from typing import Any
 import yaml
 from tqdm.auto import tqdm
 
+from afl_vlm.batching import (
+    freeze_runtime_batch_config,
+    planned_optimizer_steps,
+    resolve_batch_layout,
+)
 from afl_vlm.config import resolved_public_config, validate_config
 from afl_vlm.data.afvlm_cm import AFVLMDataModule, validate_caption_metric_runtime
 from afl_vlm.evaluation import merge_evaluation_outputs
@@ -23,17 +28,17 @@ from afl_vlm.evaluation_schedule import (
 )
 from afl_vlm.federation.client import FederatedClient
 from afl_vlm.federation.server import FederatedServer
-from afl_vlm.federation.types import ClientContext
+from afl_vlm.federation.types import ClientContext, ServerContext
 from afl_vlm.methods.registry import create_method
-from afl_vlm.models.base import TrainConfig, clone_state, state_norm
+from afl_vlm.models.base import TrainConfig, clone_state, load_evaluation_state, state_norm
 from afl_vlm.models.registry import create_model
+from afl_vlm.scheduling.timeline import EventTimeline
 from afl_vlm.scheduling.train_plan import (
     build_train_plan,
     event_records,
     load_system_profile,
     load_train_plan,
     mean_staleness,
-    optimizer_steps_for_distributed_epochs,
     optimizer_steps_for_epochs,
 )
 
@@ -62,7 +67,12 @@ def _append(path: Path, payload: Any) -> None:
 
 
 def _evaluate_method_primary(
-    model: Any, method: Any, server_state: dict[str, Any], tasks: dict[str, Any], split: str
+    model: Any,
+    method: Any,
+    server_state: dict[str, Any],
+    tasks: dict[str, Any],
+    split: str,
+    states_override: Any = None,
 ) -> dict[str, Any]:
     """Run the conventional primary evaluation for one server checkpoint.
 
@@ -79,6 +89,8 @@ def _evaluate_method_primary(
         if method.evaluation_scope == "client_local_mean"
         else {"global": server_state}
     )
+    if states_override is not None:
+        states = states_override
     try:
         if set(states) == {"global"}:
             model.load_trainable(states["global"])
@@ -88,15 +100,23 @@ def _evaluate_method_primary(
                 metrics[task] = model.evaluate(adapter, sample_ids[task], "final")
             return metrics
         by_task: dict[str, list[dict[str, float]]] = defaultdict(list)
+        per_client = {}
         for client_id, state in states.items():
             task = client_id.split("/", 1)[0]
-            model.load_trainable(state)
+            load_evaluation_state(model, state)
             model.set_evaluation_context(task, client_id)
-            by_task[task].append(model.evaluate(tasks[task], sample_ids[task], "final"))
-        return {
+            row = model.evaluate(tasks[task], sample_ids[task], "final")
+            per_client[client_id] = row
+            by_task[task].append(row)
+        task_metrics = {
             task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
             for task, rows in by_task.items()
         }
+        return (
+            {"per_task": task_metrics, "per_client": per_client}
+            if states_override is not None
+            else task_metrics
+        )
     finally:
         model.load_trainable(original)
 
@@ -140,9 +160,7 @@ def _evaluate_distributed_task(
         predictions, references = model.generate_evaluation_outputs(
             task_adapter,
             [sample_id for _, sample_id in local_items],
-            progress_label=(
-                f"evaluate {task_adapter.task_key} rank {rank + 1}/{world_size} shard"
-            ),
+            progress_label=(f"evaluate {task_adapter.task_key} rank {rank + 1}/{world_size} shard"),
         )
         if len(predictions) != len(local_items) or len(references) != len(local_items):
             raise RuntimeError("Model returned incomplete distributed evaluation outputs")
@@ -201,12 +219,12 @@ def _evaluate_method_distributed(
     server_state: dict[str, Any],
     tasks: dict[str, Any],
     split: str,
+    states_override: Any = None,
 ) -> dict[str, Any]:
     """Evaluate every model state cooperatively on all DDP ranks."""
 
     sample_ids = {
-        task: [sample.id for sample in adapter.load_split(split)]
-        for task, adapter in tasks.items()
+        task: [sample.id for sample in adapter.load_split(split)] for task, adapter in tasks.items()
     }
     original = model.snapshot_trainable()
     states = (
@@ -214,42 +232,57 @@ def _evaluate_method_distributed(
         if method.evaluation_scope == "client_local_mean"
         else {"global": server_state}
     )
+    if states_override is not None:
+        states = states_override
     try:
         if set(states) == {"global"}:
             model.load_trainable(states["global"])
             metrics = {}
             for task in sorted(tasks):
                 model.set_evaluation_context(task, None)
-                metrics[task] = _evaluate_distributed_task(
-                    model, tasks[task], sample_ids[task]
-                )
+                metrics[task] = _evaluate_distributed_task(model, tasks[task], sample_ids[task])
             return metrics
         by_task: dict[str, list[dict[str, float]]] = defaultdict(list)
+        per_client = {}
         for client_id in sorted(states):
             task = client_id.split("/", 1)[0]
-            model.load_trainable(states[client_id])
+            load_evaluation_state(model, states[client_id])
             model.set_evaluation_context(task, client_id)
-            by_task[task].append(
-                _evaluate_distributed_task(model, tasks[task], sample_ids[task])
-            )
-        return {
+            row = _evaluate_distributed_task(model, tasks[task], sample_ids[task])
+            per_client[client_id] = row
+            by_task[task].append(row)
+        task_metrics = {
             task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
             for task, rows in by_task.items()
         }
+        return (
+            {"per_task": task_metrics, "per_client": per_client}
+            if states_override is not None
+            else task_metrics
+        )
     finally:
         model.load_trainable(original)
 
 
 def evaluate_method(
-    model: Any, method: Any, server_state: dict[str, Any], tasks: dict[str, Any], split: str
+    model: Any,
+    method: Any,
+    server_state: dict[str, Any],
+    tasks: dict[str, Any],
+    split: str,
+    states_override: Any = None,
 ) -> dict[str, Any]:
     """Use all DDP ranks for evaluation without long idle collectives."""
     import torch
 
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not distributed:
-        return _evaluate_method_primary(model, method, server_state, tasks, split)
-    return _evaluate_method_distributed(model, method, server_state, tasks, split)
+        if states_override is None:
+            return _evaluate_method_primary(model, method, server_state, tasks, split)
+        return _evaluate_method_primary(model, method, server_state, tasks, split, states_override)
+    if states_override is None:
+        return _evaluate_method_distributed(model, method, server_state, tasks, split)
+    return _evaluate_method_distributed(model, method, server_state, tasks, split, states_override)
 
 
 def _initialize_server(
@@ -272,6 +305,7 @@ def _initialize_server(
 
 
 def execute(config: dict[str, Any]) -> dict[str, Any]:
+    create_method(config["method"]["name"], config["method"].get("params", {})).validate_runtime()
     """Select the configured execution backend without changing method semantics."""
     if "caption" in config.get("dataset", {}).get("tasks", []):
         validate_caption_metric_runtime()
@@ -284,6 +318,7 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
+    config = freeze_runtime_batch_config(config)
     validate_config(config)
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()
@@ -307,6 +342,16 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         )
     primary = rank == 0
     os.environ["AFVLM_PRIMARY_PROCESS"] = "1" if primary else "0"
+    batch_layout = resolve_batch_layout(config["training"], world_size)
+    if primary:
+        tqdm.write(
+            "[AFVLM-CM] batch budget: "
+            f"scope={batch_layout.batch_size_scope}, "
+            f"effective_batch={batch_layout.effective_batch_size}, "
+            f"training_ranks={world_size}, "
+            f"per_device_batch={batch_layout.per_device_batch_size}, "
+            f"physical_accumulation={batch_layout.physical_gradient_accumulation}"
+        )
 
     run = config["run"]
     seed = int(run["seed"])
@@ -330,6 +375,8 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         output.mkdir(parents=True, exist_ok=True)
         for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
             (output / name).write_text("", encoding="utf-8")
+        if method.capabilities.requires_arrival_objective_feedback:
+            (output / "algorithm_objective_feedback.jsonl").write_text("", encoding="utf-8")
         (output / "train.log").write_text(
             f"AFVLM-CM run start\nmethod={method.name}\nseed={seed}\n"
             f"runtime={'client_ddp' if distributed else 'serial'}\n"
@@ -407,9 +454,21 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             int(federation["rounds"]),
             int(training["local_epochs"]),
             int(training["batch_size"]),
-            int(training["gradient_accumulation"]),
+            int(training["gradient_accumulation"])
+            * (
+                batch_layout.reference_world_size
+                if method.capabilities.requires_local_step_control
+                and batch_layout.batch_size_scope == "reference_ddp"
+                else 1
+            ),
             method.capabilities.mode,
             config["method"].get("params", {}),
+            optimizer_step_cost_scale=(
+                batch_layout.reference_world_size
+                if method.capabilities.requires_local_step_control
+                and batch_layout.batch_size_scope == "reference_ddp"
+                else 1.0
+            ),
         )
     else:
         plan = load_train_plan(federation["train_plan"])
@@ -435,6 +494,38 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 "The persisted TrainPlan does not match the system profile task compute factors"
             )
     method.configure_schedule(plan)
+    if method.capabilities.requires_initial_gradient:
+        import time
+
+        from afl_vlm.federation.initialization import initial_gradient_jobs, initial_gradient_record
+
+        initialization_started = time.time()
+        initialization_records = []
+        for job in initial_gradient_jobs(config, profiles, server.state):
+            local_method = create_method(method.name, method.params)
+            local_method.load_client_runtime_state(job.method_runtime_state, job.context)
+            update = clients[job.event.client_id].train_prepared(
+                model,
+                local_method,
+                job.base_state,
+                job.start_state,
+                job.context,
+                job.train_config,
+            )
+            initialization_records.append(initial_gradient_record(update))
+            method.initialize_client_gradient(update)
+        method.finalize_initial_gradients()
+        _write_json(
+            output / "algorithm_initialization.json",
+            {
+                "algorithm": method.name,
+                "server_version": server.version,
+                "wall_time_seconds": time.time() - initialization_started,
+                "protocol": "fixed_initial_model_mean_local_gradients",
+                "clients": initialization_records,
+                "extra_work_not_in_train_plan": True,
+            },
+        )
     records = event_records(plan)
     _write_json(output / "train_plan.json", records)
     record_by_event = {int(item["event_id"]): item for item in records}
@@ -447,18 +538,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
     job_start_states: dict[int, dict[str, Any]] = {}
     job_method_states: dict[int, dict[str, Any]] = {}
     logical_fresh_states: dict[int, tuple[dict[str, Any], int]] = {}
-    timeline = []
-    for event in plan:
-        timeline.append((event.start_time, 2, "start", event))
-        if method.capabilities.requires_fresh_global_during_local_training:
-            refresh_fraction = float(
-                config["method"].get("params", {}).get("refresh_fraction", 0.5)
-            )
-            refresh_time = event.start_time + refresh_fraction * event.estimated_train_time
-            timeline.append((refresh_time, 1, "refresh", event))
-            record_by_event[event.event_id]["fresh_request_time"] = refresh_time
-        timeline.append((event.arrival_time, 0, "arrival", event))
-    timeline.sort(key=lambda item: (item[0], item[1], item[3].client_id, item[3].local_round))
+    timeline = EventTimeline(plan)
     staleness_values: list[int] = []
     buffer_occupancies: list[int] = []
     buffer_waiting_times: list[float] = []
@@ -498,9 +578,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 f"server_version={server.version}, {eval_schedule.unit}={evaluation_count}, "
                 f"crossed={list(crossed)}, split={periodic_split}"
             )
-        validation_metrics = evaluate_method(
-            model, method, server.state, tasks, periodic_split
-        )
+        validation_metrics = evaluate_method(model, method, server.state, tasks, periodic_split)
         _append(
             output / "task_metrics.jsonl",
             {
@@ -519,6 +597,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 "per_task": validation_metrics,
             },
         )
+
     for virtual_time, _, kind, event in timeline:
         last_virtual_time = max(last_virtual_time, virtual_time)
         if kind == "start":
@@ -539,6 +618,19 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             job_start_states[event.event_id] = method.prepare_download(
                 clone_state(base_state), context
             )
+            physical_steps = (
+                event.local_steps
+                if method.capabilities.requires_local_step_control
+                else planned_optimizer_steps(
+                    context.num_samples, int(training["local_epochs"]), training, world_size
+                )
+            )
+            refresh_step = method.select_refresh_step(context, physical_steps)
+            if refresh_step is not None:
+                record_by_event[event.event_id]["fresh_request_time"] = timeline.refresh(
+                    event, refresh_step, physical_steps
+                )
+                record_by_event[event.event_id]["fresh_request_optimizer_step"] = refresh_step
             job_method_states[event.event_id] = method.client_runtime_state(context)
             record_by_event[event.event_id]["base_version"] = server.version
             record_by_event[event.event_id]["download_policy"] = method.name
@@ -554,15 +646,14 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         stale = server.version - base_version
         staleness_values.append(stale)
         physical_optimizer_steps = (
-            optimizer_steps_for_distributed_epochs(
+            event.local_steps
+            if method.capabilities.requires_local_step_control
+            else planned_optimizer_steps(
                 len(clients[event.client_id].samples),
                 int(training["local_epochs"]),
-                int(training["batch_size"]),
-                int(training["gradient_accumulation"]),
+                training,
                 world_size,
             )
-            if distributed
-            else event.local_steps
         )
         record_by_event[event.event_id]["physical_optimizer_steps"] = physical_optimizer_steps
         record_by_event[event.event_id]["physical_executor"] = (
@@ -573,6 +664,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             batch_size=int(training["batch_size"]),
             gradient_accumulation=int(training["gradient_accumulation"]),
             learning_rate=float(training["learning_rate"]),
+            optimizer=str(training.get("optimizer", "adamw")),
             max_text_length=int(training["max_text_length"]),
             seed=context.seed,
             collect_mean_gradient=method.capabilities.requires_mean_gradient,
@@ -582,6 +674,8 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             else None,
             distributed_rank=rank,
             distributed_world_size=world_size,
+            batch_size_scope=str(training.get("batch_size_scope", "per_device")),
+            reference_world_size=int(training.get("reference_world_size", 8)),
         )
         client_method = create_method(method.name, method.params)
         client_method.load_client_runtime_state(job_method_states.pop(event.event_id), context)
@@ -600,6 +694,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             else None,
         )
         update = method.prepare_upload(update, context)
+        update.metadata.update(event.metadata)
         _append(
             output / "updates.jsonl",
             {
@@ -612,10 +707,28 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 "arrival_time": update.arrival_time,
                 "local_delta_norm": state_norm(update.delta),
                 "optimizer_steps": update.optimizer_steps,
+                "batching": update.metadata.get("batching"),
                 "sample_ids_hash": update.sample_ids_hash,
             },
         )
         receive_version = server.version
+        feedback_request = method.arrival_feedback_request(
+            update, ServerContext(server.state, server.version, len(clients))
+        )
+        if feedback_request is not None:
+            from afl_vlm.federation.objective_feedback import client_objective_feedback
+
+            feedback = client_objective_feedback(
+                model,
+                clients[update.client_id].samples,
+                feedback_request,
+                int(training["max_text_length"]),
+            )
+            update.metadata["arrival_objective_feedback"] = feedback
+            _append(
+                output / "algorithm_objective_feedback.jsonl",
+                {"update_id": update.update_id, **feedback},
+            )
         results = server.receive(update)
         evaluation_count = evaluation_progress_count(
             server, method.evaluation_scope, eval_schedule.unit
@@ -708,13 +821,27 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             "per_task": metrics,
         },
     )
+    secondary_states = method.secondary_evaluation_states(server.state)
+    if secondary_states:
+        personalized_metrics = evaluate_method(
+            model, method, server.state, tasks, final_split, secondary_states
+        )
+        _write_json(
+            output / "personalized_metrics.json",
+            {
+                "protocol": "native_personalized_secondary",
+                "split": final_split,
+                "server_version": server.version,
+                "client_ids": sorted(secondary_states),
+                "per_task": personalized_metrics["per_task"],
+                "per_client": personalized_metrics["per_client"],
+                "note": "Full held-out corpus per client; within-task client macro-average.",
+            },
+        )
     stats = {
         "runtime_backend": "client_ddp" if distributed else "serial",
         "ddp_world_size": world_size,
-        "per_device_batch_size": int(training["batch_size"]),
-        "effective_batch_size": (
-            int(training["batch_size"]) * int(training["gradient_accumulation"]) * world_size
-        ),
+        **batch_layout.as_dict(),
         "mean_staleness": mean_staleness(staleness_values),
         "median_staleness": statistics.median(staleness_values) if staleness_values else None,
         "max_staleness": max(staleness_values, default=0),
@@ -753,8 +880,16 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
             for group in group_sizes
         }
         stats["group_completion_spread"] = {
-            str(group): max(item.arrival_time for item in plan if item.group_id == group)
-            - min(item.arrival_time for item in plan if item.group_id == group)
+            str(group): max(
+                item.metadata.get("communication_arrival_time", item.arrival_time)
+                for item in plan
+                if item.group_id == group
+            )
+            - min(
+                item.metadata.get("communication_arrival_time", item.arrival_time)
+                for item in plan
+                if item.group_id == group
+            )
             for group in group_sizes
         }
     _write_json(output / "system_stats.json", stats)

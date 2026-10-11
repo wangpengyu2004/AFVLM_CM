@@ -24,7 +24,7 @@ class ExecutorSelectionTests(unittest.TestCase):
             "fedadam",
             "fedasync",
             "fedbuff",
-            "unifed_lora",
+            "orthofl",
             "ours",
         ):
             with self.subTest(method=name):
@@ -44,6 +44,7 @@ class ExecutorSelectionTests(unittest.TestCase):
             "masfl": {},
             "adamasfl": {},
             "pilot": {},
+            "unifed_lora": {},
         }
         for name, params in configurations.items():
             with self.subTest(method=name):

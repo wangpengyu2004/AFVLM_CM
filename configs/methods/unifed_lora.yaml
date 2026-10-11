@@ -1,9 +1,10 @@
 method:
   name: unifed_lora
   params:
-    hidden_size: 32
-    hyper_lr: 0.001
-    conditioning_scale: 0.05
+    hidden_size: 256
+    embedding_dim: 16
+    hyper_lr: 2.0e-05
+    hyper_device: auto
     seed: 42
     task_descriptors:
       cls: [1, 0, 0, 0, 0, 0]

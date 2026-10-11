@@ -78,8 +78,7 @@ class ContinualLoRAMerge(Method):
                 raise ValueError("Non-finite initial LoRA state")
             if bool(torch.count_nonzero(b)):
                 raise ValueError(
-                    "Continual baselines require zero-B initialization, "
-                    "not a pre-tuned adapter"
+                    "Continual baselines require zero-B initialization, not a pre-tuned adapter"
                 )
 
     def merge_core(self, old: Any, incoming: Any, seed: int) -> tuple[Any, dict[str, Any]]:
@@ -243,6 +242,10 @@ class DOPLoRA(ContinualLoRAMerge):
         "mgda_ema_beta",
         "mgda_initial_alpha",
         "normalize_gradients",
+        "mgda",
+        "ema",
+        "svd_proj_space",
+        "cutoff_rule",
     }
 
     def __init__(self, params: Mapping[str, Any] | None = None) -> None:
@@ -254,32 +257,52 @@ class DOPLoRA(ContinualLoRAMerge):
             raise ValueError("mgda_ema_beta must be in [0, 1)")
         if not 0 <= float(self.params.get("mgda_initial_alpha", 0.5)) <= 1:
             raise ValueError("mgda_initial_alpha must be in [0, 1]")
+        if self.params.get("svd_proj_space", "uv") not in {"u", "v", "uv"}:
+            raise ValueError("svd_proj_space must be u, v, or uv")
+        if self.params.get("cutoff_rule", "mass_covering") not in {"mass_covering", "author_slice"}:
+            raise ValueError("Unknown DOP cutoff_rule")
 
     def merge_core(self, old: Any, incoming: Any, seed: int) -> tuple[Any, dict[str, Any]]:
         import torch
 
         new = old + incoming  # arrival-time rebased expert target
         retain = float(self.params.get("retain", 1.0))
-        left = spectrum(old, retain, eps=self.eps)
-        right = spectrum(new, retain, eps=self.eps)
+        cutoff = str(self.params.get("cutoff_rule", "mass_covering"))
+        space = str(self.params.get("svd_proj_space", "uv"))
+        left = spectrum(old, retain, eps=self.eps, cutoff_rule=cutoff)
+        right = spectrum(new, retain, eps=self.eps, cutoff_rule=cutoff)
         with torch.enable_grad():
             value = ((old + new) / 2).detach().clone().requires_grad_(True)
             optimizer = torch.optim.Adam([value], lr=float(self.params.get("inner_lr", 1e-4)))
             alpha = value.new_tensor(float(self.params.get("mgda_initial_alpha", 0.5)))
             for _ in range(int(self.params.get("inner_steps", 50))):
-                ls = projection_loss(value, old, *left)
-                lp = projection_loss(value, new, *right)
+                ls = projection_loss(value, old, *left, space=space)
+                lp = projection_loss(value, new, *right, space=space)
                 gs = torch.autograd.grad(ls, value, retain_graph=True)[0]
                 gp = torch.autograd.grad(lp, value, retain_graph=True)[0]
                 if self.params.get("normalize_gradients", True):
                     gs = gs / ls.detach().clamp_min(self.eps)
                     gp = gp / lp.detach().clamp_min(self.eps)
                 difference = gs - gp
-                solution = (
-                    (gp * (gp - gs)).sum() / difference.square().sum().clamp_min(self.eps**2)
-                ).clamp(0, 1)
-                beta = float(self.params.get("mgda_ema_beta", 0.99))
-                alpha = beta * alpha + (1 - beta) * solution.detach()
+                if self.params.get("mgda", True):
+                    # Author MinNormSolver uses 0.001/0.999 at endpoints.
+                    cross = (gs * gp).sum()
+                    solution = torch.where(
+                        cross >= gs.square().sum(),
+                        value.new_tensor(0.999),
+                        torch.where(
+                            cross >= gp.square().sum(),
+                            value.new_tensor(0.001),
+                            (gp * (gp - gs)).sum()
+                            / difference.square().sum().clamp_min(self.eps**2),
+                        ),
+                    )
+                    beta = float(self.params.get("mgda_ema_beta", 0.99))
+                    alpha = (
+                        beta * alpha + (1 - beta) * solution.detach()
+                        if self.params.get("ema", True)
+                        else solution.detach()
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 (alpha * ls + (1 - alpha) * lp).backward()
                 optimizer.step()
@@ -289,8 +312,10 @@ class DOPLoRA(ContinualLoRAMerge):
             "new_rank": len(right[1]),
             "mgda_alpha": float(alpha),
             "inner_steps": int(self.params.get("inner_steps", 50)),
-            "stability_loss": float(projection_loss(merged, old, *left)),
-            "plasticity_loss": float(projection_loss(merged, new, *right)),
+            "stability_loss": float(projection_loss(merged, old, *left, space=space)),
+            "plasticity_loss": float(projection_loss(merged, new, *right, space=space)),
+            "cutoff_rule": cutoff,
+            "svd_proj_space": space,
         }
 
 

@@ -3,15 +3,19 @@
 method:
   name: dop_lora
   params:
-    merge_weight: 0.5
+    merge_weight: 1.0
     staleness:
       type: constant
-    inner_steps: 50
+    inner_steps: 200
     inner_lr: 1.0e-4
-    retain: 1.0
+    retain: 0.99999
     normalize_gradients: true
-    mgda_ema_beta: 0.99
-    mgda_initial_alpha: 0.5
+    mgda_ema_beta: 0.999
+    mgda_initial_alpha: 0.8
+    mgda: true
+    ema: true
+    svd_proj_space: uv
+    cutoff_rule: mass_covering
     eps: 1.0e-8
 federation:
   mode: asynchronous

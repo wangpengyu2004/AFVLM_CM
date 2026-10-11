@@ -31,6 +31,7 @@ EXPECTED_METHODS = (
     "fedbuff",
     "fedcompass",
     "fedasmu",
+    "orthofl",
     "masfl",
     "adamasfl",
     "pilot",
@@ -40,7 +41,7 @@ EXPECTED_METHODS = (
     "dop_lora",
     "nufilt_lora",
 )
-LEGACY_METHODS = set(EXPECTED_METHODS) - {"opcm_lora", "dop_lora", "nufilt_lora"}
+LEGACY_METHODS = set(EXPECTED_METHODS) - {"opcm_lora", "dop_lora", "nufilt_lora", "orthofl"}
 SETTINGS = (2, 5, 10)
 
 
@@ -118,6 +119,8 @@ def validate_profiles(errors: list[str]) -> int:
                 for path in paths:
                     config = load_config(path)
                     validate_config(config, check_paths=False)
+                    if config["training"] != reference["training"]:
+                        errors.append(f"profile changes shared training settings: {path}")
                     expected_plan = plan_path.relative_to(ROOT).as_posix()
                     expected_system = system_path.relative_to(ROOT).as_posix()
                     if config["federation"]["train_plan"] != expected_plan:
@@ -215,7 +218,7 @@ def main() -> None:
                     )
             expected_plan = f"plans/afvlm_cm/{setting}clients/async_train_plan.json"
             async_methods = (
-                "fedasync", "fedbuff", "fedasmu", "masfl", "adamasfl", "ours",
+                "fedasync", "fedbuff", "fedasmu", "orthofl", "masfl", "adamasfl", "ours",
                 "opcm_lora", "dop_lora", "nufilt_lora",
             )
             for method in async_methods:

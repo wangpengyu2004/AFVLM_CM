@@ -1,9 +1,15 @@
 method:
   name: fedasync
   params:
-    alpha: 0.5
+    # Author experiment_script_1.sh (CIFAR demonstration, not VLM tuning).
+    alpha: 0.8
+    proximal_mode: paper_loss
+    # Only used by official_contraction: current lr2e-5 * proximal_mu.1.
+    rho: 0.000002
+    proximal_mu: 0.1
+    alpha_decay: 0.5
+    alpha_decay_milestones: [800]
     staleness:
-      type: polynomial
-      a: 0.5
+      type: constant
 federation:
   mode: asynchronous

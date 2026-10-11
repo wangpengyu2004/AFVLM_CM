@@ -1,6 +1,8 @@
 method:
   name: fedbuff
   params:
+    server_lr: 1.0
+    weighting: uniform
     buffer_size: 5
     staleness_weighting: false
     staleness:

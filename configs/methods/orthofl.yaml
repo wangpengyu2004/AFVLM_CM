@@ -1,0 +1,9 @@
+# OrthoFL (arXiv:2502.15940, 2025), Eqs. 4--8, LoRA per-layer specialization.
+method:
+  name: orthofl
+  params:
+    beta: 0.6
+    a: 0.5
+    eps: 1.0e-12
+federation:
+  mode: asynchronous

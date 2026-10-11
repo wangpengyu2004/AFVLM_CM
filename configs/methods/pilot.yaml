@@ -1,10 +1,12 @@
 method:
   name: pilot
   params:
-    adapter_bottleneck: 64
+    stage1_rounds: 1
+    # Per-image unit-token features avoid raw feature-scale overflow in FP16.
+    normalize_difference: true
     difference_weight: 0.1
-    balance_weight: 0.01
-    router_z_weight: 0.001
-    text_neighbors: 3
+    balance_weight: 0.1
+    router_z_weight: 0.01
+    text_neighbors: 6
 federation:
   mode: synchronous

@@ -47,7 +47,9 @@ class FederatedServer:
                     update.base_version,
                     self.version,
                     [],
-                    {"buffered": True},
+                    {"buffered": False, "rejection_reason": update.metadata["rejection_reason"]}
+                    if "rejection_reason" in update.metadata
+                    else {"buffered": True},
                 )
             ]
         return [self._apply(item, receive_version, update.base_version) for item in mutations]

@@ -23,13 +23,28 @@ def staleness_weight(staleness: int, config: Mapping[str, Any]) -> float:
     kind = str(config.get("type", "constant"))
     if staleness < 0:
         raise ValueError("Staleness cannot be negative")
-    if kind == "constant":
+    if kind in {"constant", "none"}:
         return 1.0
-    if kind == "polynomial":
-        return (staleness + 1.0) ** (-float(config.get("a", 0.5)))
+    slope = float(config.get("a", 0.5))
+    if not math.isfinite(slope) or slope < 0:
+        raise ValueError("Staleness a must be finite and non-negative")
+    if kind in {"polynomial", "power"}:
+        return (staleness + 1.0) ** (-slope)
+    if kind == "linear":
+        return 1.0 / (1.0 + slope * staleness)
+    if kind in {"exponential", "exp"}:
+        return math.exp(-slope * staleness)
+    if kind == "sigmoid":
+        # Author FedAsync code: floor 1/b, not a logistic function.
+        floor_denominator = float(config.get("b", 1.0))
+        if not math.isfinite(floor_denominator) or floor_denominator < 1:
+            raise ValueError("Sigmoid staleness b must be finite and >= 1")
+        value = math.exp(-slope * staleness)
+        return (1.0 - value) / floor_denominator + value
     if kind == "hinge":
-        threshold = int(config.get("threshold", 1))
-        slope = float(config.get("a", 0.5))
+        threshold = int(config.get("b", config.get("threshold", 1)))
+        if threshold < 0:
+            raise ValueError("Hinge staleness threshold must be non-negative")
         return 1.0 if staleness <= threshold else 1.0 / (1.0 + slope * (staleness - threshold))
     raise ValueError(f"Unknown staleness function: {kind}")
 
@@ -61,6 +76,41 @@ class Method(ABC):
     def validate_runtime(self) -> None:
         """Fail early when a registered method is intentionally unavailable."""
         return None
+
+    def configure_local_training(self, train_config: Any) -> Any:
+        """Algorithm-specific optimizer requirements; default preserves all settings."""
+        return train_config
+
+    def select_refresh_step(self, context: ClientContext, total_steps: int) -> int | None:
+        """Select a causal within-job refresh slot; ordinary methods have none."""
+        if not self.capabilities.requires_fresh_global_during_local_training or total_steps < 2:
+            return None
+        return max(
+            1,
+            min(
+                total_steps - 1,
+                round(total_steps * float(self.params.get("refresh_fraction", 0.5))),
+            ),
+        )
+
+    def arrival_feedback_request(
+        self, update: Update, context: ServerContext
+    ) -> dict[str, Any] | None:
+        """Optional client-training-objective oracle; no default computation."""
+        return None
+
+    def prepare_local_model(self, model: Any, context: ClientContext) -> None:
+        """Default no-op; method-private adapters may select their local stage."""
+        return None
+
+    def export_local_metadata(self, model: Any, context: ClientContext) -> dict[str, Any]:
+        return {}
+
+    def initialize_client_gradient(self, update: Update) -> None:
+        raise NotImplementedError(f"{self.name} has no initial-gradient protocol")
+
+    def finalize_initial_gradients(self) -> None:
+        raise NotImplementedError(f"{self.name} has no initial-gradient protocol")
 
     def prepare_download(self, global_state: LoRAState, context: ClientContext) -> LoRAState:
         return clone_state(global_state)
@@ -105,6 +155,10 @@ class Method(ABC):
     def evaluation_states(self, global_state: LoRAState) -> Mapping[str, LoRAState]:
         """Return non-global states only for methods whose primary scope requires them."""
         return {"global": clone_state(global_state)}
+
+    def secondary_evaluation_states(self, global_state: LoRAState) -> Mapping[str, LoRAState]:
+        """Optional native personalized results, separate from global main metrics."""
+        return {}
 
     def state_dict(self) -> dict[str, Any]:
         return copy.deepcopy({"params": self.params})

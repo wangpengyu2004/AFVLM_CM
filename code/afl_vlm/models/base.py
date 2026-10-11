@@ -34,6 +34,12 @@ class TrainConfig:
     max_local_steps: int | None = None
     distributed_rank: int = 0
     distributed_world_size: int = 1
+    # Absent in legacy YAML/TrainConfig means original per-device behavior.
+    batch_size_scope: str = "per_device"
+    reference_world_size: int = 8
+    optimizer: str = "adamw"
+    # Algorithm initialization only (MasFL Algorithm 1), not an experiment mode.
+    gradient_estimation_only: bool = False
 
 
 @dataclass(slots=True)
@@ -82,6 +88,15 @@ def nested_to_device(value: Any, device: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(nested_to_device(item, device) for item in value)
     return copy.deepcopy(value)
+
+
+def load_evaluation_state(model: Any, state: Mapping[str, Any]) -> None:
+    """Ordinary states are unchanged; Pilot may attach private visual state."""
+    if "__federated_state__" in state:
+        model.load_trainable(state["__federated_state__"])
+        model.load_method_private_state(state["__private_state__"])
+    else:
+        model.load_trainable(state)
 
 
 def _binary_value(left: ScalarOrTensor, right: ScalarOrTensor, fn: Any) -> ScalarOrTensor:

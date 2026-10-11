@@ -22,6 +22,11 @@ from typing import Any
 import yaml
 from tqdm.auto import tqdm
 
+from afl_vlm.batching import (
+    freeze_runtime_batch_config,
+    planned_optimizer_steps,
+    resolve_batch_layout,
+)
 from afl_vlm.config import resolved_public_config, validate_config
 from afl_vlm.data.afvlm_cm import AFVLMDataModule
 from afl_vlm.evaluation import merge_evaluation_outputs
@@ -30,13 +35,15 @@ from afl_vlm.evaluation_schedule import (
     evaluation_progress_count,
 )
 from afl_vlm.federation.server import FederatedServer
-from afl_vlm.federation.types import ClientContext
+from afl_vlm.federation.types import ClientContext, ServerContext
 from afl_vlm.federation.worker_pool import (
     ClientWorkerPool,
     EvaluationCompleted,
     EvaluationJob,
     EvaluationProgress,
     FreshStateRequest,
+    ObjectiveFeedbackCompleted,
+    ObjectiveFeedbackJob,
     TrainCompleted,
     TrainJob,
     WorkerFailed,
@@ -53,6 +60,7 @@ from afl_vlm.models.base import (
     state_norm,
     state_to_device,
 )
+from afl_vlm.scheduling.timeline import EventTimeline
 from afl_vlm.scheduling.train_plan import (
     build_train_plan,
     event_records,
@@ -86,6 +94,7 @@ def _merge_parallel_evaluation(
     states: Mapping[str, Any],
     split: str,
     shard_payloads: list[dict[str, Any]],
+    include_clients: bool = False,
 ) -> dict[str, Any]:
     """Reconstruct complete corpora and compute each metric exactly once."""
 
@@ -116,27 +125,44 @@ def _merge_parallel_evaluation(
     if set(states) == {"global"}:
         return {task: metric_for("global", task) for task in sorted(tasks)}
     by_task: dict[str, list[dict[str, float]]] = defaultdict(list)
+    per_client = {}
     for client_id in sorted(states):
         task = client_id.split("/", 1)[0]
-        by_task[task].append(metric_for(client_id, task))
-    return {
+        row = metric_for(client_id, task)
+        per_client[client_id] = row
+        by_task[task].append(row)
+    task_metrics = {
         task: {metric: sum(row[metric] for row in rows) / len(rows) for metric in rows[0]}
         for task, rows in by_task.items()
     }
+    return {"per_task": task_metrics, "per_client": per_client} if include_clients else task_metrics
 
 
 def _build_plan(config: dict[str, Any], method: Any, profiles: list[Any]) -> list[Any]:
     federation = config["federation"]
     training = config["training"]
+    layout = resolve_batch_layout(training)
     if method.capabilities.requires_custom_scheduler or method.capabilities.mode == "synchronous":
         return build_train_plan(
             profiles,
             int(federation["rounds"]),
             int(training["local_epochs"]),
             int(training["batch_size"]),
-            int(training["gradient_accumulation"]),
+            int(training["gradient_accumulation"])
+            * (
+                layout.reference_world_size
+                if method.capabilities.requires_local_step_control
+                and layout.batch_size_scope == "reference_ddp"
+                else 1
+            ),
             method.capabilities.mode,
             config["method"].get("params", {}),
+            optimizer_step_cost_scale=(
+                layout.reference_world_size
+                if method.capabilities.requires_local_step_control
+                and layout.batch_size_scope == "reference_ddp"
+                else 1.0
+            ),
         )
     plan = load_train_plan(federation["train_plan"])
     expected_steps = {
@@ -197,6 +223,7 @@ def _resolve_runtime_devices(runtime: dict[str, Any]) -> tuple[list[int], Any]:
 
 def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     """Run a formal experiment using one process per configured GPU."""
+    config = freeze_runtime_batch_config(config)
     validate_config(config)
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()
@@ -205,6 +232,16 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     runtime = config["runtime"]
     queue_policy = str(runtime.get("worker_queue", "plan_arrival_edf"))
     devices, aggregation_device = _resolve_runtime_devices(runtime)
+    # Workers train DIFFERENT clients; one client's training world is always one.
+    batch_layout = resolve_batch_layout(config["training"], 1)
+    tqdm.write(
+        "[AFVLM-CM] batch budget: "
+        f"scope={batch_layout.batch_size_scope}, "
+        f"effective_batch={batch_layout.effective_batch_size}, "
+        f"training_ranks=1, per_device_batch={batch_layout.per_device_batch_size}, "
+        f"physical_accumulation={batch_layout.physical_gradient_accumulation}, "
+        f"concurrent_client_workers={len(devices)}"
+    )
     seed = int(config["run"]["seed"])
     random.seed(seed)
     np.random.seed(seed)
@@ -218,6 +255,8 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     for name in ("events.jsonl", "updates.jsonl", "task_metrics.jsonl"):
         (output / name).write_text("", encoding="utf-8")
+    if method.capabilities.requires_arrival_objective_feedback:
+        (output / "algorithm_objective_feedback.jsonl").write_text("", encoding="utf-8")
     started_at = time.time()
     (output / "train.log").write_text(
         f"AFVLM-CM run start\nmethod={method.name}\nseed={seed}\n"
@@ -288,6 +327,8 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     evaluation_progress_last: dict[tuple[str, int], int] = {}
     completed_updates: dict[int, Any] = {}
     completed_evaluations: dict[str, dict[str, Any]] = {}
+    completed_feedback: dict[str, dict[str, Any]] = {}
+    pending_refresh_jobs: dict[int, TrainJob] = {}
     logical_fresh_states: dict[int, tuple[dict[str, Any], int]] = {}
     waiting_fresh_requests: dict[int, list[FreshStateRequest]] = defaultdict(list)
 
@@ -373,6 +414,9 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             if isinstance(message, EvaluationCompleted):
                 completed_evaluations[message.job_id] = message.outputs
                 return
+            if isinstance(message, ObjectiveFeedbackCompleted):
+                completed_feedback[message.job_id] = message.feedback
+                return
             if isinstance(message, WorkerFailed):
                 raise RuntimeError(
                     f"GPU worker {message.worker_id} failed during {message.job_id}:\n"
@@ -389,9 +433,42 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 handle_message(pool.receive())
             return completed_updates.pop(event_id)
 
+        if method.capabilities.requires_initial_gradient:
+            from afl_vlm.federation.initialization import (
+                initial_gradient_jobs,
+                initial_gradient_record,
+            )
+
+            tqdm.write(
+                f"[AFVLM-CM] {method.name}: initializing controls from real client gradients"
+            )
+            initialization_started = time.time()
+            initialization_jobs = initial_gradient_jobs(
+                config, profiles, state_to_device(server.state, "cpu")
+            )
+            for job in initialization_jobs:
+                pool.submit(job, defer=True)
+            initialization_records = []
+            for job in initialization_jobs:
+                update = update_to_device(wait_for_update(job.event.event_id), aggregation_device)
+                initialization_records.append(initial_gradient_record(update))
+                method.initialize_client_gradient(update)
+            method.finalize_initial_gradients()
+            _write_json(
+                output / "algorithm_initialization.json",
+                {
+                    "algorithm": method.name,
+                    "server_version": server.version,
+                    "wall_time_seconds": time.time() - initialization_started,
+                    "protocol": "fixed_initial_model_mean_local_gradients",
+                    "clients": initialization_records,
+                    "extra_work_not_in_train_plan": True,
+                },
+            )
+
         evaluation_counter = 0
 
-        def run_evaluation(split: str) -> dict[str, Any]:
+        def run_evaluation(split: str, states_override: Any = None) -> dict[str, Any]:
             nonlocal evaluation_counter
             evaluation_counter += 1
             group_id = f"evaluation:{evaluation_counter}:v{server.version}:{split}"
@@ -400,10 +477,10 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 if method.evaluation_scope == "client_local_mean"
                 else {"global": server.state}
             )
-            worker_states = {key: state_to_device(state, "cpu") for key, state in states.items()}
-            job_ids = [
-                f"{group_id}:shard{shard_index}" for shard_index in range(pool.worker_count)
-            ]
+            if states_override is not None:
+                states = states_override
+            worker_states = {key: nested_to_device(state, "cpu") for key, state in states.items()}
+            job_ids = [f"{group_id}:shard{shard_index}" for shard_index in range(pool.worker_count)]
 
             # Evaluation is a synchronous snapshot operation.  First stop new
             # training dispatches and let only the jobs already executing on a
@@ -433,7 +510,13 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 while any(job_id not in completed_evaluations for job_id in job_ids):
                     handle_message(pool.receive())
                 payloads = [completed_evaluations.pop(job_id) for job_id in job_ids]
-                return _merge_parallel_evaluation(data_module, states, split, payloads)
+                return _merge_parallel_evaluation(
+                    data_module,
+                    states,
+                    split,
+                    payloads,
+                    include_clients=states_override is not None,
+                )
             finally:
                 bar = evaluation_progress.pop(group_id, None)
                 if bar is not None:
@@ -454,18 +537,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
         periodic_split = str(config["evaluation"].get("periodic_split", "validation"))
         final_split = str(config["evaluation"].get("final_split", "final"))
         training = config["training"]
-        timeline: list[tuple[float, int, str, Any]] = []
-        for event in plan:
-            timeline.append((event.start_time, 2, "start", event))
-            if method.capabilities.requires_fresh_global_during_local_training:
-                refresh_fraction = float(
-                    config["method"].get("params", {}).get("refresh_fraction", 0.5)
-                )
-                refresh_time = event.start_time + refresh_fraction * event.estimated_train_time
-                timeline.append((refresh_time, 1, "refresh", event))
-                record_by_event[event.event_id]["fresh_request_time"] = refresh_time
-            timeline.append((event.arrival_time, 0, "arrival", event))
-        timeline.sort(key=lambda row: (row[0], row[1], row[3].client_id, row[3].local_round))
+        timeline = EventTimeline(plan)
         federation_progress = tqdm(
             total=len(plan),
             desc=f"{method.name} virtual arrivals",
@@ -535,16 +607,34 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     seed=_seed(seed, event.client_id, event.local_round),
                 )
                 start_state = method.prepare_download(clone_state(base_state), context)
+                physical_steps = (
+                    event.local_steps
+                    if method.capabilities.requires_local_step_control
+                    else planned_optimizer_steps(
+                        profile_by_id[event.client_id].num_samples,
+                        int(training["local_epochs"]),
+                        training,
+                    )
+                )
+                refresh_step = method.select_refresh_step(context, physical_steps)
+                if refresh_step is not None:
+                    record_by_event[event.event_id]["fresh_request_time"] = timeline.refresh(
+                        event, refresh_step, physical_steps
+                    )
+                    record_by_event[event.event_id]["fresh_request_optimizer_step"] = refresh_step
                 method_runtime_state = method.client_runtime_state(context)
                 train_config = TrainConfig(
                     local_epochs=int(training["local_epochs"]),
                     batch_size=int(training["batch_size"]),
                     gradient_accumulation=int(training["gradient_accumulation"]),
+                    batch_size_scope=str(training.get("batch_size_scope", "per_device")),
+                    reference_world_size=int(training.get("reference_world_size", 8)),
                     learning_rate=float(training["learning_rate"]),
+                    optimizer=str(training.get("optimizer", "adamw")),
                     max_text_length=int(training["max_text_length"]),
                     seed=context.seed,
                     collect_mean_gradient=method.capabilities.requires_mean_gradient,
-                    planned_optimizer_steps=event.local_steps,
+                    planned_optimizer_steps=physical_steps,
                     max_local_steps=event.local_steps
                     if method.capabilities.requires_local_step_control
                     else None,
@@ -552,24 +642,33 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 contexts[event.event_id] = context
                 record_by_event[event.event_id]["base_version"] = base_version
                 record_by_event[event.event_id]["download_policy"] = method.name
-                pool.submit(
-                    TrainJob(
-                        event=event,
-                        context=context,
-                        base_state=state_to_device(base_state, "cpu"),
-                        start_state=state_to_device(start_state, "cpu"),
-                        train_config=train_config,
-                        method_runtime_state=nested_to_device(method_runtime_state, "cpu"),
-                        group_size=group_sizes.get(event.group_id),
-                        enqueued_wall_time=time.time(),
-                    ),
-                    defer=queue_policy == "plan_arrival_edf",
+                record_by_event[event.event_id]["physical_optimizer_steps"] = physical_steps
+                record_by_event[event.event_id]["physical_executor"] = "client_parallel"
+                job = TrainJob(
+                    event=event,
+                    context=context,
+                    base_state=state_to_device(base_state, "cpu"),
+                    start_state=state_to_device(start_state, "cpu"),
+                    train_config=train_config,
+                    method_runtime_state=nested_to_device(method_runtime_state, "cpu"),
+                    group_size=group_sizes.get(event.group_id),
+                    enqueued_wall_time=time.time(),
                 )
+                if refresh_step is not None:
+                    # Stage until its virtual fresh snapshot exists. Otherwise
+                    # all GPUs can block requesting FUTURE states while an
+                    # earlier virtual arrival still needs a worker to train.
+                    pending_refresh_jobs[event.event_id] = job
+                else:
+                    pool.submit(job, defer=queue_policy == "plan_arrival_edf")
                 continue
             if kind == "refresh":
                 snapshot = (server.state, server.version)
                 logical_fresh_states[event.event_id] = snapshot
                 record_by_event[event.event_id]["fresh_global_version"] = server.version
+                job = pending_refresh_jobs.pop(event.event_id, None)
+                if job is not None:
+                    pool.submit(job, defer=queue_policy == "plan_arrival_edf")
                 for request in waiting_fresh_requests.pop(event.event_id, []):
                     pool.respond_fresh(request, snapshot[0], snapshot[1])
                 continue
@@ -578,6 +677,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             context = contexts.pop(event.event_id)
             raw_update = update_to_device(raw_update, aggregation_device)
             update = method.prepare_upload(raw_update, context)
+            update.metadata.update(event.metadata)
             stale = server.version - update.base_version
             staleness_values.append(stale)
             queue_wait = update.metadata.get("physical_queue_wait_seconds")
@@ -606,6 +706,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     "arrival_time": update.arrival_time,
                     "local_delta_norm": state_norm(update.delta),
                     "optimizer_steps": update.optimizer_steps,
+                    "batching": update.metadata.get("batching"),
                     "sample_ids_hash": update.sample_ids_hash,
                     "worker_id": update.metadata.get("worker_id"),
                     "visible_device_id": update.metadata.get("visible_device_id"),
@@ -620,6 +721,33 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 },
             )
             receive_version = server.version
+            feedback_request = method.arrival_feedback_request(
+                update, ServerContext(server.state, server.version, len(partitions))
+            )
+            if feedback_request is not None:
+                feedback_id = f"objective:{event.event_id}:v{server.version}"
+                pool.suspend_dispatch()
+                try:
+                    pool.submit(
+                        ObjectiveFeedbackJob(
+                            feedback_id,
+                            nested_to_device(feedback_request, "cpu"),
+                            int(training["max_text_length"]),
+                        ),
+                        priority=True,
+                    )
+                    pool.dispatch_priority_jobs()
+                    while feedback_id not in completed_feedback:
+                        handle_message(pool.receive())
+                        pool.dispatch_priority_jobs()
+                    feedback = completed_feedback.pop(feedback_id)
+                finally:
+                    pool.resume_dispatch()
+                update.metadata["arrival_objective_feedback"] = feedback
+                _append(
+                    output / "algorithm_objective_feedback.jsonl",
+                    {"update_id": update.update_id, **feedback},
+                )
             results = server.receive(update)
             evaluation_count = evaluation_progress_count(
                 server, method.evaluation_scope, eval_schedule.unit
@@ -718,10 +846,26 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 "per_task": metrics,
             },
         )
+        secondary_states = method.secondary_evaluation_states(server.state)
+        if secondary_states:
+            personalized_metrics = run_evaluation(final_split, secondary_states)
+            _write_json(
+                output / "personalized_metrics.json",
+                {
+                    "protocol": "native_personalized_secondary",
+                    "split": final_split,
+                    "server_version": server.version,
+                    "client_ids": sorted(secondary_states),
+                    "per_task": personalized_metrics["per_task"],
+                    "per_client": personalized_metrics["per_client"],
+                    "note": "Full held-out corpus per client; within-task client macro-average.",
+                },
+            )
         stats: dict[str, Any] = {
             "runtime_backend": "client_parallel",
             "physical_dispatch_policy": queue_policy,
             "gpu_workers": len(devices),
+            **batch_layout.as_dict(),
             "visible_device_ids": devices,
             "aggregation_device": str(aggregation_device),
             "wall_clock_seconds": time.time() - started_at,
@@ -758,8 +902,16 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 for group in group_sizes
             }
             stats["group_completion_spread"] = {
-                str(group): max(item.arrival_time for item in plan if item.group_id == group)
-                - min(item.arrival_time for item in plan if item.group_id == group)
+                str(group): max(
+                    item.metadata.get("communication_arrival_time", item.arrival_time)
+                    for item in plan
+                    if item.group_id == group
+                )
+                - min(
+                    item.metadata.get("communication_arrival_time", item.arrival_time)
+                    for item in plan
+                    if item.group_id == group
+                )
                 for group in group_sizes
             }
         _write_json(output / "system_stats.json", stats)

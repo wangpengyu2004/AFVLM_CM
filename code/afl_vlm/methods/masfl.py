@@ -1,32 +1,22 @@
-"""MasFL and AdaMasFL (ICML 2025) adapted to federated LoRA states.
-
-Paper: "Momentum-Driven Adaptivity: Towards Tuning-Free Asynchronous
-Federated Learning", ICML 2025.
-
-MasFL implements the paper's two-level momentum/control-variate recursion:
-clients optimize with beta*(grad-c_i+c)+(1-beta)*g and the server updates the
-client controls, global control, and historical descent momentum.  AdaMasFL
-normalizes this local direction and aggregates the actual normalized local
-displacement, as specified by the adaptive variant.  All vectors below are
-LLaVA LoRA/federated-trainable states, not frozen backbone parameters.
+"""MasFL/AdaMasFL, ICML 2025, Algorithms 1--4, LoRA specialization.
+Paper: https://proceedings.mlr.press/v267/yan25f.html .
+No verified author repository. Real fixed-model gradient initialization,
+uniform arrival averaging, separate local/server controls, SGD/normalized SGD.
+Initial-gradient work is recorded separately and never counted as an upload.
 """
 
 from __future__ import annotations
 
+import copy
+import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from afl_vlm.federation.types import MethodCapabilities, ServerContext, ServerMutation, Update
 from afl_vlm.methods.base import Method
 from afl_vlm.methods.registry import register_method
-from afl_vlm.models.base import (
-    add_scaled,
-    clone_state,
-    scale_state,
-    subtract,
-    weighted_mean_states,
-    zeros_like,
-)
+from afl_vlm.models.base import add_scaled, clone_state, mean_states, scale_state, subtract
 
 
 class _MasFL(Method):
@@ -36,6 +26,7 @@ class _MasFL(Method):
         requires_staleness=True,
         requires_local_state=True,
         requires_mean_gradient=True,
+        requires_initial_gradient=True,
     )
     allowed_params = {
         "beta",
@@ -49,124 +40,196 @@ class _MasFL(Method):
 
     def __init__(self, params: Mapping[str, Any] | None = None) -> None:
         super().__init__(params)
+        beta = float(self.params.get("beta", 0.9))
+        if not math.isfinite(beta) or not 0 <= beta <= 1:
+            raise ValueError("MasFL beta must be in [0, 1]")
+        for key, default in (
+            ("server_lr", 1.0 if self.adaptive else 0.01),
+            ("client_lr", 2e-5),
+            ("normalize_epsilon", 1e-12),
+        ):
+            value = float(self.params.get(key, default))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"MasFL {key} must be finite and positive")
+        if int(self.params.get("buffer_size", 1)) <= 0:
+            raise ValueError("MasFL buffer_size must be positive")
         self.client_controls: dict[str, dict[str, Any]] = {}
+        self.local_controls: dict[str, dict[str, Any]] = {}
         self.global_control = None
         self.momentum = None
         self.buffer: list[Update] = []
+        self.initial_gradient_only = False
+        self.expected_clients = 0
+
+    def configure_server(self, initial_state: dict[str, Any], clients: list[Any]) -> None:
+        self.expected_clients = len(clients)
+        if int(self.params.get("total_clients", self.expected_clients)) != self.expected_clients:
+            raise ValueError("MasFL total_clients must match the actual client population")
+
+    def configure_model(self, model: Any, clients: list[Any]) -> None:
+        # Normalized SGD can make per-coordinate steps far smaller than FP16
+        # resolution. Keep only federated trainables in FP32, not the 7B backbone.
+        for _, parameter in model.named_federated_parameters():
+            parameter.data = parameter.data.float()
+
+    def initialize_client_gradient(self, update: Update) -> None:
+        if update.mean_gradient is None or update.optimizer_steps <= 0:
+            raise ValueError("MasFL initialization requires real local mean gradients")
+        if update.client_id in self.client_controls:
+            raise ValueError("Duplicate MasFL initial client gradient")
+        self.client_controls[update.client_id] = clone_state(update.mean_gradient)
+        self.local_controls[update.client_id] = clone_state(update.mean_gradient)
+
+    def finalize_initial_gradients(self) -> None:
+        if len(self.client_controls) != self.expected_clients:
+            raise ValueError("MasFL requires initial gradients from every client")
+        self.global_control = mean_states(self.client_controls.values())
+        self.momentum = clone_state(self.global_control)
 
     def prepare_download(self, global_state: dict[str, Any], context: Any) -> dict[str, Any]:
-        if self.global_control is None:
-            self.global_control = zeros_like(global_state)
-            self.momentum = zeros_like(global_state)
-        self.client_controls.setdefault(context.client_id, zeros_like(global_state))
+        if self.global_control is None or context.client_id not in self.local_controls:
+            raise RuntimeError("MasFL initial-gradient protocol has not completed")
         return clone_state(global_state)
 
+    def configure_local_training(self, train_config: Any) -> Any:
+        # AdamW destroys the paper's SGD / normalized-SGD recursion.
+        return replace(
+            train_config,
+            optimizer="sgd",
+            learning_rate=float(self.params.get("client_lr", train_config.learning_rate)),
+            gradient_estimation_only=self.initial_gradient_only,
+        )
+
     def transform_gradients(self, model: Any, context: Mapping[str, Any]) -> None:
-        client = context["client"]
+        if self.initial_gradient_only:
+            return
+        import torch
+
         beta = float(self.params.get("beta", 0.9))
-        local = self.client_controls[client.client_id]
-        eps = float(self.params.get("normalize_epsilon", 1e-12))
-        device_controls = context.setdefault("masfl_device_controls", {})
+        local = self.local_controls[context["client"].client_id]
+        controls = context.setdefault("masfl_device_controls", {})
         direction = {}
-        for name, parameter in model.named_federated_parameters():
-            controls = device_controls.get(name)
-            if controls is None:
-                controls = (
-                    local[name].to(parameter.device, dtype=parameter.dtype),
-                    self.global_control[name].to(parameter.device, dtype=parameter.dtype),
-                    self.momentum[name].to(parameter.device, dtype=parameter.dtype),
+        with torch.no_grad():
+            for name, parameter in model.named_federated_parameters():
+                if parameter.grad is None:
+                    raise RuntimeError(f"MasFL requires every federated gradient: {name}")
+                if name not in controls:
+                    controls[name] = tuple(
+                        state[name].detach().to(parameter.device, dtype=torch.float32)
+                        for state in (local, self.global_control, self.momentum)
+                    )
+                ci, c, g = controls[name]
+                direction[name] = beta * (parameter.grad.float() - ci + c) + (1 - beta) * g
+            if self.adaptive:
+                norm = sum(value.square().sum() for value in direction.values()).sqrt()
+                direction = scale_state(
+                    direction,
+                    norm.clamp_min(float(self.params.get("normalize_epsilon", 1e-12))).reciprocal(),
                 )
-                device_controls[name] = controls
-            old_c, global_c, old_g = controls
-            direction[name] = beta * (parameter.grad - old_c + global_c) + (1.0 - beta) * old_g
-        if self.adaptive:
-            norm_squared = None
-            for value in direction.values():
-                term = value.detach().float().square().sum()
-                norm_squared = term if norm_squared is None else norm_squared + term
-            norm = norm_squared.sqrt().clamp_min(eps)
-            direction = scale_state(direction, norm.reciprocal())
-        for name, parameter in model.named_federated_parameters():
-            parameter.grad.copy_(direction[name])
+            for name, parameter in model.named_federated_parameters():
+                parameter.grad.copy_(direction[name])
 
     def client_runtime_state(self, context: Any) -> dict[str, Any]:
         return {
-            "client_control": clone_state(self.client_controls[context.client_id]),
+            "client_control": clone_state(self.local_controls[context.client_id]),
             "global_control": clone_state(self.global_control),
             "momentum": clone_state(self.momentum),
         }
 
     def load_client_runtime_state(self, state: Mapping[str, Any], context: Any) -> None:
-        self.client_controls = {
-            context.client_id: clone_state(state["client_control"]),
-        }
+        self.initial_gradient_only = bool(state.get("initial_gradient_only", False))
+        if self.initial_gradient_only:
+            return
+        self.local_controls = {context.client_id: clone_state(state["client_control"])}
         self.global_control = clone_state(state["global_control"])
         self.momentum = clone_state(state["momentum"])
+
+    def prepare_upload(self, update: Update, context: Any) -> Update:
+        if update.mean_gradient is None:
+            raise ValueError("MasFL raw mean-gradient control cannot be replaced by displacement")
+        self.local_controls[update.client_id] = clone_state(update.mean_gradient)
+        return update
 
     def _flush(self, context: ServerContext) -> ServerMutation:
         updates, self.buffer = self.buffer, []
         beta = float(self.params.get("beta", 0.9))
-        total_clients = int(self.params.get("total_clients", context.expected_clients))
         changes = []
         for update in updates:
-            old = self.client_controls[update.client_id]
-            new = update.mean_gradient or scale_state(
-                update.delta,
-                -1.0 / max(1, update.optimizer_steps * float(self.params.get("client_lr", 2e-5))),
-            )
-            changes.append(subtract(new, old))
-            self.client_controls[update.client_id] = clone_state(new)
-        mean_change = weighted_mean_states(changes, [u.num_samples for u in updates])
-        momentum_input = add_scaled(self.global_control, mean_change, 1.0)
-        self.momentum = add_scaled(scale_state(momentum_input, beta), self.momentum, 1.0 - beta)
-        for change in changes:
-            self.global_control = add_scaled(self.global_control, change, 1.0 / total_clients)
+            if update.mean_gradient is None:
+                raise ValueError("MasFL arrival is missing its raw mean gradient")
+            changes.append(subtract(update.mean_gradient, self.client_controls[update.client_id]))
+            self.client_controls[update.client_id] = clone_state(update.mean_gradient)
         if self.adaptive:
-            direction = weighted_mean_states(
-                [
-                    scale_state(
-                        update.delta,
-                        -1.0
-                        / max(
-                            1, update.optimizer_steps * float(self.params.get("client_lr", 2e-5))
-                        ),
-                    )
-                    for update in updates
-                ],
-                [u.num_samples for u in updates],
-            )
-            new_state = add_scaled(
-                context.global_state, direction, -float(self.params.get("server_lr", 1.0))
-            )
+            directions = []
+            for update in updates:
+                eta = float(update.metadata["local_learning_rate"])
+                if eta <= 0 or update.optimizer_steps <= 0:
+                    raise ValueError("AdaMasFL requires positive actual eta and K")
+                directions.append(scale_state(update.delta, -1 / (eta * update.optimizer_steps)))
+            descent = mean_states(directions)  # Algorithm 3 step 5
         else:
-            new_state = add_scaled(
-                context.global_state, self.momentum, -float(self.params.get("server_lr", 0.01))
-            )
+            descent = self.momentum
+        self.momentum = add_scaled(
+            scale_state(add_scaled(self.global_control, mean_states(changes), 1), beta),
+            descent,
+            1 - beta,
+        )
+        for change in changes:
+            self.global_control = add_scaled(self.global_control, change, 1 / self.expected_clients)
+        server_lr = float(self.params.get("server_lr", 1.0 if self.adaptive else 0.01))
+        state = add_scaled(
+            context.global_state, descent if self.adaptive else self.momentum, -server_lr
+        )
         return ServerMutation(
-            new_state,
-            float(self.params.get("server_lr", 0.01)),
+            state,
+            server_lr,
             [u.update_id for u in updates],
-            metadata={"variant": self.name, "control_updates": len(updates)},
+            metadata={
+                "variant": self.name,
+                "control_updates": len(updates),
+                "buffer_weighting": "uniform",
+                "local_optimizer": "sgd",
+            },
         )
 
     def on_arrival(self, update: Update, server_context: ServerContext) -> list[ServerMutation]:
         self.buffer.append(update)
-        if len(self.buffer) >= int(self.params.get("buffer_size", 1)):
-            return [self._flush(server_context)]
-        return []
+        return (
+            [self._flush(server_context)]
+            if len(self.buffer) >= int(self.params.get("buffer_size", 1))
+            else []
+        )
 
     def on_finish(self, server_context: ServerContext) -> list[ServerMutation]:
         return [self._flush(server_context)] if self.buffer else []
 
     def state_dict(self) -> dict[str, Any]:
-        return {
-            "params": self.params,
-            "client_controls": self.client_controls,
-            "global_control": self.global_control,
-            "momentum": self.momentum,
-            "buffer": self.buffer,
-            "adaptive": self.adaptive,
-        }
+        return copy.deepcopy(
+            {
+                key: getattr(self, key)
+                for key in (
+                    "params",
+                    "client_controls",
+                    "local_controls",
+                    "global_control",
+                    "momentum",
+                    "buffer",
+                    "expected_clients",
+                )
+            }
+        )
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        self.__init__(state["params"])
+        for key in (
+            "client_controls",
+            "local_controls",
+            "global_control",
+            "momentum",
+            "buffer",
+            "expected_clients",
+        ):
+            setattr(self, key, copy.deepcopy(state[key]))
 
 
 @register_method("masfl")

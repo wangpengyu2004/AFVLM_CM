@@ -19,6 +19,11 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "code"))
 
+from afl_vlm.batching import (  # noqa: E402
+    detect_reference_world_size,
+    freeze_reference_training,
+    resolve_batch_layout,
+)
 from afl_vlm.config import load_config, validate_config  # noqa: E402
 from afl_vlm.federation.types import ClientSpec  # noqa: E402
 from afl_vlm.methods.registry import method_names  # noqa: E402
@@ -179,6 +184,8 @@ def create_profile(
     profile_name: str,
     seed: int,
     reuse_plans_from: str | None,
+    *,
+    reference_world_size: int | None = None,
 ) -> Path:
     """Create one immutable, self-contained experiment configuration profile."""
     name = _validate_profile_name(profile_name)
@@ -188,7 +195,16 @@ def create_profile(
             f"Experiment profile already exists and will not be overwritten: {target}"
         )
     base_config = yaml.safe_load((root / "configs" / "base.yaml").read_text(encoding="utf-8"))
-    training = dict(base_config["training"])
+    detected_reference = (
+        detect_reference_world_size() if reference_world_size is None else reference_world_size
+    )
+    training = freeze_reference_training(base_config["training"], detected_reference)
+    batch_layout = resolve_batch_layout(training)
+    print(
+        f"[AFVLM-CM] freezing batch reference: GPUs={batch_layout.reference_world_size}, "
+        f"effective_batch={batch_layout.effective_batch_size}, "
+        f"source={'visible_cuda_devices' if reference_world_size is None else 'command_line'}"
+    )
     rounds = int(base_config["federation"]["rounds"])
     task_compute_factors = {
         task: float(value)
@@ -258,6 +274,7 @@ def create_profile(
             )
             config = copy.deepcopy(load_config(source))
             config.pop("_config_path", None)
+            config["training"] = freeze_reference_training(config["training"], detected_reference)
             config["run"]["seed"] = seed
             config["federation"]["system_profile"] = system_path
             config["federation"]["train_plan"] = plan_path
@@ -294,6 +311,19 @@ def create_profile(
         "plan_source": reuse_plans_from or "generated_from_local_data",
         "run_seed": seed,
         "training": training,
+        "batch_budget": {
+            "scope": batch_layout.batch_size_scope,
+            "reference_effective_batch_size": batch_layout.effective_batch_size,
+            "reference_world_size": batch_layout.reference_world_size,
+            "reference_source": "visible_cuda_devices"
+            if reference_world_size is None
+            else "command_line",
+            "loss_normalization": "reference_rank_micro_batch_mean"
+            if batch_layout.batch_size_scope == "reference_ddp"
+            else "legacy_micro_batch_mean",
+            # Preserve the existing virtual schedule, not the old physical worker budget.
+            "plan_step_semantics": "legacy_single_rank_nominal_steps",
+        },
         "federation": {"rounds": rounds},
         "task_compute_factors": task_compute_factors,
         "runtime": copy.deepcopy(base_config.get("runtime", {"backend": "serial"})),
@@ -316,6 +346,12 @@ def main() -> None:
     parser.add_argument("--profile", help="New immutable profile name")
     parser.add_argument("--seed", type=int, help="Run/system seed; defaults to configs/base.yaml")
     parser.add_argument(
+        "--reference_world_size",
+        type=int,
+        help="Optional reference GPU count for offline profile creation; defaults to "
+        "automatic detection of visible CUDA GPUs. Saved in snapshots, not base.yaml.",
+    )
+    parser.add_argument(
         "--reuse_plans_from",
         help="Copy compatible plans from another profile, or use 'current' for plans/afvlm_cm",
     )
@@ -330,7 +366,13 @@ def main() -> None:
     base_config = yaml.safe_load((root / "configs" / "base.yaml").read_text(encoding="utf-8"))
     seed = int(args.seed if args.seed is not None else base_config["run"]["seed"])
     try:
-        target = create_profile(root, args.profile, seed, args.reuse_plans_from)
+        target = create_profile(
+            root,
+            args.profile,
+            seed,
+            args.reuse_plans_from,
+            reference_world_size=args.reference_world_size,
+        )
     except (FileExistsError, FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
     print(f"Created immutable experiment profile: {target}")

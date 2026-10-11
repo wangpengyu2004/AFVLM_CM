@@ -3,7 +3,7 @@
 method:
   name: nufilt_lora
   params:
-    merge_weight: 0.5
+    merge_weight: 1.0
     staleness:
       type: constant
     filter_rank: 8

@@ -1,120 +1,76 @@
 # Baseline Implementation Notes
 
-All methods exchange only LLaVA LoRA/configured trainable tensors. Frozen
-LLaVA-1.5-7B parameters are never placed in an update or federated checkpoint.
-For fair comparison, every client job creates a fresh AdamW optimizer; local
-optimizer moments do not persist across jobs.
+The current authoritative algorithm/source/parameter audit is
+[baseline_audit.md](baseline_audit.md). It supersedes the former scalar-gate
+UniFed, joint-loss residual Pilot, heuristic FedASMU and static Compass descriptions.
+The criterion is complete core functionality with disclosed LoRA/fixed-task
+adaptations, not copying source bugs or claiming reproduced paper scores.
 
-For all ordinary methods, `training.local_epochs` is the sole local-work
-controller. The TrainPlan's `local_steps` value is derived from client sample
-count, batch size, gradient accumulation, and local epochs; it estimates virtual
-duration but does not truncate training. FedCompass is the intentional exception
-because bounded local-iteration allocation is part of its scheduler.
+## Shared protocol and algorithm exceptions
 
-Primary evaluation is always the current server federated state at common
-incorporated-client-update milestones and the final server state after method
-finalization. Buffered, grouped, and synchronous aggregations advance this
-budget by their actual number of contributing updates; one model is evaluated
-once after a threshold-crossing aggregation. Local-only is the sole state-scope
-exception because no server model exists, and uses completed local updates for
-the same budget. Pilot's
-server-global evaluation uses task routing with a task-wise mean of its
-server-held client visual adapters; personalized LoRA states are not used as
-the primary score.
+All ordinary methods use the same LLaVA checkpoint, language LoRA, dataset,
+random seed, held-out corpora and reference effective-batch budget. Frozen 7B
+parameters never federate. Fresh local optimizers are created per job.
+MasFL/AdaMasFL require SGD instead of AdamW and FP32 trainable adapters; their
+raw-gradient initialization adds recorded work. Pilot adds trainable visual
+connectors and private routing; UniFed adds a server factor hypernetwork.
+These are real algorithm costs, not free or identical parameter budgets.
 
-## Optional continual merging adapters
+New profiles automatically freeze visible GPU count. Reference eight gives
+DDP B4/G4 and worker B4/G32, both128, with identical reference shard/tail
+objectives. This is not bitwise/dropout equivalence. Immutable legacy profiles
+remain unchanged. See [batch_fairness.md](batch_fairness.md).
 
-The optional continual-merging group adds `opcm_lora`, `dop_lora`, and
-`nufilt_lora` in an isolated package. These are explicitly **asynchronous
-fixed-rank LoRA adaptations**, not exact independent-expert reproductions.
-They use the original client training/evaluation/Plan interfaces and default
-capability-selected client DDP. The original baseline batch is unchanged;
-run them separately using `scripts/run_merging_baselines.sh`.
-See [continual merging equations, sources and limitations](continual_merging.md).
+Ordinary local work is controlled by local_epochs. FedCompass assigns bounded
+physical optimizer steps dynamically. A common system profile fixes speed,
+network delay and initial availability independently of aggregation. Other
+methods replay the same ordinary arrival Plan; Compass compiles its algorithm's
+semi-asynchronous schedule from that same profile.
 
-## Reference and classical FL
+## Availability and invocation
 
-- **Local-only:** persistent per-client LoRA states, no global mutation.
-- **FedAvg:** synchronous sample-count weighted local-state average.
-- **FedProx:** FedAvg plus `mu/2 ||theta-theta_snapshot||²` over federated
-  trainables only.
-- **FedAdam:** synchronous sample-count weighted client deltas with bias-
-  corrected server Adam moments and configurable server learning rate.
+Main runnable comparisons: local, fedavg, fedprox, fedadam, fedasync, fedbuff,
+fedcompass, fedasmu, orthofl, masfl, adamasfl, pilot, unifed_lora. Optional continual **merging**:
+opcm_lora, dop_lora, nufilt_lora. Ours remains the proposed method, not a baseline.
+FedASMU now uses an explicitly disclosed private-client training-objective oracle,
+with dynamic server/local coefficients and learned LSTM/Q request slots. No server
+dataset is reserved. Extra objective work is reported separately; this is not the
+paper's exact global objective. See [implementation and operation](orthofl_fedasmu.md).
 
-## Asynchronous FL
+```bash
+bash scripts/run_one.sh METHOD 2 PROFILE
+bash scripts/run_baselines.sh 2 PROFILE
+bash scripts/run_merging_baselines.sh 2 PROFILE
+```
 
-- **FedAsync:** each job records `base_version`; arrival applies
-  `theta <- theta + alpha*s(staleness)*(theta_client-theta)` with constant,
-  polynomial, or hinge decay.
-- **FedBuff:** maintains an arrival buffer, aggregates client deltas with
-  optional staleness weights, and explicitly flushes or errors on a residual
-  buffer.
+Replace METHOD/PROFILE with actual registry/profile names; setting2 may be5 or10.
+Create a new profile to capture corrected templates. Old Pilot bottleneck and
+UniFed conditioning_scale profiles are rejected, not silently executed as an
+incorrect same-name algorithm. Reuse ordinary Plans only when dataset and all
+local-work/system settings match; see the audit's exact generation command.
 
-## System-heterogeneity methods
+## Evaluation
 
-### FedCompass (ICLR 2024)
+All aggregated methods keep global main evaluation on the common six-task
+pipeline at incorporated-client-update milestones and finalization. Local-only
+has no global model and evaluates per-client models on common task test sets.
+No cross-task raw average is reported. Prediction shards are merged before
+computing complete-corpus metrics; GPU metric averages are not used.
 
-The shared scheduler derives bounded `local_steps_k` from each client's
-epoch-derived nominal work, persisted speed, and base training cost, then groups near-simultaneous completions for
-semi-asynchronous aggregation. It is therefore a compute-aware scheduler, not
-a renamed FedAsync decay. The implementation reuses AFVLM-CM's virtual clock
-and adapts the optimized state from a full model to LoRA.
+Pilot's global deployment view uses shared task connectors plus global text
+LoRA, not a private-client mean connector. UniFed's global view is mean-generated
+LoRA factors. Both views are disclosed adaptations of personalized methods.
+Their native client models are additionally evaluated at the final split into
+personalized_metrics.json, with within-task client macro-averages. Other methods
+do not receive extra evaluations. This secondary file is separate from metrics.json
+and does not alter periodic evaluation frequency or accepted-update counts.
 
-Paper: [FedCompass: Efficient Cross-Silo Federated Learning on Heterogeneous Client Devices Using a Computing Power-Aware Scheduler](https://proceedings.iclr.cc/paper_files/paper/2024/hash/a9f3457fa97f106f1756885237787789-Abstract-Conference.html).
+## Verification limits
 
-### FedASMU (AAAI 2024)
-
-`methods/fedasmu.py` implements dynamic per-client staleness factor `xi`, the
-bounded server interpolation coefficient, and a configurable mid-local
-interpolation with fresher global state. Online loss-improvement signals adapt
-the exposed server/local coefficients. The deterministic refresh point and
-online coefficient rule replace the original full device request/RL control
-path, so this is an explicit LoRA/AFVLM-CM adaptation rather than an exact
-framework reproduction.
-
-Paper: [FedASMU: Efficient Asynchronous Federated Learning with Dynamic Staleness-Aware Model Update](https://ojs.aaai.org/index.php/AAAI/article/download/29297/30446).
-
-### MasFL and AdaMasFL (ICML 2025)
-
-Both variants maintain per-client controls, a global control, and historical
-descent momentum. MasFL corrects local gradients with those controls and uses
-the two-level momentum recursion. AdaMasFL additionally normalizes the local
-direction and aggregates observed normalized displacement. These are not
-generic server-momentum aliases; every vector is the federated LoRA state.
-
-Paper: [Momentum-Driven Adaptivity: Towards Tuning-Free Asynchronous Federated Learning](https://proceedings.mlr.press/v267/yan25f.html).
-
-## Task-heterogeneous multimodal methods
-
-### Pilot (AAAI 2025)
-
-The Pilot-only model wrapper contains task/client visual adapters, CT-MoA
-cross-task routing, difference/load-balance/router losses, task-wise visual
-aggregation, and nearest-client personalized text-LoRA aggregation. Other
-methods retain the common LLaVA model. The current implementation jointly
-optimizes Pilot losses in one run instead of executing a separate paper-style
-pretraining stage; the immutable AFVLM-CM partition remains unchanged.
-
-Paper: [Pilot: Building the Federated Multimodal Instruction Tuning Framework](https://ojs.aaai.org/index.php/AAAI/article/download/35476/37631).
-
-### UniFed-LoRA (CVPR Workshops 2026)
-
-The server hypernetwork conditions LoRA gates on configurable task semantics,
-modality, architecture, layer, and module descriptors. Client indices are not
-descriptors. In this experiment `backbone heterogeneity = disabled` and
-`task heterogeneity = enabled`; adding new architecture/modality descriptor
-dimensions does not require changing the dataset.
-
-Paper: [UniFed-LoRA: Exploiting Semantic Task Correlation for Heterogeneous Multimodal Federated Fine-Tuning](https://openaccess.thecvf.com/content/CVPR2026W/FedVision/html/Milasheuski_UniFed-LoRA_Exploiting_Semantic_Task_Correlation_for_Heterogeneous_Multimodal_Federated_Fine-Tuning_CVPRW_2026_paper.html).
-
-## Proposed method
-
-`ours` implements sensitivity-aware asynchronous LoRA consolidation. Clients
-estimate one mean-absolute Module-Gate sensitivity per LoRA module during the
-normal backward pass; the server uses complete-module functional staleness,
-bias-corrected per-task historical sensitivity, and module-wise precision
-fusion. A bounded sliding window over successfully aggregated task labels
-corrects the current client precision; task memory itself is updated directly
-from client sensitivity and is not reliability/frequency weighted.
-It is excluded from baseline batches because it is the proposed method, not
-because it is unavailable. Full equations and commands are in `docs/ours.md`.
+Equation/state/config checks do not load the VLM, launch training, download
+weights, establish CUDA/NCCL compatibility, guarantee memory fit or reproduce
+original benchmark accuracy. Full client-specific hypernetwork heads and Pilot
+private state can be expensive. Original paper convergence guarantees do not
+automatically transfer to nonuniform Plan arrivals, variable K, LoRA or compact
+server Adam. Sources, numerical boundary fixes and costs are explicitly listed
+in [the audit](baseline_audit.md) and [continual merging](continual_merging.md).

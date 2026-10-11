@@ -109,9 +109,7 @@ class DistributedEvaluationTests(unittest.TestCase):
         ]
 
         self.assertIsNone(_primary_corpus_metrics(adapter, gathered, 2, rank=1))
-        self.assertEqual(
-            _primary_corpus_metrics(adapter, gathered, 2, rank=0), {"score": 1.0}
-        )
+        self.assertEqual(_primary_corpus_metrics(adapter, gathered, 2, rank=0), {"score": 1.0})
         adapter.metric.assert_called_once_with(["p0", "p1"], ["r0", "r1"])
 
     def test_shards_are_merged_in_original_corpus_order(self) -> None:
@@ -185,6 +183,18 @@ class DistributedEvaluationTests(unittest.TestCase):
         )
 
         self.assertEqual(metrics, {"cls": {"score": 1.0}})
+
+        secondary = _merge_parallel_evaluation(
+            data_module, states, "validation", payloads, include_clients=True
+        )
+        self.assertEqual(secondary["per_task"], metrics)
+        self.assertEqual(
+            secondary["per_client"],
+            {
+                "cls/client_0": {"score": 1.0},
+                "cls/client_1": {"score": 1.0},
+            },
+        )
 
 
 if __name__ == "__main__":

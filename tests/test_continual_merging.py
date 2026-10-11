@@ -120,7 +120,7 @@ class FunctionalAlgebraTests(unittest.TestCase):
         old = torch.diag(torch.tensor([4.0, 2.0, 1.0, 0.0]))
         incoming = torch.ones(4, 4)
         clean, rank = opcm_filter(incoming, old, 0.5, 1e-8)
-        self.assertEqual(rank, 1)
+        self.assertEqual(rank, 1)  # Count protects the first singular direction.
         for i in range(3):
             self.assertEqual(float(clean[i, i]), 0)
         self.assertEqual(float(clean[0, 1]), 1)

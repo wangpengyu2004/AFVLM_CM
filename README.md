@@ -1,5 +1,12 @@
 # AFVLM-CM
 
+本次 baseline 功能审查见 [审查报告](docs/baseline_audit.md)：以核心机制完整、功能正确为标准，
+不是逐行复制官方框架。按最新要求加入OrthoFL并补全无服务器数据的FedASMU功能适配，
+额外目标计算/原文差异见[专门说明](docs/orthofl_fedasmu.md)。Pilot/UniFed-LoRA保持
+全局主评估，训练结束另存原生个性化附加结果。
+修正后的方法需要新 profile；旧快照不自动更新。未启动训练，不能把非训练检查当作 GPU
+训练或原论文精度的保证。
+
 AFVLM-CM 是用于论文实验的异步联邦视觉语言模型指令微调框架，研究固定任务客户端下的任务异构与系统异构：每个客户端永久属于一个任务，客户端速度、可用时间和网络延迟不同，但不存在持续学习或任务增量流。
 
 正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。LoRA 仅作用于语言模型侧：即使 `q_proj/k_proj/v_proj` 名称同时匹配 CLIP，冻结的 vision tower/vision resampler 参数也会从优化器、DDP 归约和联邦状态中排除。默认运行时自动发现全部可见 GPU，并按方法能力选择物理执行器：普通 local-epoch 方法与 `ours` 使用全部 GPU 对同一客户端做 DDP，依赖特殊 optimizer-step 轨迹、动态本地步数、中途刷新或动态 adapter 的方法保留“一卡一个客户端”worker pool。两条路径都按同一虚拟 TrainPlan 冻结 base version 并按计划到达顺序聚合。冻结 7B 主干不会上传、聚合或写入联邦检查点。
@@ -29,29 +36,39 @@ data/AFVLM_CM/
 | `visual_reasoning` | FigureQA | answer accuracy | `FigureQA/images/` |
 | `grounding` | COCO grounding | mean IoU、IoU@0.5 accuracy | 与 AOKVQA 共用 `COCO2014/` |
 
-每个任务目录包含 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。当前固定版本为 `fcit_eval_v2_grounding4k5_64k5`，六任务训练记录数依次为 13,000 / 15,000 / 11,000 / 9,500 / 11,500 / 4,500，总计 64,500。该版本只缩减 Grounding 训练池；其多轮结构、validation/final 以及其他五个任务均保持不变。2/5/10 clients/task 三档复用同一任务池，只改变客户端划分。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 固定该版本的静态完整性摘要。
+每个任务目录包含 `client_N.json`、`statistics.json`、`val.json` 和 `test.json`。当前固定版本为 `fcit_eval_v2_grounding8k_68k`，六任务训练记录数依次为 13,000 / 15,000 / 11,000 / 9,500 / 11,500 / 8,000，总计 68,000。该版本只把 Grounding 训练池由 4,500 条扩展为 8,000 条，保留旧训练池全部记录；其多轮结构、validation/final 以及其他五个任务均保持不变。2/5/10 clients/task 三档复用同一任务池，只改变客户端划分。启动时会再次扫描实际文件数；配置中的 12/30/60 不是客户端清单的替代品。`configs/datasets/afvlm_cm_integrity.json` 固定该版本的静态完整性摘要。
 
 数据读取器兼容该 benchmark 实际存在的三种标注形式：LLaVA `conversations`、扁平的 `text + answer`，以及 Grounding 测试集的 `text + answer_bbox`。Grounding 训练会保留完整多轮对话并让每个 assistant 回答参与 loss；validation/final 会把每个 user/assistant 对展开成独立 query。Caption 的 validation/test 每张图片保留五个参考 caption。`max_text_length` 默认使用 LLaVA 的 2k 上下文；若某个多轮样本仍超长，collator 会明确报错而不会静默截掉后面的 assistant 回答。正常训练和独立评估不会在启动时全量扫描图片；样本真正进入 batch 时才读取对应图片。
 
-### 重建固定 64.5k 分区
+### 重建固定 68k 分区
 
 下面命令从 FCIT 指令文件构建一个新候选目录；如果目标目录非空会直接拒绝，不会覆盖当前 `partitioned/`：
 
 ```bash
 python tools/partition_afvlm_cm.py \
   --source_root data/AFVLM_CM/instruction \
-  --output_dir data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5
+  --output_dir data/AFVLM_CM/partitioned_fcitev2_grounding8k_68k
 ```
 
 验证候选目录后，再人工备份旧目录并启用新目录。数据目录不上传 GitHub，因此电脑端和服务器端都要保存/同步同一个固定分区：
 
 ```bash
-mv data/AFVLM_CM/partitioned data/AFVLM_CM/partitioned_fcitev1_72k
-mv data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5 data/AFVLM_CM/partitioned
+# 以下迁移适用于当前仍使用旧 64.5k 分区的服务器；备份目标必须不存在。
+test ! -e data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5 || exit 1
+mv data/AFVLM_CM/partitioned data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5
+mv data/AFVLM_CM/partitioned_fcitev2_grounding8k_68k data/AFVLM_CM/partitioned
 python tools/validate_afvlm_cm_data.py --all
 ```
 
-划分以问题/指令记录为隔离单位，沿用 FCIT 官方问题级 split；DVQA、FigureQA、Grounding 中不同问题或区域可以引用同一原图。每个任务总量不同，同任务客户端大小也不相等；完整数量保存在各任务的 `statistics.json` 和 `partitioned/metadata/partition_report.md`。更换分区后，旧 system profile/TrainPlan 的 `num_samples` 已失效，必须创建不复用旧 Plan 的新 experiment profile。
+划分以问题/指令记录为隔离单位，沿用现有 FCIT 来源及固定验证/测试记录；DVQA、FigureQA、Grounding 中不同问题或区域可以引用同一原图，因此不宣称图片级隔离。训练池使用固定 seed=42 的均匀无放回抽样，再打乱并按不等数量分配客户端；客户端大小限制在同任务平均值的约 0.7～1.3 倍，不额外引入标签 Dirichlet 偏斜。每个任务总量不同，同任务客户端大小也不相等；完整数量保存在各任务的 `statistics.json` 和 `partitioned/metadata/partition_report.md`。更换分区后，旧 system profile/TrainPlan 的 `num_samples` 已失效，必须创建不复用旧 Plan 的新 experiment profile：
+
+```bash
+# 先确认 configs/base.yaml 的实际训练参数；名称本身不设置参数。
+python tools/generate_system_profiles.py --profile grounding8k_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours 2 grounding8k_e1_bs4_ga4_r10_s42
+```
+
+本地旧 64.5k 分区保存在 `data/AFVLM_CM/partitioned_fcitev2_grounding4k5_64k5`，旧 72k 分区备份也保留。此数据调整不修改训练方法、评估规则或批量设置。
 
 需要检查数据时，显式运行独立工具。它会验证当前设置下的全部 `client_N.json`、`val.json`、`test.json`，并对去重后的图片路径逐一检查：
 
@@ -152,22 +169,22 @@ configs/
 ├── datasets/afvlm_cm_{2,5,10}clients.yaml
 ├── methods/{local,...,unifed_lora,ours,opcm_lora,dop_lora,nufilt_lora}.yaml
 └── experiments/llava/afvlm_cm/
-    ├── 2clients/    # 16 个可直接运行配置
-    ├── 5clients/    # 16 个可直接运行配置
-    └── 10clients/   # 16 个可直接运行配置
+    ├── 2clients/    # 17 个方法入口配置；运行限制见复审报告
+    ├── 5clients/    # 17 个方法入口配置；运行限制见复审报告
+    └── 10clients/   # 17 个方法入口配置；运行限制见复审报告
 ```
 
 这三类目录职责不同，不能互相替代：
 
 | 目录 | 作用 | 是否应修改/删除 |
 |---|---|---|
-| `configs/methods/` | 各算法的可编辑参数源；48 个实验入口通过 `inherits` 读取它们，创建新 profile 时也从这里解析当前方法参数 | 可以按实验需要修改；不能删除 |
+| `configs/methods/` | 各算法的可编辑参数源；51 个实验入口通过 `inherits` 读取它们，创建新 profile 时也从这里解析当前方法参数 | 可以按实验需要修改；不能删除 |
 | `plans/afvlm_cm/` | 默认兼容运行使用的 system profile 与 TrainPlan；保证 `bash scripts/run_one.sh <method> <setting>` 和原始实验 YAML 仍可直接运行 | 不要手工修改；当前不能删除 |
 | `experiment_profiles/` | 已冻结的完整配置、system profile 和 TrainPlan 快照，用于正式实验复现和切换旧实验 | 不要修改或覆盖；新参数应创建新 profile |
 
 因此，平时应修改 `configs/base.yaml`、`configs/models/` 或 `configs/methods/`，然后生成新的 `experiment_profiles/<name>/`。正式运行优先指定 profile；`plans/` 仅作为默认兼容入口保留。
 
-同一规模的所有方法继承相同模型、LoRA、客户端优化器、学习率、本地 epoch、batch size、随机种子、数据与评估配置。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。新 profile 保存完全解析后的 48 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径；历史 39 份配置的 profile 仍保留原状，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
+同一规模的普通方法继承相同模型、LoRA、客户端 AdamW、学习率、本地 epoch、batch size、随机种子、数据与评估配置。算法必要例外须单独披露：MasFL/AdaMasFL 用 SGD，FedCompass 动态分配本地步数，Pilot 增加视觉适配器，UniFed-LoRA 使用客户端生成参数，FedASMU额外获取新全局状态并计算客户端目标反馈；不能宣称这些方法具有完全相同的参数量或成本。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。新 profile 保存完全解析后的 51 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径；历史 39 份配置的 profile 仍保留原状，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
 
 普通方法的本地训练量只由 `training.local_epochs` 控制，不再同时设置通用的 `base_local_steps`。TrainPlan 中记录的 `local_steps` 是根据客户端样本数、batch size、梯度累积和 `local_epochs` 推导出的预计优化器步数，只用于虚拟耗时和算法钩子，不会截断普通客户端训练。FedCompass 是唯一例外：其计算能力感知调度器必须动态分配本地迭代，因此使用 `min_local_steps` / `max_local_steps` 作为方法专属边界。
 
@@ -276,7 +293,7 @@ python tools/select_runtime_backend.py \
   --config experiment_profiles/module_gate_freqw18_e1_bs4_ga4_r10_s42/configs/2clients/ours.yaml
 ```
 
-正常应输出 `client_ddp`。`fedcompass`、`fedasmu`、`masfl`、`adamasfl` 和 `pilot`
+正常应输出 `client_ddp`。`fedcompass`、`masfl`、`adamasfl`、`pilot` 和 `unifed_lora`
 会输出 `client_parallel`，这是方法能力约束，不是运行错误。
 
 ### 4. 在 8 卡上启动 `ours`
@@ -339,16 +356,21 @@ bash scripts/run_one.sh fedasync 2 module_gate_freqw18_e1_bs4_ga4_r10_s42 \
   2>&1 | tee fedasync-2clients.log
 ```
 
-依次运行 12 个 baseline（不包含 `ours`）：
+依次运行 13 个 baseline（包含FedASMU适配与OrthoFL，不包含 `ours` 和持续融合组；旧profile没有OrthoFL时须先生成新配置快照）：
 
 ```bash
 bash scripts/run_baselines.sh 2 module_gate_freqw18_e1_bs4_ga4_r10_s42
 ```
 
-将第二个参数改为 `5` 或 `10` 即选择 5/10 clients per task。8 卡 DDP 中
-`training.batch_size` 是**每卡** micro-batch；默认 `batch_size=4`、
-`gradient_accumulation=4` 时，全局有效 batch 为 `4 × 4 × 8 = 128`。GPU 数量属于实验
-条件，正式对比中应保持一致并记录。
+将第二个参数改为 `5` 或 `10` 即选择 5/10 clients per task。base.yaml 无需手填
+`batch_size_scope`、`reference_world_size`；生成 profile 时自动识别可见 GPU 数，
+并将参考卡数固定到所有方法的快照中。有效批量是 batch × 累积 × 保存的参考卡数。
+在八卡服务器生成时，默认128条记录。
+8 卡 DDP 保持每卡4条、累积4次；单卡客户端自动使用4条、累积32次。
+旧 profile 缺少该字段时保留原来的每卡批量语义，必须创建新 profile 才会启用公平模式。
+完整配置、尾批及迁移说明见 [跨执行器批量公平性](docs/batch_fairness.md)。
+无 CUDA 的电脑上生成时，可加 `--reference_world_size 8` 指定目标服务器参考卡数，
+不需要改 base.yaml；程序不会在检测不到 GPU 时静默采用1卡预算。
 
 ## 从修改参数到服务器运行的完整流程
 
@@ -413,7 +435,7 @@ python tools/generate_system_profiles.py \
   --profile e2_bs1_ga4_r20_s42
 ```
 
-此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 48 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
+此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 51 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
 
 如果需要新的随机种子，可显式指定：
 
@@ -449,7 +471,7 @@ experiment_profiles/<profile>/
 # 单个方法：<method> <2|5|10> <profile>
 bash scripts/run_one.sh fedasync 2 lr1e5_alpha03
 
-# 同一 profile 下依次运行全部 12 个 baseline
+# 同一 profile 下依次运行全部 11 个可运行的主 baseline
 bash scripts/run_baselines.sh 2 lr1e5_alpha03
 ```
 
@@ -492,24 +514,31 @@ git push origin main
 
 将方法配置路径和 profile 名替换为本次实际内容。若服务器只负责运行、实验定义统一由电脑端维护，则无需在服务器执行这一提交步骤。
 
-本地优化器策略明确为 **reset per client job**：每个作业从其下载的联邦状态创建新的 AdamW，一、二阶矩不跨作业保留。该策略对所有比较方法一致；FedAdam 等服务器优化器状态独立保存在方法状态中。
+本地优化器策略为 **reset per client job**：普通方法创建新的 AdamW，不跨作业保存优化器 moments。
+MasFL/AdaMasFL 必须使用无 momentum/weight-decay 的 SGD，保留其控制变量递推；这两个方法
+只将联邦可训练参数保持FP32，冻结7B仍使用共同配置精度。算法优化器例外不能伪装成相同AdamW。
+FedAdam 等服务器优化器状态独立保存在方法状态中。
 
 ## 异步语义
 
 运行器按常见异步联邦框架拆分为权威 Server/Method、虚拟时钟 Scheduler、Dispatcher、Client Trainer 和 Aggregator。TrainPlan 只保存开始时间、到达时间、客户端速度、网络延迟、本地工作量和可选调度组，**不保存全局模型或指定客户端必须下载哪个参数版本**。运行器在 `start_time` 读取当时的 `base_version`，再调用该方法自己的 `prepare_download`：普通方法下载全局 LoRA，Local-only 下载客户端本地状态，Pilot 下载个性化状态，UniFed-LoRA 下载任务条件化状态，MasFL/AdaMasFL 同时冻结本地控制变量。即使服务器随后更新，该作业也仍从已冻结的 dispatch package 训练。
 
-worker 完成后先返回未经服务器处理的原始更新；父进程在计划的 `arrival_time` 调用权威方法实例的 `prepare_upload` 和 `on_arrival`。上传包含 `client_id`、`task`、`dataset`、`num_samples`、`base_version`、`arrival_time`、`local_state` 和 `delta`。服务器在到达时计算 `staleness = server_version - base_version`。FedASMU 的中途新鲜模型访问被建模为显式虚拟事件，不依赖某一次运行中偶然的 GPU 完成先后。
+worker 完成后先返回未经服务器处理的原始更新；父进程在计划的 `arrival_time` 调用权威方法实例的 `prepare_upload` 和 `on_arrival`。上传包含 `client_id`、`task`、`dataset`、`num_samples`、`base_version`、`arrival_time`、`local_state` 和 `delta`。服务器在到达时计算 `staleness = server_version - base_version`。FedASMU由学习式时隙选择器插入逻辑refresh，返回当时冻结的全局快照；到达时另做真实客户端训练目标反馈，不改变普通方法路径。
 
 默认 `runtime.arrival_policy: planned` 会按持久化虚拟到达顺序应用更新，`runtime.worker_queue: plan_arrival_edf` 则只优化物理 GPU 执行顺序。逻辑 start 时先冻结 `base_version` 和方法产生的下载状态，在下一次计划 arrival 前把所有已经合法启动的作业放入候选堆，再优先执行计划 `arrival_time` 最早者；提前算完但尚未轮到的结果进入缓存。EDF 不重算下载版本、不提前聚合，也不允许未来 start 事件偷跑，因此某次运行的磁盘抖动或 GPU 波动只影响 wall-clock，不改变方法比较的逻辑到达条件。FedCompass 可以改变本地步数和分组，因为这是算法本身；其他方法不能通过修改 Plan 偷换系统条件。完整生命周期、特殊方法处理、方法服务器状态和任务耗时校准见 [`docs/async_runtime.md`](docs/async_runtime.md)。
 
 物理执行器由 `MethodCapabilities.supports_client_ddp` 选择。普通 local-epoch 方法以及
-`ours` 使用所有可见 GPU 对同一个客户端执行 DDP；FedCompass、FedASMU、MasFL、
-AdaMasFL 和 Pilot 继续使用原来的一卡一客户端 worker pool。前四者显式依赖 local-step
-分配、中途刷新或 optimizer-step 梯度轨迹；Pilot 的任务/客户端专属 adapter 会随客户端
+`ours` 使用所有可见 GPU 对同一个客户端执行 DDP；FedCompass、MasFL、AdaMasFL、Pilot
+和 UniFed-LoRA 使用一卡一客户端 worker pool。前三者依赖 local-step
+分配或 optimizer-step 梯度轨迹；Pilot 的任务/客户端专属 adapter 会随客户端
 产生动态 unused parameters，不与当前重入式梯度检查点强行组合 DDP。两种执行器都只在
-Plan 指定的逻辑 arrival 聚合。
-DDP 的 `training.batch_size` 是每卡 batch，其有效批量为
-`batch_size × gradient_accumulation × GPU数`，这一差异会写入输出，也必须在论文实验中披露。
+Plan 指定的逻辑 arrival 聚合。UniFed-LoRA 使用独立服务器超网络，避免在每个DDP rank复制完整输出头。
+新 profile 自动识别并保存参考卡数；八卡服务器生成的快照固定参考预算128，
+DDP 保留原每卡4条、累积4次；worker-pool 在单卡复现八个参考分片，累积32次。
+两者保留相同的原始分片补齐、尾批和 micro-batch 平均损失规则。
+缺少 scope 字段的旧 profile 仍是 `per_device`，其 DDP 有效批量继续乘 GPU 数。
+直接运行可编辑模板时，训练入口在启动 workers 前识别卡数并保存到 resolved config；
+正式对比建议使用同一份 profile，避免换机器时参考预算随可见卡数改变。
 周期验证和最终测试同样由全部 DDP rank 协同执行：每个任务的样本按 rank 做不重复分片，
 生成结果按原始样本顺序汇总后再计算完整语料级指标。Caption 的 CIDEr 因而仍使用整个
 验证/测试语料计算，而不是错误地平均分片 CIDEr。不存在 rank 0 独自验证、其余 rank 在
@@ -559,7 +588,8 @@ python tools/estimate_task_compute_factors.py \
 - `fedasync`：逐到达插值，支持 constant、polynomial、hinge 陈旧函数。
 - `fedbuff`：异步缓冲聚合，可选样本量/陈旧加权，结尾强制处理残余缓冲。
 - `fedcompass`：计算能力感知的本地步数分配与分组半异步聚合。
-- `fedasmu`：动态陈旧服务器更新以及一次训练中途新鲜全局调整。
+- `fedasmu`：无服务器数据适配，动态server/local系数元梯度、LSTM/Q请求时隙与fresh global本地混合；用客户端训练目标代理原文全局F，额外成本单列。
+- `orthofl`：独立客户端轨迹、全局原上传模型插值、逐层正交漂移校准后用于该客户端下一轮训练。
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
@@ -617,12 +647,18 @@ bash scripts/run_one.sh fedasync 2
 bash scripts/run_one.sh fedbuff 2
 bash scripts/run_one.sh fedcompass 2
 bash scripts/run_one.sh fedasmu 2
+bash scripts/run_one.sh orthofl 2
 bash scripts/run_one.sh masfl 2
 bash scripts/run_one.sh adamasfl 2
 bash scripts/run_one.sh pilot 2
 bash scripts/run_one.sh unifed_lora 2
 bash scripts/run_one.sh ours 2
 ```
+
+OrthoFL/FedASMU实现、OPCM恢复 `.5` 的说明及新profile运行流程见
+[专门操作说明](docs/orthofl_fedasmu.md)。FedASMU不预留服务器训练数据，但客户端目标代理
+不等于原文全局目标；不能声称原始理论或精度被完全复现。Pilot/UniFed-LoRA已有核心功能
+与全局/个性化双评估，但新实现需新配置快照，UniFed完整输出头还受显存限制。
 
 `ours` 现在只实现本文的 Module-Gate 版本。推荐为正式实验生成独立的不可变 profile：
 
@@ -702,11 +738,18 @@ bash scripts/run_one.sh fedasync 2 v100_fp16_8gpu_edf_e1_bs4_ga4_r10_s42
 
 所有更新条都设置为逐更新刷新；进入周期评估前会再次强制刷新，并输出包含真实
 `server_version` 和 `interval` 的独立状态行。本地进度按 optimizer step 计数，不按
-gradient accumulation 的 micro-batch 计数。因此，若配置为 `gradient_accumulation: 4`，
-进度条增加 1 代表已经完成 4 个 micro-batch 的梯度累积及 1 次参数更新。进度显示只读取
+gradient accumulation 的 micro-batch 计数。参考八卡模式下 DDP 完整窗口每卡累积4次，
+单卡客户端完整窗口累积32次；尾窗口按实际 micro-batch 数处理。
+进度条增加 1 始终代表 1 次参数更新。进度显示只读取
 已有训练状态，不会改变 local epoch、TrainPlan、聚合顺序或虚拟时间。
 
-`batch_size` 是每张 GPU 的真实多模态 micro-batch 大小：文本在当前 batch 内动态 padding，图像组成同一个 batch tensor，并通过一次 LLaVA forward/backward 处理。原 worker pool 的有效批量是 `batch_size × gradient_accumulation`；DDP 的有效批量还要乘以 world size。例如八卡下 `batch_size: 4`、`gradient_accumulation: 4` 的有效批量是 128。修改 batch、卡数或执行策略后必须创建新的实验 profile。
+公平模式下 `batch_size` 是每卡 micro-batch 大小，
+`batch_size × gradient_accumulation × reference_world_size` 是共同完整步骤记录预算。
+真实物理 micro-batch 内仍动态 padding 文本、堆叠图像，并调用一次 LLaVA forward/backward。
+CE 沿用原 micro-batch 均值再按窗口平均，DDP 沿用原 rank 梯度平均。
+尾批和补齐重复样本与原八卡完全一致，不引入零权重占位或新的 token 加权目标。
+`updates.jsonl` 的 `batching` 和 `system_stats.json` 记录实际换算和每步记录数。
+启用单卡匹配应新建 profile；其他参数相同的旧八卡128结果可保留，旧单卡16结果需重跑。
 
 若需要把终端输出重定向到文件，建议同时打开 Python 非缓冲输出：
 
@@ -795,7 +838,7 @@ bash scripts/run_merging_baselines.sh 2 merging_e1_bs4_ga4_r10_s42
 
 ## 静态工程检查
 
-以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、48 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
+以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、51 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
 
 ```bash
 python -m compileall -q code scripts tools
@@ -807,18 +850,20 @@ ruff check code scripts tools
 ## 与论文原始设置的差异
 
 - FedCompass：保留计算能力感知步数分配和分组半异步核心，复用本项目的持久化虚拟时钟，没有复制原框架进程架构；优化状态限定为 LoRA。
-- FedASMU：保留论文动态陈旧混合和中途新鲜模型调整。当前用确定性的可配置刷新位置及在线系数更新代替原工作完整的设备强化学习请求控制器，因此属于明确适配而非逐代码精确复现。
-- MasFL/AdaMasFL：实现控制变量与两级动量方程；模型接口同时返回实际平均 LoRA 梯度。所有向量仅覆盖联邦可训练状态。
-- Pilot：把专属视觉适配器和 CT-MoA 隔离在 Pilot 包装器内，其他方法的 LLaVA 不受影响；数据仍使用 AFVLM-CM 固定分区。当前一次运行联合优化两个阶段的损失，而不是另行执行论文中的独立预训练阶段。
-- UniFed-LoRA：原论文支持异构主干；当前 `backbone heterogeneity = disabled`、`task heterogeneity = enabled`。超网络仍由任务/模态/层/模块描述符条件化，未使用硬编码客户端编号。
+- FedASMU：保留动态server/local系数及LSTM/Q请求机制，以客户端私有训练目标替代全局F；不预留服务器数据，不用validation/test。请求epoch改为optimizer时隙，FP32 LoRA/共同AdamW适配；额外计算及通信必须计成本，不宣称完全原版。
+- OrthoFL：全局聚合与客户端校准分离；在同层LoRA坐标投影而非全冻结主干，主评估保持公共全局模型。
+- MasFL/AdaMasFL：真实初始梯度控制、SGD、双层动量及Ada归一化；实际eta*K归一位移。到达缓冲与可调参数是Plan适配，不直接宣称论文tuning-free理论设置。
+- Pilot：分阶段任务/私有预训练MLP、token CT-MoA、任务及邻近text聚合；私有状态不被平均。stage1_rounds=1后转stage2以匹配预算，差异特征默认归一；原生个性化为附加结果。
+- UniFed-LoRA：同构主干下以任务/模态/层/模块描述符生成真实A/B，客户端delta提供VJP，不是标量门控。full-participation meta-batch、共同初始化及全局部署视图是显式适配；完整输出头可能超出32GB显存。
 
 ## 当前限制
 
 - 代码未替用户启动 7B 训练；显存、CUDA、原始 LLaVA 版本与权重兼容性需要在目标训练机确认。
 - Flickr30k、DVQA、FigureQA 和 COCO 受各自许可与分发条件约束；下载工具不会绕过许可页面。
 - 当前训练入口保存可独立复评的最终联邦检查点，但尚未提供从任意中间异步事件恢复并继续训练的 CLI；这需要同时恢复仍在途的客户端作业快照。
-- Flickr30k 指令当前每条只有一个参考答案；内置 CIDEr 使用标准 1--4 gram TF-IDF 余弦构造，但与拥有五参考标注的官方 COCO caption scorer 不能宣称数值完全等价。
-- Pilot 的联合阶段适配和 FedASMU 的确定性刷新策略必须在论文中按上述差异披露。
+- Flickr30k训练每条一个caption，当前验证/测试保留五参考并使用pycocoevalcap；METEOR需Java。
+- 详细算法及参数见[baseline审查](docs/baseline_audit.md)；[独立复审](docs/baseline_reaudit_20261011.md)指出 Pilot 半精度优化风险及 UniFed 默认输出头显存限制尚未解决，不应理解为全部配置已真实训练通过。
+- 本次上传对 `ours`/OPCM 与已有八卡实验的影响、是否重建 profile/Plan，见[旧实验兼容说明](docs/profile_compatibility_20261011.md)。新 profile 读取当前模板，复用 Plan 不会复制旧方法参数。
 - `ours` 已实现，但其 sensitivity 是虚拟 Module-Gate 的局部一阶变化幅度，即各 optimizer step 的 `|dL/dz_l|` 平均，并非完整 Fisher、Hessian 或真实任务泛化重要性；当前只支持 LoRA-only 联邦状态。任务频率校正基于最近成功聚合标签，而不是对真实设备速度的直接估计。`ours` 不在 baseline 批处理里，应使用独立命令运行。
 
 ## 主要论文与数据来源
