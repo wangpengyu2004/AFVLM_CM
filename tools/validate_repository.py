@@ -32,6 +32,7 @@ EXPECTED_METHODS = (
     "fedcompass",
     "fedasmu",
     "orthofl",
+    "c2afcl",
     "masfl",
     "adamasfl",
     "pilot",
@@ -41,7 +42,9 @@ EXPECTED_METHODS = (
     "dop_lora",
     "nufilt_lora",
 )
-LEGACY_METHODS = set(EXPECTED_METHODS) - {"opcm_lora", "dop_lora", "nufilt_lora", "orthofl"}
+LEGACY_METHODS = set(EXPECTED_METHODS) - {
+    "opcm_lora", "dop_lora", "nufilt_lora", "orthofl", "c2afcl",
+}
 SETTINGS = (2, 5, 10)
 
 
@@ -218,7 +221,7 @@ def main() -> None:
                     )
             expected_plan = f"plans/afvlm_cm/{setting}clients/async_train_plan.json"
             async_methods = (
-                "fedasync", "fedbuff", "fedasmu", "orthofl", "masfl", "adamasfl", "ours",
+                "fedasync", "fedbuff", "fedasmu", "orthofl", "c2afcl", "masfl", "adamasfl", "ours",
                 "opcm_lora", "dop_lora", "nufilt_lora",
             )
             for method in async_methods:

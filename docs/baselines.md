@@ -30,12 +30,19 @@ semi-asynchronous schedule from that same profile.
 ## Availability and invocation
 
 Main runnable comparisons: local, fedavg, fedprox, fedadam, fedasync, fedbuff,
-fedcompass, fedasmu, orthofl, masfl, adamasfl, pilot, unifed_lora. Optional continual **merging**:
+fedcompass, fedasmu, orthofl, c2afcl, masfl, adamasfl, pilot, unifed_lora. Optional continual **merging**:
 opcm_lora, dop_lora, nufilt_lora. Ours remains the proposed method, not a baseline.
 FedASMU now uses an explicitly disclosed private-client training-objective oracle,
 with dynamic server/local coefficients and learned LSTM/Q request slots. No server
 dataset is reserved. Extra objective work is reported separately; this is not the
 paper's exact global objective. See [implementation and operation](orthofl_fedasmu.md).
+
+C2-AFCL preserves same-client/task raw-update cache differences and joint-coordinate
+SVD interference projection, specialized to fixed tasks and federated LoRA states.
+Default per-task buffer1 gives immediate incremental aggregation. Other-task
+incorporated history replaces previous sequential tasks; numeric settings and
+protocol ambiguity are disclosed in [C2-AFCL adaptation and commands](c2afcl.md).
+No local training, dataset, Plan or evaluation code is changed for this baseline.
 
 ```bash
 bash scripts/run_one.sh METHOD 2 PROFILE

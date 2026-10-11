@@ -25,6 +25,7 @@ class ExecutorSelectionTests(unittest.TestCase):
             "fedasync",
             "fedbuff",
             "orthofl",
+            "c2afcl",
             "ours",
         ):
             with self.subTest(method=name):

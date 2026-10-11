@@ -4,6 +4,8 @@
 不是逐行复制官方框架。按最新要求加入OrthoFL并补全无服务器数据的FedASMU功能适配，
 额外目标计算/原文差异见[专门说明](docs/orthofl_fedasmu.md)。Pilot/UniFed-LoRA保持
 全局主评估，训练结束另存原生个性化附加结果。
+新增 `c2afcl`：保留原文客户端历史差分与跨任务 SVD 正交校准，作为固定任务 LoRA
+适配 baseline。实现差异、参数与运行步骤见 [C2-AFCL 说明](docs/c2afcl.md)。
 修正后的方法需要新 profile；旧快照不自动更新。未启动训练，不能把非训练检查当作 GPU
 训练或原论文精度的保证。
 
@@ -169,22 +171,22 @@ configs/
 ├── datasets/afvlm_cm_{2,5,10}clients.yaml
 ├── methods/{local,...,unifed_lora,ours,opcm_lora,dop_lora,nufilt_lora}.yaml
 └── experiments/llava/afvlm_cm/
-    ├── 2clients/    # 17 个方法入口配置；运行限制见复审报告
-    ├── 5clients/    # 17 个方法入口配置；运行限制见复审报告
-    └── 10clients/   # 17 个方法入口配置；运行限制见复审报告
+    ├── 2clients/    # 18 个方法入口配置；运行限制见复审报告与各方法说明
+    ├── 5clients/    # 18 个方法入口配置；运行限制见复审报告与各方法说明
+    └── 10clients/   # 18 个方法入口配置；运行限制见复审报告与各方法说明
 ```
 
 这三类目录职责不同，不能互相替代：
 
 | 目录 | 作用 | 是否应修改/删除 |
 |---|---|---|
-| `configs/methods/` | 各算法的可编辑参数源；51 个实验入口通过 `inherits` 读取它们，创建新 profile 时也从这里解析当前方法参数 | 可以按实验需要修改；不能删除 |
+| `configs/methods/` | 各算法的可编辑参数源；54 个实验入口通过 `inherits` 读取它们，创建新 profile 时也从这里解析当前方法参数 | 可以按实验需要修改；不能删除 |
 | `plans/afvlm_cm/` | 默认兼容运行使用的 system profile 与 TrainPlan；保证 `bash scripts/run_one.sh <method> <setting>` 和原始实验 YAML 仍可直接运行 | 不要手工修改；当前不能删除 |
 | `experiment_profiles/` | 已冻结的完整配置、system profile 和 TrainPlan 快照，用于正式实验复现和切换旧实验 | 不要修改或覆盖；新参数应创建新 profile |
 
 因此，平时应修改 `configs/base.yaml`、`configs/models/` 或 `configs/methods/`，然后生成新的 `experiment_profiles/<name>/`。正式运行优先指定 profile；`plans/` 仅作为默认兼容入口保留。
 
-同一规模的普通方法继承相同模型、LoRA、客户端 AdamW、学习率、本地 epoch、batch size、随机种子、数据与评估配置。算法必要例外须单独披露：MasFL/AdaMasFL 用 SGD，FedCompass 动态分配本地步数，Pilot 增加视觉适配器，UniFed-LoRA 使用客户端生成参数，FedASMU额外获取新全局状态并计算客户端目标反馈；不能宣称这些方法具有完全相同的参数量或成本。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。新 profile 保存完全解析后的 51 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径；历史 39 份配置的 profile 仍保留原状，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
+同一规模的普通方法继承相同模型、LoRA、客户端 AdamW、学习率、本地 epoch、batch size、随机种子、数据与评估配置。算法必要例外须单独披露：MasFL/AdaMasFL 用 SGD，FedCompass 动态分配本地步数，Pilot 增加视觉适配器，UniFed-LoRA 使用客户端生成参数，FedASMU额外获取新全局状态并计算客户端目标反馈；不能宣称这些方法具有完全相同的参数量或成本。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。新 profile 保存完全解析后的 54 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径；历史 profile 仍保留原状，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
 
 普通方法的本地训练量只由 `training.local_epochs` 控制，不再同时设置通用的 `base_local_steps`。TrainPlan 中记录的 `local_steps` 是根据客户端样本数、batch size、梯度累积和 `local_epochs` 推导出的预计优化器步数，只用于虚拟耗时和算法钩子，不会截断普通客户端训练。FedCompass 是唯一例外：其计算能力感知调度器必须动态分配本地迭代，因此使用 `min_local_steps` / `max_local_steps` 作为方法专属边界。
 
@@ -435,7 +437,7 @@ python tools/generate_system_profiles.py \
   --profile e2_bs1_ga4_r20_s42
 ```
 
-此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 51 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
+此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 54 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
 
 如果需要新的随机种子，可显式指定：
 
@@ -595,6 +597,7 @@ python tools/estimate_task_compute_factors.py \
 - `fedcompass`：计算能力感知的本地步数分配与分组半异步聚合。
 - `fedasmu`：无服务器数据适配，动态server/local系数元梯度、LSTM/Q请求时隙与fresh global本地混合；用客户端训练目标代理原文全局F，额外成本单列。
 - `orthofl`：独立客户端轨迹、全局原上传模型插值、逐层正交漂移校准后用于该客户端下一轮训练。
+- `c2afcl`：固定任务 LoRA 适配；同客户端原始 delta 历史差分，其他任务历史平均 delta 的联合 SVD 子空间保护，再增量聚合；默认同任务 buffer_size=1，沿用 DDP 与原 Plan。
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
@@ -637,7 +640,9 @@ python tools/export_ours_diagnostics.py \
 rank 级 CSV。CSV 是派生分析文件，可以随时重新生成；权威原始记录始终是
 `events.jsonl`。
 
-FCIT、C2-AFCL 和 FedSpace 属于联邦持续/任务增量学习，不是当前固定任务客户端的强制 baseline；FedAST 的原问题是并行训练多个联邦模型，也不作为当前主 baseline。注册表保留后续扩展能力。
+FCIT 和 FedSpace 原本属于联邦持续/任务增量学习，目前没有作为 baseline 加入。
+C2-AFCL 原本也研究持续学习，但已按要求加入明确标注的固定任务 LoRA 适配版，
+并未改变本项目任务场景。FedAST 的原问题是并行训练多个联邦模型，不作为当前主 baseline。
 
 ## 运行单个方法
 
@@ -653,6 +658,7 @@ bash scripts/run_one.sh fedbuff 2
 bash scripts/run_one.sh fedcompass 2
 bash scripts/run_one.sh fedasmu 2
 bash scripts/run_one.sh orthofl 2
+bash scripts/run_one.sh c2afcl 2
 bash scripts/run_one.sh masfl 2
 bash scripts/run_one.sh adamasfl 2
 bash scripts/run_one.sh pilot 2
@@ -664,6 +670,30 @@ OrthoFL/FedASMU实现、OPCM恢复 `.5` 的说明及新profile运行流程见
 [专门操作说明](docs/orthofl_fedasmu.md)。FedASMU不预留服务器训练数据，但客户端目标代理
 不等于原文全局目标；不能声称原始理论或精度被完全复现。Pilot/UniFed-LoRA已有核心功能
 与全局/个性化双评估，但新实现需新配置快照，UniFed完整输出头还受显存限制。
+
+### 运行新增 C2-AFCL baseline
+
+修改参数使用 `configs/methods/c2afcl.yaml`。默认 `server_lr: 0.5`、
+`subspace_rank: 5`、`buffer_size: 1` 是本项目适配默认值，不冒充原文公布的数值。
+新方法只增加服务器校准，不改客户端训练与评估。通常自动选择全部可见 GPU 的
+`client_ddp`，沿用现有有效 batch 与本地训练代码。
+
+旧 profile 没有新增方法的 YAML，需新建配置快照。若数据、训练工作量与系统设置均一致，
+可以复用原 Plan，无需重新随机生成系统条件；把下面的 `YOUR_OLD_PROFILE` 替换为你真实的旧快照名：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile c2afcl_fixed_task_v1 \
+  --reuse_plans_from YOUR_OLD_PROFILE
+
+bash scripts/run_one.sh c2afcl 2 c2afcl_fixed_task_v1
+bash scripts/run_one.sh c2afcl 5 c2afcl_fixed_task_v1
+bash scripts/run_one.sh c2afcl 10 c2afcl_fixed_task_v1
+```
+
+生成器读取当前所有方法模板，而非复制旧方法配置，正式比较前需核对与已有实验共享设置一致。
+新增方法已加入 `run_baselines.sh`；使用缺少它的旧 profile 跑批量脚本会在训练前提示缺少配置。
+详见 [原文公式、适配边界、诊断日志与显存成本](docs/c2afcl.md)。
 
 `ours` 现在只实现本文的 Module-Gate 版本。推荐为正式实验生成独立的不可变 profile：
 
@@ -843,7 +873,7 @@ bash scripts/run_merging_baselines.sh 2 merging_e1_bs4_ga4_r10_s42
 
 ## 静态工程检查
 
-以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、51 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
+以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、54 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
 
 ```bash
 python -m compileall -q code scripts tools
@@ -857,6 +887,7 @@ ruff check code scripts tools
 - FedCompass：保留计算能力感知步数分配和分组半异步核心，复用本项目的持久化虚拟时钟，没有复制原框架进程架构；优化状态限定为 LoRA。
 - FedASMU：保留动态server/local系数及LSTM/Q请求机制，以客户端私有训练目标替代全局F；不预留服务器数据，不用validation/test。请求epoch改为optimizer时隙，FP32 LoRA/共同AdamW适配；额外计算及通信必须计成本，不宣称完全原版。
 - OrthoFL：全局聚合与客户端校准分离；在同层LoRA坐标投影而非全冻结主干，主评估保持公共全局模型。
+- C2-AFCL：缓存原始客户端增量差分、全联邦可训练坐标 SVD 投影，之前顺序任务改为其他固定任务的已聚合历史；默认逐到达增量更新，可选同任务缓冲。原文未具体定义的持续学习正则项不自行补造，客户端仍用共同指令 CE/AdamW；详见专门说明。
 - MasFL/AdaMasFL：真实初始梯度控制、SGD、双层动量及Ada归一化；实际eta*K归一位移。到达缓冲与可调参数是Plan适配，不直接宣称论文tuning-free理论设置。
 - Pilot：分阶段任务/私有预训练MLP、token CT-MoA、任务及邻近text聚合；私有状态不被平均。stage1_rounds=1后转stage2以匹配预算，差异特征默认归一；原生个性化为附加结果。
 - UniFed-LoRA：同构主干下以任务/模态/层/模块描述符生成真实A/B，客户端delta提供VJP，不是标量门控。full-participation meta-batch、共同初始化及全局部署视图是显式适配；完整输出头可能超出32GB显存。
@@ -875,6 +906,7 @@ ruff check code scripts tools
 
 - FedCompass, ICLR 2024: <https://proceedings.iclr.cc/paper_files/paper/2024/hash/a9f3457fa97f106f1756885237787789-Abstract-Conference.html>
 - FedASMU, AAAI 2024: <https://ojs.aaai.org/index.php/AAAI/article/view/29297>
+- C2-AFCL, ICML 2026: <https://proceedings.mlr.press/v306/li26gx.html>
 - MasFL/AdaMasFL, ICML 2025: <https://proceedings.mlr.press/v267/yan25f.html>
 - Pilot, AAAI 2025: <https://ojs.aaai.org/index.php/AAAI/article/view/35476>
 - UniFed-LoRA, CVPR Workshops 2026: <https://openaccess.thecvf.com/content/CVPR2026W/FedVision/html/Milasheuski_UniFed-LoRA_Exploiting_Semantic_Task_Correlation_for_Heterogeneous_Multimodal_Federated_Fine-Tuning_CVPRW_2026_paper.html>

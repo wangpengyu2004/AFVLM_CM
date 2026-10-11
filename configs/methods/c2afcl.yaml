@@ -1,0 +1,12 @@
+# C2-AFCL (ICML 2026), Sections 4.1/4.2, Eqs. 4--6.
+# Fixed-task LoRA specialization; these are project defaults, not published numeric defaults.
+method:
+  name: c2afcl
+  params:
+    server_lr: 0.5
+    subspace_rank: 5
+    buffer_size: 1
+    svd_rtol: 1.0e-6
+    eps: 1.0e-12
+federation:
+  mode: asynchronous

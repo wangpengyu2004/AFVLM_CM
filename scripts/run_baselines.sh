@@ -12,7 +12,7 @@ fi
 setting="$1"
 profile="${2:-}"
 # FedASMU uses a disclosed client-training feedback specialization (extra work).
-methods=(local fedavg fedprox fedadam fedasync fedbuff fedcompass fedasmu orthofl masfl adamasfl pilot unifed_lora)
+methods=(local fedavg fedprox fedadam fedasync fedbuff fedcompass fedasmu orthofl c2afcl masfl adamasfl pilot unifed_lora)
 for method in "${methods[@]}"; do
   if [[ -n "$profile" ]]; then
     config="experiment_profiles/${profile}/configs/${setting}clients/${method}.yaml"
