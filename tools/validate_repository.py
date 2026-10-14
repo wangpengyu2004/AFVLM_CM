@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "code"))
 
 from afl_vlm.config import load_config, validate_config  # noqa: E402
 from afl_vlm.data.afvlm_cm import AFVLMDataModule  # noqa: E402
-from afl_vlm.methods.registry import method_names  # noqa: E402
+from afl_vlm.methods.registry import create_method, method_names, profile_method_names  # noqa: E402
 from afl_vlm.scheduling.train_plan import (  # noqa: E402
     load_system_profile,
     load_train_plan,
@@ -41,9 +41,10 @@ EXPECTED_METHODS = (
     "opcm_lora",
     "dop_lora",
     "nufilt_lora",
+    "opcm_oneshot",
 )
 LEGACY_METHODS = set(EXPECTED_METHODS) - {
-    "opcm_lora", "dop_lora", "nufilt_lora", "orthofl", "c2afcl",
+    "opcm_lora", "dop_lora", "nufilt_lora", "orthofl", "c2afcl", "opcm_oneshot",
 }
 SETTINGS = (2, 5, 10)
 
@@ -81,7 +82,7 @@ def validate_profiles(errors: list[str]) -> int:
             # An immutable historical snapshot must not be rewritten just because
             # the registry gained optional methods after that profile was created.
             profile_methods = set(manifest.get("methods", ()))
-            if not LEGACY_METHODS <= profile_methods <= set(EXPECTED_METHODS):
+            if not LEGACY_METHODS <= profile_methods <= set(profile_method_names()):
                 errors.append(f"profile {profile_root.name}: method list mismatch")
             expected_hashes = manifest.get("files_sha256", {})
             for relative, expected_hash in expected_hashes.items():
@@ -153,8 +154,6 @@ def main() -> None:
     registered = set(method_names())
     if registered != set(EXPECTED_METHODS):
         errors.append(f"method registry mismatch: {sorted(registered)}")
-    from afl_vlm.methods.registry import create_method
-
     try:
         ours = create_method("ours", {})
         ours.validate_runtime()
@@ -195,6 +194,22 @@ def main() -> None:
                             errors.append(f"{setting} clients/task: missing {task}/{filename}")
             reference = resolved["fedavg"]
             for method, candidate in resolved.items():
+                if create_method(method).capabilities.requires_one_shot:
+                    for section in ("run", "runtime", "model", "dataset"):
+                        if candidate[section] != reference[section]:
+                            errors.append(f"{method}/{setting} changes shared {section} settings")
+                    if {
+                        k: v for k, v in candidate["training"].items() if k != "local_epochs"
+                    } != {
+                        k: v for k, v in reference["training"].items() if k != "local_epochs"
+                    }:
+                        errors.append(f"{method}/{setting} changes non-epoch training controls")
+                    expected_output = (
+                        f"runs/llava/afvlm_cm/oneshot/{setting}clients/{method}/seed42"
+                    )
+                    if candidate["output"]["directory"] != expected_output:
+                        errors.append(f"{method}/{setting}: wrong standalone output path")
+                    continue
                 for section in (
                     "run",
                     "runtime",

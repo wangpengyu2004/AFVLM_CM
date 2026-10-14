@@ -18,7 +18,7 @@ from afl_vlm.batching import (
 )
 from afl_vlm.config import load_config, validate_config
 from afl_vlm.federation.types import ClientSpec
-from afl_vlm.methods.registry import method_names
+from afl_vlm.methods.registry import profile_method_names
 from afl_vlm.scheduling.train_plan import build_train_plan, optimizer_steps_for_epochs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -198,7 +198,7 @@ class ReferenceBatchBudgetTests(unittest.TestCase):
         self.assertNotIn("batch_size_scope", reference)
         self.assertNotIn("reference_world_size", reference)
         for setting in (2, 5, 10):
-            for method in method_names():
+            for method in profile_method_names():
                 path = (
                     ROOT
                     / "configs/experiments/llava/afvlm_cm"

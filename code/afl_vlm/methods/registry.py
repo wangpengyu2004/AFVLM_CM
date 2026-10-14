@@ -26,6 +26,7 @@ def _load_builtins() -> None:
         fedasmu,
         fedcompass,
         masfl,
+        opcm_oneshot,
         orthofl,
         ours,
         standard,
@@ -46,6 +47,15 @@ def create_method(name: str, params: Mapping[str, Any] | None = None) -> Method:
 def method_names() -> tuple[str, ...]:
     _load_builtins()
     return tuple(sorted(METHOD_REGISTRY))
+
+
+def profile_method_names() -> tuple[str, ...]:
+    """Ordinary shared-budget profiles exclude standalone protocol comparisons."""
+    _load_builtins()
+    return tuple(
+        name for name in sorted(METHOD_REGISTRY)
+        if not METHOD_REGISTRY[name].capabilities.requires_one_shot
+    )
 
 
 def method_capabilities() -> dict[str, Any]:

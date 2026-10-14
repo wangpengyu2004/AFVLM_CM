@@ -171,16 +171,16 @@ configs/
 ├── datasets/afvlm_cm_{2,5,10}clients.yaml
 ├── methods/{local,...,unifed_lora,ours,opcm_lora,dop_lora,nufilt_lora}.yaml
 └── experiments/llava/afvlm_cm/
-    ├── 2clients/    # 18 个方法入口配置；运行限制见复审报告与各方法说明
-    ├── 5clients/    # 18 个方法入口配置；运行限制见复审报告与各方法说明
-    └── 10clients/   # 18 个方法入口配置；运行限制见复审报告与各方法说明
+    ├── 2clients/    # 18 个常规方法 + 1 个独立 one-shot 入口
+    ├── 5clients/    # 18 个常规方法 + 1 个独立 one-shot 入口
+    └── 10clients/   # 18 个常规方法 + 1 个独立 one-shot 入口
 ```
 
 这三类目录职责不同，不能互相替代：
 
 | 目录 | 作用 | 是否应修改/删除 |
 |---|---|---|
-| `configs/methods/` | 各算法的可编辑参数源；54 个实验入口通过 `inherits` 读取它们，创建新 profile 时也从这里解析当前方法参数 | 可以按实验需要修改；不能删除 |
+| `configs/methods/` | 各算法的可编辑参数源；54 个常规入口与3个独立 one-shot 入口通过 `inherits` 读取；两种生成器分别解析对应方法参数 | 可以按实验需要修改；不能删除 |
 | `plans/afvlm_cm/` | 默认兼容运行使用的 system profile 与 TrainPlan；保证 `bash scripts/run_one.sh <method> <setting>` 和原始实验 YAML 仍可直接运行 | 不要手工修改；当前不能删除 |
 | `experiment_profiles/` | 已冻结的完整配置、system profile 和 TrainPlan 快照，用于正式实验复现和切换旧实验 | 不要修改或覆盖；新参数应创建新 profile |
 
@@ -598,6 +598,7 @@ python tools/estimate_task_compute_factors.py \
 - `fedasmu`：无服务器数据适配，动态server/local系数元梯度、LSTM/Q请求时隙与fresh global本地混合；用客户端训练目标代理原文全局F，额外成本单列。
 - `orthofl`：独立客户端轨迹、全局原上传模型插值、逐层正交漂移校准后用于该客户端下一轮训练。
 - `c2afcl`：固定任务 LoRA 适配；同客户端原始 delta 历史差分，其他任务历史平均 delta 的联合 SVD 子空间保护，再增量聚合；默认同任务 buffer_size=1，沿用 DDP 与原 Plan。
+- `opcm_oneshot`：独立 one-shot 对照，所有客户端从共同初始模型连续训练多个 epoch，恰好上传一次，收齐后离线 OPCM 合并；不在普通 profile 或 baseline 批处理里。
 - `masfl`、`adamasfl`：客户端/全局控制变量、历史下降动量；Ada 版本使用归一化局部方向与实际局部位移聚合。
 - `pilot`：任务/客户端视觉适配器、CT-MoA 和任务/文本自适应聚合。
 - `unifed_lora`：任务、模态、层和模块描述符驱动的服务器 LoRA 超网络。
@@ -646,7 +647,7 @@ C2-AFCL 原本也研究持续学习，但已按要求加入明确标注的固定
 
 ## 运行单个方法
 
-接口为 `bash scripts/run_one.sh <method> <setting> [profile]`，其中 setting 为 2、5 或 10。省略 profile 时使用原始兼容配置；提供 profile 时使用对应的不可变配置快照。以下是 2 clients/task 的全部正式 baseline 及提出方法命令：
+接口为 `bash scripts/run_one.sh <method> <setting> [profile]`，其中 setting 为 2、5 或 10。省略 profile 时使用原始兼容配置；提供 profile 时使用对应的不可变配置快照。以下是 2 clients/task 的常规 baseline 及提出方法命令；独立 one-shot 使用后文专属入口：
 
 ```bash
 bash scripts/run_one.sh local 2
@@ -871,9 +872,61 @@ bash scripts/run_merging_baselines.sh 2 merging_e1_bs4_ga4_r10_s42
 
 旧 immutable profile 不会被改写，也不自动具有新增方法配置。新增方法本身不改变Plan，可创建新profile并用 `--reuse_plans_from <旧快照名>` 复用兼容Plan；这仍使用当前配置模板，需自行核对数据、seed、模型和训练设置一致。更改客户端数据量后不能复用旧Plan。同一比较的旧基线与 `ours` 应使用同一快照和实际有效batch。此处profile名称是人工标签，方法支持服务器的实际分区规模，不会修改或同步本地数据。
 
+## 独立 one-shot 联邦 OPCM 对比
+
+`opcm_oneshot` 与原 `opcm_lora` 完全不同的通信协议：每个客户端从相同version0
+连续训练多个epoch，全部客户端各上传一次之后才离线合并，最后只评估同一个最终全局
+模型。服务器在收集期间不更新参数，也不向客户端发送其他客户端的知识。
+客户端任务、数据、LoRA、DDP 和六任务评估代码保持原样；OPCM仅处理LoRA状态。
+
+参数源是 `configs/methods/opcm_oneshot.yaml`。默认本地10epoch、通信1轮；
+`merge_weight: 1.0` 是独立实验的项目设置，不改变原 `opcm_lora` 的0.5。
+默认 `merge_order: seeded_random`、`merge_seed: 42`，避免把客户端速度顺序混进融合效果。
+按不同merge_seed做顺序对照时，须新建快照，不能按测试结果挑顺序。
+
+在服务器根目录创建独立配置快照并运行：
+
+```bash
+python tools/generate_oneshot_profiles.py \
+  --profile opcm_oneshot_e10_bs4_ga4_s42 \
+  --local_epochs 10
+
+bash scripts/run_oneshot.sh 2 opcm_oneshot_e10_bs4_ga4_s42
+# 按需要选择5或10 clients/task；每条命令是一个独立实验。
+bash scripts/run_oneshot.sh 5 opcm_oneshot_e10_bs4_ga4_s42
+bash scripts/run_oneshot.sh 10 opcm_oneshot_e10_bs4_ga4_s42
+```
+
+工具默认识别所有可见GPU；DDP沿用现有每卡batch与梯度累积。只调整本实验epoch
+可用 `--local_epochs 5`，无需改 `base.yaml`。离线生成可加 `--reference_world_size 8`。
+快照放在 `one_shot_profiles/<name>/`，结果放在
+`runs/llava/afvlm_cm/oneshot/profiles/<name>/<setting>clients/opcm_oneshot/seed42/`。
+profile名称只是标签，bs4/ga4应与实际base配置一致；同名快照和非空结果目录不覆盖。
+
+不能复用多轮异步TrainPlan，但可以只复用相同数据的基础系统画像，生成新的一次上传Plan：
+
+```bash
+python tools/generate_oneshot_profiles.py \
+  --profile opcm_oneshot_e10_same_system \
+  --local_epochs 10 \
+  --system_profile_from YOUR_OLD_PROFILE
+```
+
+将 `YOUR_OLD_PROFILE` 替换为真实旧快照名。工具会核对客户端ID、任务、样本数、
+任务计算成本和种子；不匹配就拒绝复用。现有 `experiment_profiles`、旧Plan和方法
+配置不会被改写，普通生成器仍生成原18个方法/54份配置，不包含此one-shot实验。
+
+上传数量为12/30/60；对外只有1次全局聚合，离线OPCM内部专家处理次数另记。
+日志记录 `merge_client_order`、`merge_steps`、`expert_training` 和原OPCM模块诊断。
+one-shot10epoch与10轮×1epoch只是相近样本遍历预算，优化器连续性、通信量和模型
+交换轨迹不同；论文中必须区分，不能宣称训练轨迹相同。
+
+完整协议、配置路径、评估规则、缓存显存成本和LoRA适配限制见
+[one-shot OPCM说明](docs/opcm_oneshot.md)。当前没有实际启动GPU训练，也不保证原论文精度。
+
 ## 静态工程检查
 
-以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、54 个配置、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
+以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、57 个配置（54常规+3个one-shot）、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
 
 ```bash
 python -m compileall -q code scripts tools

@@ -1,0 +1,17 @@
+# Standalone one-shot comparison, NOT part of ordinary async profile/batch generation.
+# All clients train from common version0, upload once; merge only after all arrive.
+method:
+  name: opcm_oneshot
+  params:
+    merge_weight: 1.0  # No extra async relaxation; project choice, not official default.
+    retain: 0.5
+    eps: 1.0e-8
+    merge_order: seeded_random
+    merge_seed: 42
+training:
+  local_epochs: 10
+federation:
+  rounds: 1
+  mode: synchronous
+evaluation:
+  interval_unit: incorporated_client_updates

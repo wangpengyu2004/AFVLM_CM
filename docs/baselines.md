@@ -32,6 +32,13 @@ semi-asynchronous schedule from that same profile.
 Main runnable comparisons: local, fedavg, fedprox, fedadam, fedasync, fedbuff,
 fedcompass, fedasmu, orthofl, c2afcl, masfl, adamasfl, pilot, unifed_lora. Optional continual **merging**:
 opcm_lora, dop_lora, nufilt_lora. Ours remains the proposed method, not a baseline.
+
+Standalone comparison: `opcm_oneshot` trains every client once for multiple epochs
+from the same version0, collects every upload before offline OPCM, and evaluates
+only the final global model. Use `tools/generate_oneshot_profiles.py` and
+`scripts/run_oneshot.sh`; ordinary profile generation/default batch remain
+unchanged. This intentionally changes communication/optimizer continuity,
+not the original asynchronous OPCM. See [protocol and usage](opcm_oneshot.md).
 FedASMU now uses an explicitly disclosed private-client training-objective oracle,
 with dynamic server/local coefficients and learned LSTM/Q request slots. No server
 dataset is reserved. Extra objective work is reported separately; this is not the

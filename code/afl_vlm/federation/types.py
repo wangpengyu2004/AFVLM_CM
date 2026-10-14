@@ -119,3 +119,5 @@ class MethodCapabilities:
     requires_group_sensitivity: bool = False
     requires_initial_gradient: bool = False
     requires_arrival_objective_feedback: bool = False
+    # Standalone comparison: one common-origin job/client, offline final merge.
+    requires_one_shot: bool = False

@@ -201,6 +201,12 @@ def validate_config(config: Mapping[str, Any], *, check_paths: bool = True) -> N
     method_cfg = config["method"]
     method = create_method(str(method_cfg["name"]), method_cfg.get("params", {}))
     configured_mode = str(config["federation"]["mode"])
+    if method.capabilities.requires_one_shot:
+        if int(config["federation"]["rounds"]) != 1:
+            raise ValueError("One-shot methods require federation.rounds=1")
+        if int(evaluation[interval_key]) <= int(dataset["total_clients"]):
+            raise ValueError("One-shot comparisons evaluate only the final merged global model; "
+                             "set the periodic interval greater than total_clients")
     if method.capabilities.mode != configured_mode:
         raise ValueError(
             f"Method {method.name} requires federation.mode={method.capabilities.mode}, "

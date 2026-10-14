@@ -1,0 +1,9 @@
+inherits:
+  - ../../../../base.yaml
+  - ../../../../models/llava15_7b_lora.yaml
+  - ../../../../datasets/afvlm_cm_5clients.yaml
+  - ../../../../methods/opcm_oneshot.yaml
+evaluation:
+  eval_every_client_updates: 31  # More than 30 uploads: final merged model only.
+output:
+  directory: runs/llava/afvlm_cm/oneshot/5clients/opcm_oneshot/seed42

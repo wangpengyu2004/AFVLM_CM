@@ -26,7 +26,7 @@ from afl_vlm.batching import (  # noqa: E402
 )
 from afl_vlm.config import load_config, validate_config  # noqa: E402
 from afl_vlm.federation.types import ClientSpec  # noqa: E402
-from afl_vlm.methods.registry import method_names  # noqa: E402
+from afl_vlm.methods.registry import profile_method_names  # noqa: E402
 from afl_vlm.scheduling.train_plan import (  # noqa: E402
     build_train_plan,
     event_records,
@@ -257,7 +257,7 @@ def create_profile(
         _validate_plan(clients, plan, training, rounds)
         plans[setting] = (system_bytes, plan_bytes)
 
-    methods = method_names()
+    methods = profile_method_names()
     resolved_configs: dict[tuple[int, str], str] = {}
     for setting in SETTINGS:
         system_path = f"experiment_profiles/{name}/plans/{setting}clients/system_profile.json"
