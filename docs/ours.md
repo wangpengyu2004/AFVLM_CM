@@ -182,8 +182,8 @@ Rejected or zero-weight arrivals do not advance `u`; accepted arrivals advance i
 once. The current arrival reads the existing weight before advancing the counter.
 A newly retired task starts at age zero and weight one.
 
-Defaults are boost `1.0` and time scale `18.0` accepted updates. The multiplier
-grows smoothly from one towards two. These are tunable initial settings, not
+Defaults are boost `2.0` and time scale `18.0` accepted updates. The multiplier
+grows smoothly from one towards three. These are tunable initial settings, not
 empirically established optimum values. Tasks with no accepted history still
 contribute zero regardless of multiplier. All original task priors remain
 `pi[q]=1/Q`; weighted priors are NOT renormalized and completed tasks are NOT
@@ -278,7 +278,7 @@ method:
     history_lambda: 1.0
     history_strength: 1.0
     history_age_enabled: true
-    history_age_boost: 1.0
+    history_age_boost: 2.0
     history_age_time_scale: 18.0
     base_precision: 1.0
     alpha_max: 0.5

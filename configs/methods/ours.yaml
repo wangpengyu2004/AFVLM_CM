@@ -20,7 +20,7 @@ method:
     # a_q = 1 + boost * (1-exp(-age/time_scale)); unfinished tasks keep a_q=1.
     # Set false for the original historical precision (old profiles default false).
     history_age_enabled: true
-    history_age_boost: 1.0
+    history_age_boost: 2.0
     history_age_time_scale: 18.0
     base_precision: 1.0
     alpha_max: 0.5
