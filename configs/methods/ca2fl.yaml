@@ -1,0 +1,13 @@
+method:
+  name: ca2fl
+  params:
+    # Paper language experiments: M=3; eta=1 is in the reported search grid.
+    server_lr: 1.0
+    buffer_size: 3
+    # 32: full CA2FL; 8 or 4: Appendix A.1 MF-CA2FL cache quantization.
+    cache_bits: 32
+    cache_seed: 42
+    # Finite-Plan adaptation: never silently lose the last partial buffer.
+    flush_last_buffer: true
+federation:
+  mode: asynchronous

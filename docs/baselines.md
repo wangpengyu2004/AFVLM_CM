@@ -29,7 +29,7 @@ semi-asynchronous schedule from that same profile.
 
 ## Availability and invocation
 
-Main runnable comparisons: local, fedavg, fedprox, fedadam, fedasync, fedbuff,
+Main runnable comparisons: local, fedavg, fedprox, fedadam, fedasync, fedbuff, ca2fl,
 fedcompass, fedasmu, orthofl, c2afcl, masfl, adamasfl, pilot, unifed_lora. Optional continual **merging**:
 opcm_lora, dop_lora, nufilt_lora. Ours remains the proposed method, not a baseline.
 
@@ -50,6 +50,14 @@ Default per-task buffer1 gives immediate incremental aggregation. Other-task
 incorporated history replaces previous sequential tasks; numeric settings and
 protocol ambiguity are disclosed in [C2-AFCL adaptation and commands](c2afcl.md).
 No local training, dataset, Plan or evaluation code is changed for this baseline.
+
+CA2FL (ICLR2024 Algorithm2/Eq4.1) adds an independent client-update cache and
+buffered calibration using the previous global cache mean. It also supports
+AppendixA.1 4/8bit unbiased packed caches. Defaults follow the language-buffer
+setting M3 with server_lr1; local training remains the common VLM configuration.
+No author-code equivalence claim is made. Standard profile generation includes
+CA2FL; old snapshots and the existing default batch sequence remain unchanged.
+See [algorithm, adaptations, memory and launch commands](ca2fl.md).
 
 ```bash
 bash scripts/run_one.sh METHOD 2 PROFILE

@@ -1,5 +1,10 @@
 # AFVLM-CM
 
+新增独立异步 baseline `ca2fl`（ICLR 2024）：客户端旧更新缓存差分校准、全局缓存均值、
+缓冲聚合，以及可选 4/8-bit MF 缓存。默认 `server_lr=1`、`buffer_size=3`、完整 FP32 缓存；
+沿用现有 DDP、本地训练、虚拟 Plan 与全局评估，不修改 `ours` 或其他 baseline。
+运行、参数、显存成本和原文适配差异见 [CA²FL 说明](docs/ca2fl.md)。
+
 本次 baseline 功能审查见 [审查报告](docs/baseline_audit.md)：以核心机制完整、功能正确为标准，
 不是逐行复制官方框架。按最新要求加入OrthoFL并补全无服务器数据的FedASMU功能适配，
 额外目标计算/原文差异见[专门说明](docs/orthofl_fedasmu.md)。Pilot/UniFed-LoRA保持
@@ -171,9 +176,9 @@ configs/
 ├── datasets/afvlm_cm_{2,5,10}clients.yaml
 ├── methods/{local,...,unifed_lora,ours,opcm_lora,dop_lora,nufilt_lora}.yaml
 └── experiments/llava/afvlm_cm/
-    ├── 2clients/    # 18 个常规方法 + 1 个独立 one-shot 入口
-    ├── 5clients/    # 18 个常规方法 + 1 个独立 one-shot 入口
-    └── 10clients/   # 18 个常规方法 + 1 个独立 one-shot 入口
+    ├── 2clients/    # 19 个常规方法 + 1 个独立 one-shot 入口
+    ├── 5clients/    # 19 个常规方法 + 1 个独立 one-shot 入口
+    └── 10clients/   # 19 个常规方法 + 1 个独立 one-shot 入口
 ```
 
 这三类目录职责不同，不能互相替代：
@@ -594,6 +599,7 @@ python tools/estimate_task_compute_factors.py \
 - `fedadam`：同步客户端 delta 与服务器 Adam 一、二阶矩。
 - `fedasync`：逐到达插值，支持 constant、polynomial、hinge 陈旧函数。
 - `fedbuff`：异步缓冲聚合，可选样本量/陈旧加权，结尾强制处理残余缓冲。
+- `ca2fl`：ICLR 2024 缓存更新校准；默认 M=3，使用旧全局缓存均值加客户端增量差分，支持 MF 4/8-bit 缓存；[配置与运行](docs/ca2fl.md)。
 - `fedcompass`：计算能力感知的本地步数分配与分组半异步聚合。
 - `fedasmu`：无服务器数据适配，动态server/local系数元梯度、LSTM/Q请求时隙与fresh global本地混合；用客户端训练目标代理原文全局F，额外成本单列。
 - `orthofl`：独立客户端轨迹、全局原上传模型插值、逐层正交漂移校准后用于该客户端下一轮训练。
@@ -656,6 +662,7 @@ bash scripts/run_one.sh fedprox 2
 bash scripts/run_one.sh fedadam 2
 bash scripts/run_one.sh fedasync 2
 bash scripts/run_one.sh fedbuff 2
+bash scripts/run_one.sh ca2fl 2
 bash scripts/run_one.sh fedcompass 2
 bash scripts/run_one.sh fedasmu 2
 bash scripts/run_one.sh orthofl 2
@@ -672,7 +679,41 @@ OrthoFL/FedASMU实现、OPCM恢复 `.5` 的说明及新profile运行流程见
 不等于原文全局目标；不能声称原始理论或精度被完全复现。Pilot/UniFed-LoRA已有核心功能
 与全局/个性化双评估，但新实现需新配置快照，UniFed完整输出头还受显存限制。
 
-### 运行新增 C2-AFCL baseline
+### CA²FL：缓存更新校准
+
+先修改 `configs/methods/ca2fl.yaml`，默认参数为：
+
+```yaml
+server_lr: 1.0
+buffer_size: 3
+cache_bits: 32
+cache_seed: 42
+flush_last_buffer: true
+```
+
+`buffer_size=3` 采用原文 BERT-LoRA 语言实验设置；`server_lr=1` 在原文搜索范围内，
+不是已验证的 VLM 最优值。`cache_bits=32` 为标准 CA²FL；改成 8 或 4 启用附录的
+MF 缓存量化，量化器的具体选择见专门说明。原有本地训练参数统一继承，不改成原文 rank1。
+
+旧 profile 不会自动增加新方法。在服务器上，若数据与本地训练/系统设置不变，可复用旧 Plan：
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile ca2fl_e1_bs4_ga4_r10_s42 \
+  --reuse_plans_from e1_bs4_ga4_r10_s42
+
+bash scripts/run_one.sh ca2fl 2 ca2fl_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ca2fl 5 ca2fl_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ca2fl 10 ca2fl_e1_bs4_ga4_r10_s42
+```
+
+请将旧 profile 名替换为服务器真实名称。新 profile 从当前模板生成配置，不改写旧实验；
+复用 Plan 并不代表其他方法配置自动保持旧版本，运行前检查新配置是否符合预期。
+能力自动选择全部可见 GPU 的 DDP；无需改 `run_one.sh`。默认 baseline 批处理列表保持
+原样，CA²FL 单独启动。评估仍按纳入聚合的客户端更新预算执行，不把缓存复用算作新上传。
+算法顺序、重复客户端缓冲适配、残余 flush、日志与显存开销见 [CA²FL 详细说明](docs/ca2fl.md)。
+
+### C2-AFCL：固定任务适配
 
 修改参数使用 `configs/methods/c2afcl.yaml`。默认 `server_lr: 0.5`、
 `subspace_rank: 5`、`buffer_size: 1` 是本项目适配默认值，不冒充原文公布的数值。
@@ -914,7 +955,7 @@ python tools/generate_oneshot_profiles.py \
 
 将 `YOUR_OLD_PROFILE` 替换为真实旧快照名。工具会核对客户端ID、任务、样本数、
 任务计算成本和种子；不匹配就拒绝复用。现有 `experiment_profiles`、旧Plan和方法
-配置不会被改写，普通生成器仍生成原18个方法/54份配置，不包含此one-shot实验。
+配置不会被改写；当前普通生成器生成19个方法/57份配置（含新增CA2FL），不包含此one-shot实验。
 
 上传数量为12/30/60；对外只有1次全局聚合，离线OPCM内部专家处理次数另记。
 日志记录 `merge_client_order`、`merge_steps`、`expert_training` 和原OPCM模块诊断。
