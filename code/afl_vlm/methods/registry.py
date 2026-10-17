@@ -22,6 +22,7 @@ def register_method(name: str) -> Callable[[type[Method]], type[Method]]:
 
 def _load_builtins() -> None:
     from afl_vlm.methods import (  # noqa: F401
+        aced,
         c2afcl,
         ca2fl,
         fedasmu,

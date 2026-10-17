@@ -437,6 +437,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
             from afl_vlm.federation.initialization import (
                 initial_gradient_jobs,
                 initial_gradient_record,
+                initial_server_update_record,
             )
 
             tqdm.write(
@@ -454,6 +455,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                 initialization_records.append(initial_gradient_record(update))
                 method.initialize_client_gradient(update)
             method.finalize_initial_gradients()
+            initialization_extra = initial_server_update_record(server)
             _write_json(
                 output / "algorithm_initialization.json",
                 {
@@ -463,6 +465,7 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
                     "protocol": "fixed_initial_model_mean_local_gradients",
                     "clients": initialization_records,
                     "extra_work_not_in_train_plan": True,
+                    **initialization_extra,
                 },
             )
 

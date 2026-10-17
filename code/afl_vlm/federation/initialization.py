@@ -1,9 +1,11 @@
 """Real algorithm-required local-gradient initialization (not a validation mode).
 
 MasFL Algorithm 1 evaluates K stochastic gradients at the unchanged initial
-model on every client's own training data. No validation/test data, parameter
-update, server aggregation, or fake model is involved. Returned records belong
-to algorithm_initialization.json, not updates.jsonl or aggregation counters.
+model on every client's own training data. ACED privately limits this to one
+effective-batch observation/client. Collection uses no held-out data or optimizer
+update. A separate optional server hook implements ACED's initial descent;
+existing methods keep their original server state. Records belong to
+algorithm_initialization.json, not ordinary Plan-upload counters.
 """
 
 from __future__ import annotations
@@ -83,4 +85,22 @@ def initial_gradient_record(update: Any) -> dict[str, Any]:
         "gradient_observations": update.optimizer_steps,
         "batching": update.metadata.get("batching", {}),
         "counted_as_upload": False,
+    }
+
+
+def initial_server_update_record(server: Any) -> dict[str, Any]:
+    """Only opt-in algorithms change the server after initial-gradient collection."""
+    result = server.initialize_from_gradients()
+    if result is None:
+        return {}
+    return {
+        "server_initialization": {
+            "receive_version": result.receive_version,
+            "resulting_version": result.resulting_version,
+            "applied_weight": result.applied_weight,
+            "received_client_updates": server.received_updates,
+            "accepted_client_updates": server.accepted_updates,
+            "counted_as_upload": False,
+            **result.metadata,
+        }
     }

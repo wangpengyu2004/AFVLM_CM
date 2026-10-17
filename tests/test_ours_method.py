@@ -576,7 +576,9 @@ class TemporalHistoryTests(unittest.TestCase):
         from afl_vlm.methods.registry import create_method, method_names
 
         for name in method_names():
-            if name == "ours":
+            # ACED also intentionally reads the Plan (automatic server LR).
+            # Its schedule validation is covered in test_aced, not a no-op.
+            if name in {"ours", "aced"}:
                 continue
             with self.subTest(method=name):
                 baseline = create_method(name)

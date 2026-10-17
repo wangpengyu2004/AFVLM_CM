@@ -1,5 +1,10 @@
 # AFVLM-CM
 
+新增独立 `aced`：全客户端初始梯度与首步下降、活跃梯度缓存均值、超时筛选及重新参与。
+沿用固定任务分区、虚拟 Plan 和全局评估，自动选择每卡一个客户端的真实梯度收集路径；
+不改已有 DDP 训练或其他方法。多步 AdamW、额外初始化成本与原文时间戳差异均明确披露，
+不声称原论文精确复现。配置和启动见 [ACED 说明](docs/aced.md)。
+
 新增独立异步 baseline `ca2fl`（ICLR 2024）：客户端旧更新缓存差分校准、全局缓存均值、
 缓冲聚合，以及可选 4/8-bit MF 缓存。默认 `server_lr=1`、`buffer_size=3`、完整 FP32 缓存；
 沿用现有 DDP、本地训练、虚拟 Plan 与全局评估，不修改 `ours` 或其他 baseline。
@@ -176,9 +181,9 @@ configs/
 ├── datasets/afvlm_cm_{2,5,10}clients.yaml
 ├── methods/{local,...,unifed_lora,ours,opcm_lora,dop_lora,nufilt_lora}.yaml
 └── experiments/llava/afvlm_cm/
-    ├── 2clients/    # 19 个常规方法 + 1 个独立 one-shot 入口
-    ├── 5clients/    # 19 个常规方法 + 1 个独立 one-shot 入口
-    └── 10clients/   # 19 个常规方法 + 1 个独立 one-shot 入口
+    ├── 2clients/    # 20 个常规方法 + 1 个独立 one-shot 入口
+    ├── 5clients/    # 20 个常规方法 + 1 个独立 one-shot 入口
+    └── 10clients/   # 20 个常规方法 + 1 个独立 one-shot 入口
 ```
 
 这三类目录职责不同，不能互相替代：
@@ -600,6 +605,7 @@ python tools/estimate_task_compute_factors.py \
 - `fedasync`：逐到达插值，支持 constant、polynomial、hinge 陈旧函数。
 - `fedbuff`：异步缓冲聚合，可选样本量/陈旧加权，结尾强制处理残余缓冲。
 - `ca2fl`：ICLR 2024 缓存更新校准；默认 M=3，使用旧全局缓存均值加客户端增量差分，支持 MF 4/8-bit 缓存；[配置与运行](docs/ca2fl.md)。
+- `aced`：活跃客户端梯度缓存均值、超时排除及重新参与；真实轨迹平均梯度的 LoRA 适配，独立记录全客户端初始化成本；[配置与运行](docs/aced.md)。
 - `fedcompass`：计算能力感知的本地步数分配与分组半异步聚合。
 - `fedasmu`：无服务器数据适配，动态server/local系数元梯度、LSTM/Q请求时隙与fresh global本地混合；用客户端训练目标代理原文全局F，额外成本单列。
 - `orthofl`：独立客户端轨迹、全局原上传模型插值、逐层正交漂移校准后用于该客户端下一轮训练。
@@ -678,6 +684,30 @@ OrthoFL/FedASMU实现、OPCM恢复 `.5` 的说明及新profile运行流程见
 [专门操作说明](docs/orthofl_fedasmu.md)。FedASMU不预留服务器训练数据，但客户端目标代理
 不等于原文全局目标；不能声称原始理论或精度被完全复现。Pilot/UniFed-LoRA已有核心功能
 与全局/个性化双评估，但新实现需新配置快照，UniFed完整输出头还受显存限制。
+
+### ACED：活跃梯度缓存异步聚合
+
+参数仅修改 `configs/methods/aced.yaml`。默认 `delay_threshold: 10`、`cache_bits: 32`；
+`server_lr: null` 时采用 `0.2 * sqrt(N / (Plan上传数+1))`，也可显式指定服务器梯度步长。
+本地仍用公共 AdamW/epochs 设置，缓存实际训练梯度均值而非参数差分。
+
+```bash
+python tools/generate_system_profiles.py \
+  --profile aced_e1_bs4_ga4_r10_s42 \
+  --reuse_plans_from e1_bs4_ga4_r10_s42
+
+bash scripts/run_one.sh aced 2 aced_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh aced 5 aced_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh aced 10 aced_e1_bs4_ga4_r10_s42
+```
+
+旧 profile 名请替换成服务器真实名称，数据/训练/系统条件匹配才复用 Plan。
+新 profile 自动包含 ACED，旧 profile 不改写；新配置来自当前模板，不保证其他方法参数
+与旧 profile 相同。默认批处理脚本列表不变，ACED 单独运行。初始化先额外计算每客户端
+一个有效批量的梯度并进行一次全局下降，单独记入 `algorithm_initialization.json`；
+不把它或缓存复用冒充新的 Plan 上传。普通评估仍按首次纳入聚合的上传预算触发。
+本方法默认使用每卡一个客户端，参考八卡有效批量仍对齐到 128，不改变已有八卡 DDP。
+原文差异、活动年龄与真实陈旧度区别、缓存显存和日志见 [完整说明](docs/aced.md)。
 
 ### CA²FL：缓存更新校准
 
@@ -955,7 +985,7 @@ python tools/generate_oneshot_profiles.py \
 
 将 `YOUR_OLD_PROFILE` 替换为真实旧快照名。工具会核对客户端ID、任务、样本数、
 任务计算成本和种子；不匹配就拒绝复用。现有 `experiment_profiles`、旧Plan和方法
-配置不会被改写；当前普通生成器生成19个方法/57份配置（含新增CA2FL），不包含此one-shot实验。
+配置不会被改写；当前普通生成器生成20个方法/60份配置（含CA2FL和ACED），不包含此one-shot实验。
 
 上传数量为12/30/60；对外只有1次全局聚合，离线OPCM内部专家处理次数另记。
 日志记录 `merge_client_order`、`merge_steps`、`expert_training` 和原OPCM模块诊断。
@@ -967,7 +997,7 @@ one-shot10epoch与10轮×1epoch只是相近样本遍历预算，优化器连续�
 
 ## 静态工程检查
 
-以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、57 个配置（54常规+3个one-shot）、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
+以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、63 个配置（60常规+3个one-shot）、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
 
 ```bash
 python -m compileall -q code scripts tools

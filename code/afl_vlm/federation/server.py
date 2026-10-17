@@ -34,6 +34,17 @@ class FederatedServer:
     def context(self) -> ServerContext:
         return ServerContext(self.state, self.version, self.expected_clients)
 
+    def initialize_from_gradients(self) -> ApplyResult | None:
+        """Apply an optional pre-Plan bootstrap without inventing client uploads."""
+        if self.version != 0 or self.received_updates != 0:
+            raise RuntimeError("Server gradient initialization must precede all Plan updates")
+        mutation = self.method.initial_server_update(self.context())
+        if mutation is None:
+            return None
+        if mutation.contributing_update_ids:
+            raise ValueError("Server initialization cannot count new client uploads")
+        return self._apply(mutation, self.version, self.version)
+
     def receive(self, update: Update) -> list[ApplyResult]:
         receive_version = self.version
         self.received_updates += 1

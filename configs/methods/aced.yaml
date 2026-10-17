@@ -1,0 +1,15 @@
+method:
+  name: aced
+  params:
+    # Appendix F.4: eta=c*sqrt(N/T), c=0.2; T=Plan arrivals+1 bootstrap.
+    # Set server_lr to override.
+    # These are raw-gradient server step sizes, NOT the local AdamW LR.
+    server_lr: null
+    lr_scale: 0.2
+    # Appendix D Algorithm a.1 activity-age threshold (inclusive).
+    delay_threshold: 10
+    # 32 is uncompressed; 8 enables optional unbiased stochastic cache coding.
+    cache_bits: 32
+    cache_seed: 42
+federation:
+  mode: asynchronous

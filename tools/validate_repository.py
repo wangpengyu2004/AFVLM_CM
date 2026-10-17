@@ -30,6 +30,7 @@ EXPECTED_METHODS = (
     "fedasync",
     "fedbuff",
     "ca2fl",
+    "aced",
     "fedcompass",
     "fedasmu",
     "orthofl",
@@ -45,7 +46,7 @@ EXPECTED_METHODS = (
     "opcm_oneshot",
 )
 LEGACY_METHODS = set(EXPECTED_METHODS) - {
-    "opcm_lora", "dop_lora", "nufilt_lora", "orthofl", "c2afcl", "opcm_oneshot", "ca2fl",
+    "opcm_lora", "dop_lora", "nufilt_lora", "orthofl", "c2afcl", "opcm_oneshot", "ca2fl", "aced",
 }
 SETTINGS = (2, 5, 10)
 

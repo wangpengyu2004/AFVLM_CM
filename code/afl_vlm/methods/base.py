@@ -112,6 +112,14 @@ class Method(ABC):
     def finalize_initial_gradients(self) -> None:
         raise NotImplementedError(f"{self.name} has no initial-gradient protocol")
 
+    def initial_server_update(self, context: ServerContext) -> ServerMutation | None:
+        """Optional algorithm bootstrap after gradient collection, before dispatch.
+
+        Existing methods leave the model/counters unchanged. Bootstrap mutations
+        must not claim new client-upload contributors.
+        """
+        return None
+
     def prepare_download(self, global_state: LoRAState, context: ClientContext) -> LoRAState:
         return clone_state(global_state)
 

@@ -29,7 +29,7 @@ semi-asynchronous schedule from that same profile.
 
 ## Availability and invocation
 
-Main runnable comparisons: local, fedavg, fedprox, fedadam, fedasync, fedbuff, ca2fl,
+Main runnable comparisons: local, fedavg, fedprox, fedadam, fedasync, fedbuff, ca2fl, aced,
 fedcompass, fedasmu, orthofl, c2afcl, masfl, adamasfl, pilot, unifed_lora. Optional continual **merging**:
 opcm_lora, dop_lora, nufilt_lora. Ours remains the proposed method, not a baseline.
 
@@ -58,6 +58,19 @@ setting M3 with server_lr1; local training remains the common VLM configuration.
 No author-code equivalence claim is made. Standard profile generation includes
 CA2FL; old snapshots and the existing default batch sequence remain unchanged.
 See [algorithm, adaptations, memory and launch commands](ca2fl.md).
+
+ACED follows arXiv:2511.19066v1 Appendix D Algorithm a.1: all-client initial
+gradients plus a first server descent, uniform active-cache descent on arrivals,
+age-threshold exclusion and post-aggregation activity timestamp reset/rejoining.
+Only ACED uses the new optional initialization server hook; all other methods
+default to no mutation. Its raw-gradient collection uses client_parallel with
+FP32 trainable adapters, the common local AdamW work and reference batch budget.
+Multi-step trajectory-mean gradients replace the source's one-minibatch
+gradients; these are real gradients, not AdamW delta/lr. Extra initialization
+computation/messages are disclosed separately, and cached reuse never inflates
+accepted-upload counts. Initial descent adds one model version, not a Plan upload.
+No exact K=1 convergence or author-code equivalence claim is made.
+See [ACED implementation, limitations, memory and launch commands](aced.md).
 
 ```bash
 bash scripts/run_one.sh METHOD 2 PROFILE
