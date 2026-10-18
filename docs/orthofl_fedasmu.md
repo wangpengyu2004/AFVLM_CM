@@ -1,5 +1,9 @@
 # OrthoFL、无服务器数据 FedASMU 与 OPCM 设置
 
+更新（2026-10-18）：FedASMU、UniFed-LoRA 现支持方法内部 DDP 适配，Pilot 仍使用
+客户端并行。下文私有目标和算法公式保留；新增反馈归约、rank0 请求决策、显存边界与
+启动流程以 [DDP 适配说明](baseline_ddp.md) 为准。
+
 2026-10-11。本次不改 `ours` 公式、DDP backward、分区或历史 profile。
 代码开发与注册规范用于将新行为封装为 Method 生命周期 hooks；普通方法默认 no-op。
 这里只报告非训练检查，不保证未经真实环境验证的 GPU 性能或论文准确率。
@@ -142,7 +146,7 @@ bash scripts/run_one.sh pilot 2 baseline_v2_e1_bs4_ga4_r10_s42
 bash scripts/run_one.sh unifed_lora 2 baseline_v2_e1_bs4_ga4_r10_s42
 ```
 
-2可换为5或10。默认使用全部可见GPU；OrthoFL按能力策略DDP，FedASMU/Pilot/UniFed
+2可换为5或10。默认使用全部可见GPU；OrthoFL、FedASMU、UniFed按能力策略DDP，Pilot
 保留client_parallel。默认base B4/G4、参考8卡时有效128；单卡worker按同一参考窗口
 累积32个micro-batches，既不强行B128造成OOM，也不改变既有八卡DDP过程。
 启动仍只使用本地模型与图像，无自动权重下载。此次没有上传GitHub。

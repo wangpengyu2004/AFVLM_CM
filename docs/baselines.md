@@ -63,7 +63,7 @@ ACED follows arXiv:2511.19066v1 Appendix D Algorithm a.1: all-client initial
 gradients plus a first server descent, uniform active-cache descent on arrivals,
 age-threshold exclusion and post-aggregation activity timestamp reset/rejoining.
 Only ACED uses the new optional initialization server hook; all other methods
-default to no mutation. Its raw-gradient collection uses client_parallel with
+default to no mutation. Its raw-gradient collection now supports DDP with
 FP32 trainable adapters, the common local AdamW work and reference batch budget.
 Multi-step trajectory-mean gradients replace the source's one-minibatch
 gradients; these are real gradients, not AdamW delta/lr. Extra initialization
@@ -71,6 +71,14 @@ computation/messages are disclosed separately, and cached reuse never inflates
 accepted-upload counts. Initial descent adds one model version, not a Plan upload.
 No exact K=1 convergence or author-code equivalence claim is made.
 See [ACED implementation, limitations, memory and launch commands](aced.md).
+
+FedASMU, Compass, MasFL/AdaMasFL, ACED and UniFed-LoRA now select DDP under the
+capability policy. Changes are method-owned: synchronized FedASMU observations
+and rank0 policy decisions, rank-aware gradient initialization, existing SGD
+hooks and Compass K assignments. Pilot retains client_parallel for dynamic
+trainable adapters. UniFed replicates rather than shards its server hypernetwork;
+single-device memory limitations remain. Shared trainers/evaluation/ours/OPCM
+are unchanged. See [DDP details, fairness and launch commands](baseline_ddp.md).
 
 ```bash
 bash scripts/run_one.sh METHOD 2 PROFILE

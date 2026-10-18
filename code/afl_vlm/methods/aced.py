@@ -36,7 +36,7 @@ class ACED(Method):
     name = "aced"
     capabilities = MethodCapabilities(
         mode="asynchronous",
-        supports_client_ddp=False,
+        supports_client_ddp=True,
         requires_staleness=True,
         requires_mean_gradient=True,
         requires_initial_gradient=True,
@@ -147,15 +147,24 @@ class ACED(Method):
 
     def configure_local_training(self, train_config: Any) -> Any:
         if self.initial_gradient_only:
+            import torch
+
             # One real reference-effective batch at the fixed common origin;
             # gradient-only mode guarantees NO optimizer.step or weight decay.
-            return replace(
+            configured = replace(
                 train_config,
                 max_local_steps=1,
                 planned_optimizer_steps=1,
                 collect_mean_gradient=True,
                 gradient_estimation_only=True,
             )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                configured = replace(
+                    configured,
+                    distributed_rank=torch.distributed.get_rank(),
+                    distributed_world_size=torch.distributed.get_world_size(),
+                )
+            return configured
         return train_config
 
     def load_client_runtime_state(self, state: Mapping[str, Any], context: ClientContext) -> None:

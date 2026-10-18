@@ -61,8 +61,9 @@ optimizer.step。完整窗口32个 micro-batches，不是32次参数更新。
 
 ## 方法和虚拟 Plan
 
-能力策略下 `fedcompass`、`fedasmu`、`masfl`、`adamasfl`、`pilot`、`unifed_lora` 继续每卡一个客户端；
-其他已注册方法默认走客户端 DDP。不会因此改写其聚合、梯度机制或评估。
+能力策略下当前仅 Pilot 保留每卡一个客户端；FedCompass、FedASMU、MasFL/AdaMasFL、
+ACED、UniFed-LoRA 已通过方法私有适配接入 DDP，其他方法保持原执行方式。
+公共批量/训练/评估代码不改，详见 [DDP 适配与边界](baseline_ddp.md)。
 
 普通方法的原 Plan 保留：Plan 的 `local_steps` 是旧 B*G 单卡预算的名义虚拟时间单位，
 并不等于八卡真实步数（上述例子为380和48）。进度/中途刷新使用真实48步；

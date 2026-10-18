@@ -30,7 +30,9 @@ class UniFedLoRA(Method):
     name = "unifed_lora"
     capabilities = MethodCapabilities(
         mode="synchronous",
-        supports_client_ddp=False,
+        # Only ordinary client LoRA participates in DDP. Each rank retains its
+        # deterministic server hypernetwork replica (NOT sharded by DDP).
+        supports_client_ddp=True,
         requires_task_id=True,
         requires_custom_adapter=True,
         requires_local_state=True,

@@ -34,7 +34,7 @@ class FedASMU(Method):
     name = "fedasmu"
     capabilities = MethodCapabilities(
         mode="asynchronous",
-        supports_client_ddp=False,
+        supports_client_ddp=True,
         requires_staleness=True,
         requires_fresh_global_during_local_training=True,
         requires_local_state=True,
@@ -132,6 +132,9 @@ class FedASMU(Method):
         # FP32 LoRA masters for meta-gradients; frozen 7B stays common dtype.
         for _, parameter in model.named_federated_parameters():
             parameter.data = parameter.data.float()
+        from afl_vlm.methods.fedasmu_ddp import install_feedback
+
+        install_feedback(model)
 
     def configure_server(self, initial_state: LoRAState, clients: list[Any]) -> None:
         self.controller = RequestController(self.params, next(iter(initial_state.values())).device)
@@ -199,9 +202,18 @@ class FedASMU(Method):
     def select_refresh_step(self, context: ClientContext, total_steps: int) -> int | None:
         if self.controller is None:
             raise RuntimeError("Configure FedASMU request controller before dispatch")
-        decision = self.controller.select(
-            context.client_id, context.local_round, context.seed, total_steps, context.base_version
-        )
+        from afl_vlm.methods.fedasmu_ddp import distributed_active, select_decision
+
+        if distributed_active():
+            decision = select_decision(self.controller, context, total_steps)
+        else:
+            decision = self.controller.select(
+                context.client_id,
+                context.local_round,
+                context.seed,
+                total_steps,
+                context.base_version,
+            )
         self.decisions[(context.client_id, context.local_round)] = decision
         return decision["step"]
 
@@ -275,9 +287,14 @@ class FedASMU(Method):
             self.local_controls[context.client_id] = copy.deepcopy(local["controls"])
         if self.controller is None:
             raise RuntimeError("FedASMU request controller is missing")
-        self.controller.observe(
-            context.client_id, context.local_round, decision, float(local.get("reward", 0))
-        )
+        from afl_vlm.methods.fedasmu_ddp import controller_owner
+
+        # Only rank zero owns the request policy; every rank receives the same
+        # dispatch decision and globally reduced local feedback/reward.
+        if controller_owner():
+            self.controller.observe(
+                context.client_id, context.local_round, decision, float(local.get("reward", 0))
+            )
         update.metadata["fedasmu_request_decision"] = decision
         return update
 

@@ -359,11 +359,10 @@ class ACEDChecks(unittest.TestCase):
         self.assertEqual(right.contributing_update_ids, left.contributing_update_ids)
         torch.testing.assert_close(left.new_state["x"], right.new_state["x"])
 
-    def test_forced_ddp_and_changed_gradient_shape_are_rejected(self):
+    def test_explicit_ddp_accepted_but_changed_gradient_shape_rejected(self):
         config = load_config(ROOT / "configs/experiments/llava/afvlm_cm/2clients/aced.yaml")
         config["runtime"]["backend"] = "client_ddp"
-        with self.assertRaisesRegex(ValueError, "does not support client_ddp"):
-            validate_config(config)
+        validate_config(config)
         method, server = self.setup_method()
         bad = upload()
         bad.mean_gradient = {"x": torch.ones(2)}
@@ -384,7 +383,7 @@ class ACEDChecks(unittest.TestCase):
             for key in ("training", "model", "dataset", "run", "evaluation", "runtime"):
                 self.assertEqual(config[key], reference[key], key)
             self.assertEqual(
-                resolve_runtime_backend(config, create_method("aced")), "client_parallel"
+                resolve_runtime_backend(config, create_method("aced")), "client_ddp"
             )
             self.assertEqual(config["federation"]["mode"], "asynchronous")
 

@@ -26,6 +26,12 @@ class ExecutorSelectionTests(unittest.TestCase):
             "fedbuff",
             "orthofl",
             "c2afcl",
+            "fedcompass",
+            "fedasmu",
+            "masfl",
+            "adamasfl",
+            "aced",
+            "unifed_lora",
             "ours",
         ):
             with self.subTest(method=name):
@@ -34,18 +40,9 @@ class ExecutorSelectionTests(unittest.TestCase):
                     "client_ddp",
                 )
 
-    def test_step_sensitive_methods_keep_client_parallel_workers(self) -> None:
+    def test_dynamic_pilot_adapters_keep_client_parallel_workers(self) -> None:
         configurations = {
-            "fedcompass": {
-                "min_local_steps": 1,
-                "max_local_steps": 2,
-                "group_window": 0.25,
-            },
-            "fedasmu": {},
-            "masfl": {},
-            "adamasfl": {},
             "pilot": {},
-            "unifed_lora": {},
         }
         for name, params in configurations.items():
             with self.subTest(method=name):

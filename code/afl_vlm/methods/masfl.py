@@ -22,7 +22,7 @@ from afl_vlm.models.base import add_scaled, clone_state, mean_states, scale_stat
 class _MasFL(Method):
     capabilities = MethodCapabilities(
         mode="asynchronous",
-        supports_client_ddp=False,
+        supports_client_ddp=True,
         requires_staleness=True,
         requires_local_state=True,
         requires_mean_gradient=True,
@@ -93,12 +93,39 @@ class _MasFL(Method):
 
     def configure_local_training(self, train_config: Any) -> Any:
         # AdamW destroys the paper's SGD / normalized-SGD recursion.
-        return replace(
+        configured = replace(
             train_config,
             optimizer="sgd",
             learning_rate=float(self.params.get("client_lr", train_config.learning_rate)),
             gradient_estimation_only=self.initial_gradient_only,
         )
+        if self.initial_gradient_only:
+            import torch
+
+            # Shared initialization packages are executor-neutral. Bind their
+            # real rank here, privately, so probes cover distinct DDP shards.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                from afl_vlm.batching import planned_optimizer_steps
+
+                world = torch.distributed.get_world_size()
+                client = configured.context["client"]
+                configured = replace(
+                    configured,
+                    distributed_rank=torch.distributed.get_rank(),
+                    distributed_world_size=world,
+                    planned_optimizer_steps=planned_optimizer_steps(
+                        client.num_samples,
+                        configured.local_epochs,
+                        {
+                            "batch_size": configured.batch_size,
+                            "gradient_accumulation": configured.gradient_accumulation,
+                            "batch_size_scope": configured.batch_size_scope,
+                            "reference_world_size": configured.reference_world_size,
+                        },
+                        world,
+                    ),
+                )
+        return configured
 
     def transform_gradients(self, model: Any, context: Mapping[str, Any]) -> None:
         if self.initial_gradient_only:

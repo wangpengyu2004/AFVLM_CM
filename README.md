@@ -1,9 +1,13 @@
 # AFVLM-CM
 
 新增独立 `aced`：全客户端初始梯度与首步下降、活跃梯度缓存均值、超时筛选及重新参与。
-沿用固定任务分区、虚拟 Plan 和全局评估，自动选择每卡一个客户端的真实梯度收集路径；
+沿用固定任务分区、虚拟 Plan 和全局评估，现支持全部可见 GPU 协同的 DDP 梯度收集；
 不改已有 DDP 训练或其他方法。多步 AdamW、额外初始化成本与原文时间戳差异均明确披露，
 不声称原论文精确复现。配置和启动见 [ACED 说明](docs/aced.md)。
+
+FedASMU、FedCompass、MasFL/AdaMasFL、ACED、UniFed-LoRA 现默认按能力选择 DDP；
+Pilot 因动态训练参数仍使用客户端并行。改动仅在相应方法内，公共训练/评估和 ours/OPCM
+不变；UniFed 的超网络不会被 DDP 分摊显存。详见 [方法内 DDP 适配与启动](docs/baseline_ddp.md)。
 
 新增独立异步 baseline `ca2fl`（ICLR 2024）：客户端旧更新缓存差分校准、全局缓存均值、
 缓冲聚合，以及可选 4/8-bit MF 缓存。默认 `server_lr=1`、`buffer_size=3`、完整 FP32 缓存；
@@ -21,7 +25,7 @@
 
 AFVLM-CM 是用于论文实验的异步联邦视觉语言模型指令微调框架，研究固定任务客户端下的任务异构与系统异构：每个客户端永久属于一个任务，客户端速度、可用时间和网络延迟不同，但不存在持续学习或任务增量流。
 
-正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。LoRA 仅作用于语言模型侧：即使 `q_proj/k_proj/v_proj` 名称同时匹配 CLIP，冻结的 vision tower/vision resampler 参数也会从优化器、DDP 归约和联邦状态中排除。默认运行时自动发现全部可见 GPU，并按方法能力选择物理执行器：普通 local-epoch 方法与 `ours` 使用全部 GPU 对同一客户端做 DDP，依赖特殊 optimizer-step 轨迹、动态本地步数、中途刷新或动态 adapter 的方法保留“一卡一个客户端”worker pool。两条路径都按同一虚拟 TrainPlan 冻结 base version 并按计划到达顺序聚合。冻结 7B 主干不会上传、聚合或写入联邦检查点。
+正式实验只使用 LLaVA-v1.5-7B、CLIP ViT-L/14-336 和 LoRA。默认 LoRA 为 r=8、alpha=16、dropout=0.05、bias=none；默认随机种子为 42。LoRA 仅作用于语言模型侧：即使 `q_proj/k_proj/v_proj` 名称同时匹配 CLIP，冻结的 vision tower/vision resampler 参数也会从优化器、DDP 归约和联邦状态中排除。默认运行时发现全部可见 GPU，按方法能力选择执行器：除 Pilot 外的当前方法支持全部 GPU 对同一客户端做 DDP，方法自身处理 SGD、初始化与中途刷新等特殊需要；Pilot 的动态 adapter 保留“一卡一个客户端”worker pool。普通异步方法仍按虚拟 TrainPlan 冻结 base version 并按计划到达聚合。冻结 7B 主干不会上传、聚合或写入联邦检查点。
 
 ## 已检测的数据
 
@@ -305,8 +309,8 @@ python tools/select_runtime_backend.py \
   --config experiment_profiles/module_gate_freqw18_e1_bs4_ga4_r10_s42/configs/2clients/ours.yaml
 ```
 
-正常应输出 `client_ddp`。`fedcompass`、`masfl`、`adamasfl`、`pilot` 和 `unifed_lora`
-会输出 `client_parallel`，这是方法能力约束，不是运行错误。
+正常应输出 `client_ddp`，FedASMU、FedCompass、MasFL/AdaMasFL、ACED、UniFed-LoRA 现在也一样。
+只有 Pilot 仍输出 `client_parallel`，其动态适配器暂不强接当前固定 DDP reducer。
 
 ### 4. 在 8 卡上启动 `ours`
 
@@ -540,11 +544,12 @@ worker 完成后先返回未经服务器处理的原始更新；父进程在计�
 默认 `runtime.arrival_policy: planned` 会按持久化虚拟到达顺序应用更新，`runtime.worker_queue: plan_arrival_edf` 则只优化物理 GPU 执行顺序。逻辑 start 时先冻结 `base_version` 和方法产生的下载状态，在下一次计划 arrival 前把所有已经合法启动的作业放入候选堆，再优先执行计划 `arrival_time` 最早者；提前算完但尚未轮到的结果进入缓存。EDF 不重算下载版本、不提前聚合，也不允许未来 start 事件偷跑，因此某次运行的磁盘抖动或 GPU 波动只影响 wall-clock，不改变方法比较的逻辑到达条件。FedCompass 可以改变本地步数和分组，因为这是算法本身；其他方法不能通过修改 Plan 偷换系统条件。完整生命周期、特殊方法处理、方法服务器状态和任务耗时校准见 [`docs/async_runtime.md`](docs/async_runtime.md)。
 
 物理执行器由 `MethodCapabilities.supports_client_ddp` 选择。普通 local-epoch 方法以及
-`ours` 使用所有可见 GPU 对同一个客户端执行 DDP；FedCompass、MasFL、AdaMasFL、Pilot
-和 UniFed-LoRA 使用一卡一客户端 worker pool。前三者依赖 local-step
-分配或 optimizer-step 梯度轨迹；Pilot 的任务/客户端专属 adapter 会随客户端
-产生动态 unused parameters，不与当前重入式梯度检查点强行组合 DDP。两种执行器都只在
-Plan 指定的逻辑 arrival 聚合。UniFed-LoRA 使用独立服务器超网络，避免在每个DDP rank复制完整输出头。
+`ours` 及除 Pilot 外的当前方法使用所有可见 GPU 对同一个客户端执行 DDP。
+FedCompass 保留方法分配的 K，MasFL/AdaMasFL 保留同步后 SGD 钩子，ACED 保留真实梯度；
+FedASMU 在方法内部归约反馈并广播请求决策。Pilot 的动态训练参数暂保留 worker pool，
+不改变公共 DDP 包装。两种执行器都只在 Plan 指定的逻辑 arrival 聚合。
+UniFed-LoRA 每 rank 复制服务器超网络，**不会按八卡分摊显存**；原显存限制仍适用。
+方法级实现、旧快照批量注意事项和运行命令见 [DDP 适配说明](docs/baseline_ddp.md)。
 `ours`/OPCM 的普通 AdamW DDP 训练使用公平性改造前 `ced4779` 的完整本地训练函数，
 与单卡批量对齐隔离；不添加静态图或首窗口同步。FedAsync 的 `paper_loss` 正则
 在已有 optimizer-boundary hook 解析加入梯度，避免给重入式 checkpoint 增加重复反向路径。
@@ -706,7 +711,8 @@ bash scripts/run_one.sh aced 10 aced_e1_bs4_ga4_r10_s42
 与旧 profile 相同。默认批处理脚本列表不变，ACED 单独运行。初始化先额外计算每客户端
 一个有效批量的梯度并进行一次全局下降，单独记入 `algorithm_initialization.json`；
 不把它或缓存复用冒充新的 Plan 上传。普通评估仍按首次纳入聚合的上传预算触发。
-本方法默认使用每卡一个客户端，参考八卡有效批量仍对齐到 128，不改变已有八卡 DDP。
+本方法现默认使用全部可见 GPU 的 DDP；初始化按真实 rank 分片，参考八卡有效批量仍为 128。
+不改变已有 ours/OPCM 的八卡路径；旧缺少参考元数据的 per_device 快照应重新建 profile。
 原文差异、活动年龄与真实陈旧度区别、缓存显存和日志见 [完整说明](docs/aced.md)。
 
 ### CA²FL：缓存更新校准
