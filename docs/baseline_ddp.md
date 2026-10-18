@@ -44,6 +44,28 @@ PyTorch 对 DDP 常规反向、`autograd.grad` 及重入 checkpoint 的限制见
 `physical_batch_records`。不伪造上传/optimizer steps，不引入服务器校准集。
 私有训练目标依然是原文全局目标的已披露代理；本次 DDP 不消除这个理论差异。
 
+### FedASMU 反馈阶段 OOM 修复
+
+旧反馈虽然关闭 dropout，却也因为 `eval()` 绕过了 Transformers 的训练模式梯度
+检查点。7B decoder 的额外求梯度前向因此保存全层激活；这不是把单卡 GA32 错当成
+DDP batch32。`feedback_samples: 4` 的到达反馈原本就是每 rank 重复同4条记录，
+与普通训练的 batch/梯度累积独立；刷新反馈则读取各 rank 最近的真实 micro-batch。
+
+现在只在 FedASMU DDP 的额外反馈梯度阶段，为当前模型实例的每个 decoder layer
+临时安装 `checkpoint(..., use_reentrant=False)`。它支持项目的 PyTorch2.0.1
+`autograd.grad` 和关键字输入；wrapper 一直保留到求导/重计算结束，异常时也恢复
+原 forward。全程保留 eval/dropout-off，不调用 DDP forward、不写 `.grad`，
+不把模型、激活或运算迁到 CPU。损失前向显式关闭 KV cache、attention/hidden输出。
+依据：[PyTorch2.0.1 checkpoint 源码及接口说明](https://github.com/pytorch/pytorch/blob/v2.0.1/torch/utils/checkpoint.py)。
+
+不减少 `feedback_samples`、不截短文本、不改变反馈目标、rank均值归约、普通
+batch/累积/optimizer steps、Plan、聚合或其他方法。以额外逐层重计算换取激活显存，
+不保证任意文本长度或批量下32GB卡都足够，也不保证指标逐位不变。新增日志
+`objective_per_rank_batch_records`、`objective_activation_checkpointing`、
+`objective_checkpointed_layers`；原 forwards/backwards 计数仍表示顶层目标调用次数，
+不是每层重计算次数。无需重生成 Plan/profile 即可应用代码修复，但失败输出应保留
+并使用新的空输出目录重新正式运行；框架不会据此自动恢复中断训练。
+
 ## 初始化与特殊优化器
 
 共享初始化作业不绑定 DDP rank。MasFL/AdaMasFL 和 ACED 在各自

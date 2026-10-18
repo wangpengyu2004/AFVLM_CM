@@ -4,11 +4,15 @@ Training still uses the historical DDP AdamW body. Extra meta-objectives run on
 the unwrapped eval-mode network, so autograd.grad never uses a DDP forward or a
 re-entrant training checkpoint. Three scalar observations are explicitly reduced;
 no parameter .grad, optimizer or reducer state is modified by this oracle.
+Eval disables Hugging Face's training-only activation checkpoints, so the extra
+gradient objective uses temporary non-reentrant checkpoints per decoder layer.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from functools import wraps
 from types import MethodType
 from typing import Any
 
@@ -53,6 +57,53 @@ def reduce_observations(values: Any, records: int) -> tuple[Any, int, int]:
     return packed[:3] / world, int(packed[3].item()), world
 
 
+def _checkpointed_forward(original: Any) -> Any:
+    """Checkpoint one decoder, not the whole model (which has a large replay)."""
+    import torch
+    from torch.utils.checkpoint import checkpoint
+
+    @wraps(original)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if not torch.is_grad_enabled():
+            return original(*args, **kwargs)
+        # Supported by the project's torch 2.0.1: unlike reentrant checkpoint,
+        # this preserves keyword inputs and works with torch.autograd.grad.
+        return checkpoint(original, *args, use_reentrant=False, **kwargs)
+
+    return wrapped
+
+
+@contextmanager
+def objective_checkpoints(network: Any) -> Iterator[int]:
+    """Temporary instance-only wrappers, active through gradient recomputation.
+
+    Leave all modules in eval mode, preserve class/instance forward lookup,
+    and restore even after a forward/autograd/OOM exception. Do not change
+    common LLaVA checkpoint flags or install wrappers on its DDP shell.
+    """
+    import torch
+
+    backbone = network.get_base_model()
+    layers = backbone.get_model().layers
+    if not isinstance(layers, torch.nn.ModuleList) or not len(layers):
+        raise ValueError("FedASMU feedback requires LLaVA Llama decoder layers")
+    saved = []
+    try:
+        for layer in layers:
+            original = layer.forward
+            had_override = "forward" in layer.__dict__
+            override = layer.__dict__.get("forward")
+            saved.append((layer, had_override, override))
+            layer.forward = _checkpointed_forward(original)
+        yield len(layers)
+    finally:
+        for layer, had_override, override in reversed(saved):
+            if had_override:
+                layer.forward = override
+            else:
+                delattr(layer, "forward")
+
+
 def feedback(
     model: Any,
     left: dict[str, Any],
@@ -88,13 +139,19 @@ def feedback(
     try:
         # Bypass the DDP forward/reducer ONLY for the extra objective. In eval
         # mode HF training checkpoints/dropout are off; main training is intact.
+        # Disable KV/attention/hidden-state outputs for this loss-only oracle.
+        # Copy the mapping: the caller's cached training batch stays unchanged.
         model.model.eval()
+        objective_inputs = dict(encoded)
+        objective_inputs.update(
+            use_cache=False, output_attentions=False, output_hidden_states=False
+        )
         model.load_trainable(left)
         with torch.no_grad():
-            before = network(**encoded).loss.detach().float()
+            before = network(**objective_inputs).loss.detach().float()
         model.load_trainable(add_scaled(left, direction, weight))
-        with torch.enable_grad():
-            loss = network(**encoded).loss
+        with torch.enable_grad(), objective_checkpoints(network) as checkpointed_layers:
+            loss = network(**objective_inputs).loss
             parameters = dict(model.named_federated_parameters())
             gradients = torch.autograd.grad(loss, tuple(parameters.values()), allow_unused=True)
         derivative = loss.detach().new_zeros((), dtype=torch.float32)
@@ -124,6 +181,9 @@ def feedback(
             if replicated_probe
             else "ddp_last_local_microbatches",
             "objective_world_size": world,
+            "objective_per_rank_batch_records": int(encoded["input_ids"].shape[0]),
+            "objective_activation_checkpointing": "non_reentrant_decoder_layers",
+            "objective_checkpointed_layers": checkpointed_layers,
             "physical_objective_forwards": 2 * world,
             "physical_objective_backwards": world,
             "physical_batch_records": total_records,

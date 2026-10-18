@@ -222,6 +222,87 @@ class BaselineDDPChecks(unittest.TestCase):
             any(isinstance(node, ast.Try) and node.finalbody for node in ast.walk(tree))
         )
 
+    def test_objective_checkpoints_restore_forward_lookup_modes_and_isolate_instances(self):
+        # Inspect module wiring only: no model forward, backward or training.
+        layers = torch.nn.ModuleList([torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)])
+        layers[0].eval()
+        override = Mock()
+        layers[1].forward = override
+        other = torch.nn.Linear(2, 2)
+        network = SimpleNamespace(
+            get_base_model=lambda: SimpleNamespace(get_model=lambda: SimpleNamespace(layers=layers))
+        )
+        flags = [layer.training for layer in layers]
+        for fail in (False, True):
+            try:
+                with fedasmu_ddp.objective_checkpoints(network) as count:
+                    self.assertEqual(count, 2)
+                    self.assertTrue(all("forward" in layer.__dict__ for layer in layers))
+                    self.assertIs(layers[1].forward.__wrapped__, override)
+                    self.assertNotIn("forward", other.__dict__)
+                    self.assertEqual([layer.training for layer in layers], flags)
+                    if fail:
+                        raise RuntimeError("feedback failed")
+            except RuntimeError as exc:
+                self.assertTrue(fail)
+                self.assertEqual(str(exc), "feedback failed")
+            self.assertNotIn("forward", layers[0].__dict__)
+            self.assertIs(layers[1].forward, override)
+            self.assertEqual([layer.training for layer in layers], flags)
+        override.assert_not_called()
+
+    def test_objective_checkpoint_uses_nonreentrant_keyword_api_without_running_network(self):
+        original = Mock()
+        marker, attention = object(), object()
+        with (
+            torch.enable_grad(),
+            patch("torch.utils.checkpoint.checkpoint", return_value=marker) as checkpoint,
+        ):
+            wrapper = fedasmu_ddp._checkpointed_forward(original)
+            self.assertIs(wrapper(marker, attention_mask=attention), marker)
+        checkpoint.assert_called_once_with(
+            original, marker, use_reentrant=False, attention_mask=attention
+        )
+        original.assert_not_called()
+
+    def test_objective_context_is_active_through_autograd_and_never_rewrites_cached_batch(self):
+        tree = ast.parse(inspect.getsource(fedasmu_ddp.feedback))
+        checkpoint_context = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "objective_checkpoints"
+                for item in node.items
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "grad"
+                for node in ast.walk(checkpoint_context)
+            )
+        )
+        source = inspect.getsource(fedasmu_ddp.feedback)
+        self.assertIn("objective_inputs = dict(encoded)", source)
+        self.assertIn("use_cache=False", source)
+        self.assertNotIn("encoded.update", source)
+        self.assertNotIn("gradient_accumulation", source)
+        self.assertNotIn("batch_size *", source)
+
+    def test_objective_checkpoints_reject_missing_decoder_layers_without_mutating(self):
+        network = SimpleNamespace(
+            get_base_model=lambda: SimpleNamespace(
+                get_model=lambda: SimpleNamespace(layers=torch.nn.ModuleList())
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "decoder layers"):
+            with fedasmu_ddp.objective_checkpoints(network):
+                self.fail("Empty decoder must be rejected")
+
 
 if __name__ == "__main__":
     unittest.main()
