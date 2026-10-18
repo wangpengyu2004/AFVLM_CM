@@ -144,11 +144,10 @@ each task:
 m_hat[q,l] = m[q,l] / (1-history_beta^n[q])    if n[q] > 0
 ```
 
-With uniform target-task prior `pi[q]=1/Q`, the protected server precision is:
+With uniform target-task prior `pi[q]=1/Q`, the unchanged base precision is:
 
 ```text
-Omega[t,l] = base_precision
-             + history_strength sum_q pi[q] a[q,t] m_hat[q,l]
+Omega_base[t,l] = base_precision + history_strength sum_q pi[q] m_hat[q,l]
 ```
 
 The memory used for one arrival is the state before fusing that arrival. The
@@ -156,39 +155,46 @@ source task memory is updated only after fusion. Reliability and frequency do
 not scale this EMA, so stale or infrequent tasks do not receive weaker future
 protection solely because of their system behavior.
 
-### Optional age-weighted protection of finished tasks
+### Finished-task selected-layer max protection (current template)
 
-The current method template enables `history_age_enabled`. Only historical
-precision synthesis changes; the raw EMA, its bias correction, functional
-staleness, frequency correction and base-relative A/B increment remain the same.
-When disabled (also the default if the flag is absent in a legacy profile),
-`a[q,t]=1` and the original historical precision is recovered exactly.
+The template enables `history_age_enabled` and `history_age_mode: selected_layers_max`.
+Only the EXTRA temporal precision changes. The raw EMA, bias correction,
+functional staleness, frequency, base precision and LoRA increment remain unchanged.
+All configured clients must finish all unique planned jobs by successful incorporation.
+Rejected jobs remain pending and do not retire a task; duplicate accepted jobs fail.
+After the last successful update's EMA, freeze its corrected `H_end` and counter.
 
 ```text
 u          = number of successfully aggregated client updates so far
-u_finish[q]= u when every planned (client_id, local_round) job of task q is resolved
+u_finish[q]= u when every planned (client_id, local_round) job of task q is accepted
 age[q,t]   = u - u_finish[q]
-
-a[q,t] = 1                                      if q is unfinished
-a[q,t] = 1 + history_age_boost
-             * (1-exp(-age[q,t]/history_age_time_scale))  otherwise
+E[q,m]     = max(H_end[q,m] - 0.5, 0)
+I[q,layer] = mean_QKVO(E[q,layer,projection])
+p[q,layer] = I[q,layer] / sum_layers I[q,layer]
+mask[q,layer] = p[q,layer] > 1/L + 1e-8
+b[q,t]     = history_age_boost * (1-exp(-age[q,t]/history_age_time_scale))
+P[q,m]     = pi[q] * b[q,t] * mask[q,layer(m)] * H_end[q,m]
+Omega[t,m] = Omega_base[t,m] + history_strength * max_finished_q P[q,m]
 ```
 
-The exact virtual Plan is observed through `configure_schedule`; it is not
-modified. A task retires only after all its clients' planned arrivals are handled,
-including a rejected terminal arrival. Physical GPU completion, inactivity in
-the frequency window, and finishing one client's last round do not retire a task.
-Rejected or zero-weight arrivals do not advance `u`; accepted arrivals advance it
-once. The current arrival reads the existing weight before advancing the counter.
-A newly retired task starts at age zero and weight one.
+L is inferred from complete decoder Q/K/V/O metadata (32 for LLaVA1.5-7B), not
+chosen from observed experimental layer lists. The floor is `1-uniform_mix`,
+currently0.5, subtracted only for selection. Zero/indistinguishable scores select
+no layers. H_end/mask are immutable after completion. No fixed K, L/K compensation,
+normalization of extra mass or additive full-layer age term is used.
+Four projections retain their own H_end and may have different max-owner tasks.
+Base history still SUMS all tasks. Selection union and positive-extra support differ.
 
-Defaults are boost `2.0` and time scale `18.0` accepted updates. The multiplier
-grows smoothly from one towards three. These are tunable initial settings, not
-empirically established optimum values. Tasks with no accepted history still
-contribute zero regardless of multiplier. All original task priors remain
-`pi[q]=1/Q`; weighted priors are NOT renormalized and completed tasks are NOT
-removed. The frequency window and its fixed-Q calculation are unchanged by
-this extension. The time-scale value is independent of the frequency-window size.
+Default boost2/scale18 are initial experimental settings, not proven optimal.
+Current aggregation reads pre-update age: first upload after completion has age0,
+second has age1. No parameter anchor, synthetic upload or extra server update.
+The max/sparsification can lower mean Omega; this is not budget-matched relocation.
+
+Compatibility: absent `history_age_mode` retains the original `all_modules_sum`
+rule for old profiles, including its old resolved-job retirement semantics.
+The strict successful-completion and frozen selection rules belong to the new mode.
+Set `history_age_enabled: false` for base-only protection. Old profiles/checkpoints
+are not silently rewritten. See [full implementation and logs](ours_selected_layer_protection.md).
 
 No parameter anchor, old-update replay, extra forward/backward or client upload
 is introduced. Increased Omega only damps subsequent movements in important
@@ -278,6 +284,7 @@ method:
     history_lambda: 1.0
     history_strength: 1.0
     history_age_enabled: true
+    history_age_mode: selected_layers_max
     history_age_boost: 2.0
     history_age_time_scale: 18.0
     base_precision: 1.0
@@ -319,7 +326,7 @@ unchanged by this method revision.
 
 ## 10. Diagnostics and checkpoints
 
-Every arrival writes schema-version-4 `ours_diagnostics`, including:
+Selected-layer arrivals write schema-version-5 `ours_diagnostics` (legacy mode remains4), including:
 
 - raw and final module-sensitivity summaries;
 - per-module sensitivity and observation count;
@@ -334,6 +341,8 @@ Every arrival writes schema-version-4 `ours_diagnostics`, including:
 - each task's pending Plan jobs, completion counter, age and protection multiplier,
   before/after the arrival;
 - per-module historical precision both with and without temporal weighting;
+- immutable task-end H, layer scores/shares/masks and client completion counts;
+- selected-layer union, actual positive-extra support and per-module max source;
 
 `tools/export_ours_diagnostics.py` exports update-level and module-level CSV
 files. Both include `aggregation_rule`. Legacy events without a rule label
@@ -343,6 +352,8 @@ maps `history_task_weights_before/after`, `history_task_ages_before/after`,
 `history_tasks_finished_at_before/after`, and `history_pending_updates_before/after`;
 the module CSV adds `historical_precision_unweighted_before/after` for comparison
 with actual `historical_precision_before/after`.
+Selected-layer records additionally export extra precision, source task and layer.
+`ours_task_completion_diagnostics.csv` is created when task-end snapshots are present.
 There is no rank-level CSV because Module-Gate does not produce or upload
 rank sensitivity.
 
@@ -351,7 +362,8 @@ they cannot reconstruct the ordered accepted-task frequency window.
 This aggregation revision keeps the same memory/checkpoint data layout but
 changes the update semantics. Do not continue an old endpoint-mixing run as
 the same experiment; use a separate output/profile for the new variant.
-Temporal-history runs additionally checkpoint `history_age_state` (sub-schema 1):
+Temporal-history runs additionally checkpoint `history_age_state` (legacy sub-schema1;
+selected-layer sub-schema2 additionally requires frozen H/masks):
 the exact Plan jobs, resolved jobs, successful-update counter and task retirement
 times. Loading it validates completion consistency. A legacy checkpoint without
 these fields is accepted only with temporal history disabled; it is never assigned
@@ -391,9 +403,9 @@ profile, reuse its identical Plan (replace `YOUR_EXISTING_PROFILE`):
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_age_e1_bs4_ga4_r10_s42 \
+  --profile module_gate_selectedmax_b2_t18_e1_bs4_ga4_r10_s42 \
   --reuse_plans_from YOUR_EXISTING_PROFILE
-bash scripts/run_one.sh ours 2 module_gate_age_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_selectedmax_b2_t18_e1_bs4_ga4_r10_s42
 ```
 
 The profile name is a label, not a parameter override. New snapshots read current

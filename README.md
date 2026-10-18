@@ -601,6 +601,14 @@ python tools/estimate_task_compute_factors.py \
 
 ## 方法
 
+`ours` 新增“任务结束后重要层去重保护”：只有所有客户端的计划作业成功纳入后，才冻结
+该任务包含最后一次上传的历史 EMA；扣除0.5底座选出任务内高于平均占比的层。
+只在入选层增加年龄保护，同模块多个结束任务取 max，不叠加旧全层年龄项、不做层数补偿。
+当前模板为 `history_age_mode: selected_layers_max`、`boost=2`、`scale=18`。
+旧 profile 缺少模式字段仍保留旧全层方案；需要新 profile 才启用新模式，可复用匹配的旧 Plan。
+客户端敏感度、r/w、基础历史求和、增量聚合和评估不变；
+[实现、日志、公式及运行步骤](docs/ours_selected_layer_protection.md)。
+
 统一注册表支持：
 
 - `local`：每个客户端独立 LoRA，无服务器聚合。

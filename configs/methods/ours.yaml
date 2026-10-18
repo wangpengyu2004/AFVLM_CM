@@ -16,10 +16,11 @@ method:
     history_beta: 0.9
     history_lambda: 1.0
     history_strength: 1.0
-    # Only completed tasks gain bounded protection as accepted updates pass.
-    # a_q = 1 + boost * (1-exp(-age/time_scale)); unfinished tasks keep a_q=1.
-    # Set false for the original historical precision (old profiles default false).
+    # Freeze each task's final corrected EMA; select above-mean Q/K/V/O layers.
+    # Add MAX task demand on selected modules only, never sum old age terms.
+    # Old snapshots missing mode retain all_modules_sum; false disables extra age.
     history_age_enabled: true
+    history_age_mode: selected_layers_max
     history_age_boost: 2.0
     history_age_time_scale: 18.0
     base_precision: 1.0

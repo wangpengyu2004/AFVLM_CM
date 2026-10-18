@@ -53,6 +53,7 @@ def export_diagnostics(
 ) -> dict[str, Any]:
     update_rows: list[dict[str, Any]] = []
     module_rows: list[dict[str, Any]] = []
+    completion_rows: list[dict[str, Any]] = []
     for event in _read_events(events_path):
         for item in _diagnostics(event):
             client = item["client"]
@@ -73,11 +74,38 @@ def export_diagnostics(
             after_summary = memory["task_memory_after_summary"]
             age_before = memory.get("history_age_before", {})
             age_after = memory.get("history_age_after", {})
+            completed = memory.get("finished_task_snapshot")
+            if completed is not None:
+                completion_rows.append(
+                    {
+                        "task": completed["task"],
+                        "finished_at": completed["finished_at"],
+                        "last_update_id": completed["last_update_id"],
+                        "layer_count": completed["layer_count"],
+                        "selected_layer_count": len(completed["selected_layers"]),
+                        "selection_floor": completed["selection_floor"],
+                        "threshold": completed["threshold"],
+                        "selection_tolerance": completed["selection_tolerance"],
+                        "selection_reason": completed["selection_reason"],
+                        **{
+                            key: json.dumps(completed[key], sort_keys=True, ensure_ascii=False)
+                            for key in (
+                                "selected_layers",
+                                "layer_score",
+                                "layer_share",
+                                "layer_mask",
+                                "history",
+                                "completion_by_client",
+                            )
+                        },
+                    }
+                )
 
             def age_json(section: Mapping[str, Any], key: str) -> str:
                 if key not in section:
                     return ""
                 return json.dumps(section[key], sort_keys=True, ensure_ascii=False)
+
             common = {
                 "event_id": event.get("event_id"),
                 "update_id": client["update_id"],
@@ -122,14 +150,10 @@ def export_diagnostics(
                     "sensitivity_statistic": transform.get("statistic", ""),
                     "sensitivity_normalization": transform.get("normalization", ""),
                     "sensitivity_uniform_mix": _summary_value(transform, "uniform_mix"),
-                    "sensitivity_uniform_floor": _summary_value(
-                        transform, "uniform_floor"
-                    ),
+                    "sensitivity_uniform_floor": _summary_value(transform, "uniform_floor"),
                     "raw_sensitivity_mean": _summary_value(raw_summary, "mean"),
                     "final_sensitivity_mean": _summary_value(final_summary, "mean"),
-                    "gate_direction_abs_mean": _summary_value(
-                        transform, "gate_direction_abs_mean"
-                    ),
+                    "gate_direction_abs_mean": _summary_value(transform, "gate_direction_abs_mean"),
                     "module_sensitivity_mean": _summary_value(module_summary, "mean"),
                     "module_sensitivity_std": _summary_value(module_summary, "std"),
                     "module_sensitivity_min": _summary_value(module_summary, "min"),
@@ -143,6 +167,9 @@ def export_diagnostics(
                     "task_memory_count_after": memory.get("task_memory_count_after", ""),
                     "history_strength": memory.get("history_strength", ""),
                     "history_age_enabled": age_before.get("enabled", ""),
+                    "history_age_mode": age_before.get(
+                        "mode", "all_modules_sum" if age_before else ""
+                    ),
                     "history_age_boost": age_before.get("boost", ""),
                     "history_age_time_scale": age_before.get("time_scale", ""),
                     "history_accepted_updates_before": age_before.get("accepted_updates", ""),
@@ -155,6 +182,26 @@ def export_diagnostics(
                     "history_tasks_finished_at_after": age_json(age_after, "finished_at"),
                     "history_pending_updates_before": age_json(age_before, "pending_updates"),
                     "history_pending_updates_after": age_json(age_after, "pending_updates"),
+                    "selected_layers_by_task_before": age_json(
+                        age_before, "selected_layers_by_task"
+                    ),
+                    "selected_layers_by_task_after": age_json(age_after, "selected_layers_by_task"),
+                    "selected_layer_union_before": age_json(age_before, "selected_layer_union"),
+                    "selected_layer_union_after": age_json(age_after, "selected_layer_union"),
+                    "positive_extra_modules_before": age_before.get(
+                        "positive_extra_module_count", ""
+                    ),
+                    "positive_extra_modules_after": age_after.get(
+                        "positive_extra_module_count", ""
+                    ),
+                    "extra_precision_mean_before": age_before.get(
+                        "extra_precision_summary", {}
+                    ).get("mean", ""),
+                    "extra_precision_mean_after": age_after.get("extra_precision_summary", {}).get(
+                        "mean", ""
+                    ),
+                    "max_sources_before": age_json(age_before, "max_source_by_module"),
+                    "max_sources_after": age_json(age_after, "max_source_by_module"),
                 }
             )
             modules = sensitivity["module_by_module"]
@@ -165,6 +212,7 @@ def export_diagnostics(
                     {
                         **common,
                         "module": module,
+                        "decoder_layer": age_before.get("layer_by_module", {}).get(module, ""),
                         "raw_module_sensitivity": raw_by_module.get(module, ""),
                         "signed_gate_mean": signed_gate_mean.get(module, ""),
                         "gate_direction": gate_direction.get(module, ""),
@@ -179,17 +227,27 @@ def export_diagnostics(
                         )[module],
                         "task_memory_before": memory["task_memory_before"][module],
                         "task_memory_after": memory["task_memory_after"][module],
-                        "historical_precision_before": memory[
-                            "historical_precision_before"
-                        ][module],
-                        "historical_precision_after": memory[
-                            "historical_precision_after"
-                        ][module],
+                        "historical_precision_before": memory["historical_precision_before"][
+                            module
+                        ],
+                        "historical_precision_after": memory["historical_precision_after"][module],
                         "historical_precision_unweighted_before": memory.get(
                             "historical_precision_unweighted_before", {}
                         ).get(module, ""),
                         "historical_precision_unweighted_after": memory.get(
                             "historical_precision_unweighted_after", {}
+                        ).get(module, ""),
+                        "history_age_extra_before": age_before.get(
+                            "extra_precision_by_module", {}
+                        ).get(module, ""),
+                        "history_age_extra_after": age_after.get(
+                            "extra_precision_by_module", {}
+                        ).get(module, ""),
+                        "history_age_max_source_before": age_before.get(
+                            "max_source_by_module", {}
+                        ).get(module, ""),
+                        "history_age_max_source_after": age_after.get(
+                            "max_source_by_module", {}
                         ).get(module, ""),
                     }
                 )
@@ -203,11 +261,17 @@ def export_diagnostics(
     module_path = output_directory / "ours_module_diagnostics.csv"
     _write_csv(update_path, update_rows, update_fields)
     _write_csv(module_path, module_rows, module_fields)
+    completion_path = None
+    if completion_rows:
+        completion_path = output_directory / "ours_task_completion_diagnostics.csv"
+        _write_csv(completion_path, completion_rows, list(completion_rows[0]))
     return {
         "updates": len(update_rows),
         "modules": len(module_rows),
         "update_csv": str(update_path),
         "module_csv": str(module_path),
+        "completed_tasks": len(completion_rows),
+        "completion_csv": str(completion_path) if completion_path is not None else None,
     }
 
 

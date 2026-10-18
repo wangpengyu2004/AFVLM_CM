@@ -560,6 +560,7 @@ class Ours(Method):
         "history_lambda",
         "history_strength",
         "history_age_enabled",
+        "history_age_mode",
         "history_age_boost",
         "history_age_time_scale",
         "base_precision",
@@ -579,6 +580,8 @@ class Ours(Method):
         self.history_resolved_jobs: set[tuple[str, int]] = set()
         self.task_pending_updates: dict[str, int] = {}
         self.task_finished_at: dict[str, int] = {}
+        self.task_end_snapshots: dict[str, dict[str, Any]] = {}
+        self._age_module_layers: dict[str, str] = {}
         self._client_tasks: dict[str, str] = {}
         self._server_metadata: dict[str, dict[str, Any]] = {}
         self._model_metadata: dict[str, dict[str, Any]] = {}
@@ -633,6 +636,11 @@ class Ours(Method):
             raise ValueError("history_strength must be finite and non-negative")
         if not isinstance(self.params.get("history_age_enabled", False), bool):
             raise ValueError("history_age_enabled must be boolean")
+        age_mode = self.params.get("history_age_mode", "all_modules_sum")
+        if not isinstance(age_mode, str) or age_mode not in {
+            "all_modules_sum", "selected_layers_max",
+        }:
+            raise ValueError("history_age_mode must be all_modules_sum or selected_layers_max")
         history_age_boost = self._value("history_age_boost", 1.0)
         if not math.isfinite(history_age_boost) or history_age_boost < 0.0:
             raise ValueError("history_age_boost must be finite and non-negative")
@@ -654,7 +662,16 @@ class Ours(Method):
 
     def configure_server(self, initial_state: LoRAState, clients: list[Any]) -> None:
         pairs = _state_pairs(initial_state)
+        if self._selected_layer_age() and self.params.get("history_age_enabled", False):
+            from afl_vlm.methods.ours_layer_protection import layer_modules
+
+            self._age_module_layers = {
+                module: str(layer)
+                for layer, group in layer_modules(tuple(pairs)).items()
+                for module in group.values()
+            }
         for module, pair in pairs.items():
+            previous_metadata = self._server_metadata.get(module, {})
             a_name, a = pair["A"]
             b_name, b = pair["B"]
             a_shape, b_shape = _shape(a), _shape(b)
@@ -667,7 +684,7 @@ class Ours(Method):
                 "rank": a_shape[0],
                 "in_features": a_shape[1],
                 "out_features": b_shape[0],
-                "scaling": None,
+                "scaling": previous_metadata.get("scaling") if self._selected_layer_age() else None,
             }
         if self._model_metadata:
             if set(self._model_metadata) != set(self._server_metadata):
@@ -719,6 +736,8 @@ class Ours(Method):
             jobs[job] = event.task
         if not jobs or set(jobs.values()) != set(self.task_weights):
             raise ValueError("Temporal-history Plan must contain every configured task")
+        if self._selected_layer_age() and {job[0] for job in jobs} != set(self._client_tasks):
+            raise ValueError("Selected-layer history Plan must contain every configured client")
         if self.history_planned_jobs and jobs != self.history_planned_jobs:
             raise ValueError("Temporal-history checkpoint Plan differs from the current Plan")
         self.history_planned_jobs = jobs
@@ -740,6 +759,59 @@ class Ours(Method):
             raise ValueError(f"Update is absent from the temporal-history Plan: {job}")
         if job in self.history_resolved_jobs:
             raise ValueError(f"Temporal-history Plan job was already resolved: {job}")
+        if (
+            self._selected_layer_age()
+            and update.update_id != f"{update.client_id}-r{update.local_round}"
+        ):
+            raise ValueError("Selected-layer history update ID must match its unique Plan job")
+
+    def _selected_layer_age(self) -> bool:
+        # Old immutable profiles retain their original full-layer age rule.
+        return self.params.get("history_age_mode", "all_modules_sum") == "selected_layers_max"
+
+    def _selected_age_extra(
+        self, module: str | None = None
+    ) -> tuple[dict[str, float], dict[str, str | None]]:
+        modules = (module,) if module is not None else tuple(sorted(self._server_metadata))
+        if not self.params.get("history_age_enabled", False) or not self.task_end_snapshots:
+            return dict.fromkeys(modules, 0.0), dict.fromkeys(modules)
+        from afl_vlm.methods.ours_layer_protection import max_extra
+
+        extra, sources = max_extra(
+            self.task_end_snapshots,
+            self.task_weights,
+            {task: self._task_history_age_weight(task) - 1.0 for task in self.task_end_snapshots},
+            modules,
+            self._age_module_layers,
+        )
+        strength = self._value("history_strength", 1.0)
+        scaled = {module: strength * value for module, value in extra.items()}
+        return scaled, {
+            module: sources[module] if scaled[module] > 0 else None for module in modules
+        }
+
+    def _end_snapshot(self, update: Update, history: Mapping[str, float]) -> dict[str, Any]:
+        from afl_vlm.methods.ours_layer_protection import select_layers
+
+        snapshot = select_layers(
+            history, 1.0 - self._value("sensitivity_uniform_mix", 0.5), self._value("eps", 1e-12)
+        )
+        resolved = self.history_resolved_jobs | {(update.client_id, update.local_round)}
+        snapshot.update({
+            "task": update.task,
+            "finished_at": self.history_accepted_updates + 1,
+            "last_update_id": update.update_id,
+            "completion_by_client": {
+                client: {
+                    "planned": sum(job[0] == client for job in self.history_planned_jobs),
+                    "accepted": sum(job[0] == client for job in resolved),
+                    "pending": sum(job[0] == client and job not in resolved
+                                   for job in self.history_planned_jobs),
+                }
+                for client, task in sorted(self._client_tasks.items()) if task == update.task
+            },
+        })
+        return snapshot
 
     def _task_history_age_weight(self, task: str) -> float:
         if not self.params.get("history_age_enabled", False) or task not in self.task_finished_at:
@@ -750,7 +822,7 @@ class Ours(Method):
         )
 
     def _history_age_diagnostics(self) -> dict[str, Any]:
-        return {
+        result = {
             "enabled": bool(self.params.get("history_age_enabled", False)),
             "clock": "accepted_client_updates",
             "accepted_updates": self.history_accepted_updates,
@@ -767,21 +839,52 @@ class Ours(Method):
                 task: self._task_history_age_weight(task) for task in sorted(self.task_weights)
             },
         }
+        if self._selected_layer_age():
+            extra, sources = self._selected_age_extra()
+            result.update({
+                "mode": "selected_layers_max",
+                "weight_semantics": "candidate_age_envelope_not_full_history_multiplier",
+                "layer_by_module": dict(self._age_module_layers),
+                "selected_layers_by_task": {
+                    task: list(snapshot["selected_layers"])
+                    for task, snapshot in sorted(self.task_end_snapshots.items())
+                },
+                "selected_layer_union": sorted({
+                    layer for row in self.task_end_snapshots.values()
+                    for layer in row["selected_layers"]
+                }),
+                "extra_precision_by_module": extra,
+                "max_source_by_module": sources,
+                "positive_extra_module_count": sum(value > 0 for value in extra.values()),
+                "extra_precision_summary": _numeric_summary(list(extra.values())),
+            })
+        return result
 
     def _finish_history_arrival(
-        self, update: Update, accepted: bool, diagnostics: dict[str, Any]
+        self, update: Update, accepted: bool, diagnostics: dict[str, Any],
+        end_snapshot: dict[str, Any] | None = None,
     ) -> None:
         """Resolve an arrival once; only successful aggregation advances the clock."""
 
         if accepted:
             self.history_accepted_updates += 1
-        if self.params.get("history_age_enabled", False):
+        if self.params.get("history_age_enabled", False) and (
+            accepted or not self._selected_layer_age()
+        ):
             job = (update.client_id, update.local_round)
             self.history_resolved_jobs.add(job)
             self.task_pending_updates[update.task] -= 1
             if self.task_pending_updates[update.task] == 0:
                 self.task_finished_at[update.task] = self.history_accepted_updates
+                if self._selected_layer_age():
+                    if end_snapshot is None:
+                        raise RuntimeError(
+                            "Selected-layer task completion requires its EMA snapshot"
+                        )
+                    self.task_end_snapshots[update.task] = copy.deepcopy(end_snapshot)
         memory = diagnostics["memory"]
+        if self._selected_layer_age():
+            memory["finished_task_snapshot"] = copy.deepcopy(end_snapshot)
         memory["history_age_after"] = self._history_age_diagnostics()
         memory["historical_precision_unweighted_after"] = {
             module: self._historical_precision(module, apply_age_weight=False)
@@ -912,6 +1015,12 @@ class Ours(Method):
         )
 
     def _historical_precision(self, module: str, *, apply_age_weight: bool = True) -> float:
+        if self._selected_layer_age():
+            base = self._value("base_precision", 1.0) + self._value("history_strength", 1.0) * sum(
+                weight * self._corrected_task_memory(task, module)
+                for task, weight in self.task_weights.items()
+            )
+            return base + (self._selected_age_extra(module)[0][module] if apply_age_weight else 0.0)
         memory = sum(
             weight
             * (self._task_history_age_weight(task) if apply_age_weight else 1.0)
@@ -1055,7 +1164,7 @@ class Ours(Method):
         }
         frequency = self._frequency_diagnostics(update.task)
         diagnostics = {
-            "schema_version": 4,
+            "schema_version": 5 if self._selected_layer_age() else 4,
             "method_variant": "module_gate",
             "client": {
                 "update_id": update.update_id,
@@ -1149,7 +1258,7 @@ class Ours(Method):
             module: compute_module_alpha(
                 module_sensitivity=module_sensitivity[module],
                 reliability=reliability,
-                history_precision=self._historical_precision(module),
+                history_precision=historical_precision_before[module],
                 client_weight=frequency["weight"],
                 history_lambda=self._value("history_lambda", 1.0),
                 alpha_max=self._value("alpha_max", 0.5),
@@ -1162,6 +1271,25 @@ class Ours(Method):
         )
 
         history_beta = self._value("history_beta", 0.9)
+        end_snapshot = None
+        if self._selected_layer_age():
+            if not all(math.isfinite(value) and value >= 0 for value in alphas.values()):
+                raise ValueError("Selected-layer aggregation produced invalid alpha")
+            if sum(alphas.values()) / len(alphas) <= 0:
+                diagnostics["aggregation"]["rejection_reason"] = "zero_aggregation_weight"
+                return self._reject(update, server_context, "zero_aggregation_weight", common)
+            # Validate the proposed terminal snapshot BEFORE changing counters or EMA.
+            if (
+                self.params.get("history_age_enabled", False)
+                and self.task_pending_updates[update.task] == 1
+            ):
+                correction = max(1 - history_beta ** (task_memory_count_before + 1),
+                                 self._value("eps", 1e-12))
+                end_snapshot = self._end_snapshot(update, {
+                    module: (history_beta * task_memory_raw_before[module]
+                             + (1 - history_beta) * sensitivity) / correction
+                    for module, sensitivity in module_sensitivity.items()
+                })
         task_memory = self.task_memory.setdefault(update.task, {})
         for module, sensitivity in module_sensitivity.items():
             task_memory[module] = (
@@ -1170,7 +1298,7 @@ class Ours(Method):
             )
         self.task_memory_counts[update.task] = task_memory_count_before + 1
         self._finish_history_arrival(
-            update, sum(alphas.values()) / len(alphas) > 0.0, diagnostics
+            update, sum(alphas.values()) / len(alphas) > 0.0, diagnostics, end_snapshot
         )
         counts_after = self._append_frequency_task(update.task)
         diagnostics["frequency"].update(
@@ -1243,7 +1371,9 @@ class Ours(Method):
             "task_weights": copy.deepcopy(self.task_weights),
             "task_frequency_window": list(self.task_frequency_window),
             "history_age_state": {
-                "schema_version": 1,
+                "schema_version": 2 if self._selected_layer_age() else 1,
+                **({"finished_snapshots": copy.deepcopy(self.task_end_snapshots)}
+                   if self._selected_layer_age() else {}),
                 "accepted_updates": self.history_accepted_updates,
                 "planned_jobs": [
                     {"client_id": client_id, "local_round": local_round, "task": task}
@@ -1306,8 +1436,14 @@ class Ours(Method):
             self.history_resolved_jobs = set()
             self.task_pending_updates = {}
             self.task_finished_at = {}
+            self.task_end_snapshots = {}
+            self._age_module_layers = {}
             return
-        if not isinstance(age_state, Mapping) or age_state.get("schema_version") != 1:
+        expected_age_schema = 2 if self._selected_layer_age() else 1
+        if (
+            not isinstance(age_state, Mapping)
+            or age_state.get("schema_version") != expected_age_schema
+        ):
             raise ValueError("Unsupported temporal-history state schema")
 
         def count(value: Any, label: str) -> int:
@@ -1353,6 +1489,7 @@ class Ours(Method):
             ):
                 raise ValueError("Temporal-history completion state has no Plan")
             self.task_pending_updates = {}
+            self._restore_end_snapshots(age_state)
             return
         if set(self.history_planned_jobs.values()) != set(self.task_weights):
             raise ValueError("Temporal-history checkpoint Plan is missing tasks")
@@ -1369,3 +1506,87 @@ class Ours(Method):
             raise ValueError("Temporal-history completion state disagrees with unresolved jobs")
         if self.history_accepted_updates > len(self.history_resolved_jobs):
             raise ValueError("Temporal-history accepted updates exceed resolved jobs")
+        self._restore_end_snapshots(age_state)
+
+    def _restore_end_snapshots(self, age_state: Mapping[str, Any]) -> None:
+        """Validate frozen histories/masks; never infer missing end snapshots."""
+        self.task_end_snapshots = {}
+        self._age_module_layers = {}
+        if not self._selected_layer_age():
+            return
+        from afl_vlm.methods.ours_layer_protection import layer_modules, select_layers
+
+        if set(self.task_memory) != set(self.task_weights) or any(
+            set(memory) != set(self._server_metadata)
+            or any(not math.isfinite(value) or value < 0 for value in memory.values())
+            for memory in self.task_memory.values()
+        ):
+            raise ValueError("Selected-layer checkpoint has invalid task history")
+        if (
+            self.params.get("history_age_enabled", False)
+            and self.history_accepted_updates != len(self.history_resolved_jobs)
+        ):
+            raise ValueError("Selected-layer resolved jobs must be successfully accepted jobs")
+        if (
+            set(self.task_memory_counts) != set(self.task_weights)
+            or sum(self.task_memory_counts.values()) != self.history_accepted_updates
+            or any(not math.isclose(weight, 1 / len(self.task_weights), rel_tol=1e-12)
+                   for weight in self.task_weights.values())
+        ):
+            raise ValueError("Selected-layer task counts or uniform task priors are inconsistent")
+        snapshots = age_state.get("finished_snapshots")
+        if not isinstance(snapshots, Mapping) or set(snapshots) != set(self.task_finished_at):
+            raise ValueError("Selected-layer checkpoint must contain every finished task snapshot")
+        if self.params.get("history_age_enabled", False) or snapshots:
+            self._age_module_layers = {
+                module: str(layer)
+                for layer, group in layer_modules(tuple(self._server_metadata)).items()
+                for module in group.values()
+            }
+        self._client_tasks = {}
+        for (client_id, _), task in self.history_planned_jobs.items():
+            if self._client_tasks.setdefault(client_id, task) != task:
+                raise ValueError("Selected-layer Plan changes a client's fixed task identity")
+        for task, snapshot in snapshots.items():
+            if (
+                not isinstance(snapshot, Mapping)
+                or not isinstance(snapshot.get("history"), Mapping)
+            ):
+                raise ValueError("Invalid selected-layer finished-task snapshot")
+            if set(snapshot["history"]) != set(self._server_metadata):
+                raise ValueError("Finished-task history modules differ from the model")
+            expected = select_layers(
+                snapshot["history"], 1.0 - self._value("sensitivity_uniform_mix", 0.5),
+                self._value("eps", 1e-12),
+            )
+            if any(snapshot.get(key) != value for key, value in expected.items()):
+                raise ValueError("Finished-task layer selection disagrees with frozen history")
+            if (
+                snapshot.get("task") != task
+                or snapshot.get("finished_at") != self.task_finished_at[task]
+                or self.task_finished_at[task] < 1
+            ):
+                raise ValueError("Invalid selected-layer task completion counter")
+            if not self.task_memory_counts.get(task, 0) or any(
+                not math.isclose(float(snapshot["history"][module]),
+                                 self._corrected_task_memory(task, module),
+                                 rel_tol=1e-12, abs_tol=1e-12)
+                for module in self._server_metadata
+            ):
+                raise ValueError("Finished-task snapshot is not its final corrected EMA")
+            task_jobs = {job for job, known in self.history_planned_jobs.items() if known == task}
+            if snapshot.get("last_update_id") not in {
+                f"{client}-r{local_round}" for client, local_round in task_jobs
+            }:
+                raise ValueError("Finished-task last update ID is not in its Plan")
+            completion = {
+                client: {
+                    "planned": sum(job[0] == client for job in task_jobs),
+                    "accepted": sum(job[0] == client for job in task_jobs),
+                    "pending": 0,
+                }
+                for client, known in self._client_tasks.items() if known == task
+            }
+            if snapshot.get("completion_by_client") != completion:
+                raise ValueError("Finished-task client completion is inconsistent")
+            self.task_end_snapshots[task] = copy.deepcopy(dict(snapshot))
