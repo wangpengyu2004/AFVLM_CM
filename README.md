@@ -601,12 +601,21 @@ python tools/estimate_task_compute_factors.py \
 
 ## 方法
 
-`ours` 新增“任务结束后重要层去重保护”：只有所有客户端的计划作业成功纳入后，才冻结
+`ours` 使用“任务结束后重要层累计保护”：只有所有客户端的计划作业成功纳入后，才冻结
 该任务包含最后一次上传的历史 EMA；扣除0.5底座选出任务内高于平均占比的层。
-只在入选层增加年龄保护，同模块多个结束任务取 max，不叠加旧全层年龄项、不做层数补偿。
-当前模板为 `history_age_mode: selected_layers_max`、`boost=2`、`scale=18`。
-旧 profile 缺少模式字段仍保留旧全层方案；需要新 profile 才启用新模式，可复用匹配的旧 Plan。
-客户端敏感度、r/w、基础历史求和、增量聚合和评估不变；
+只在入选层增加年龄保护，同模块多个结束任务的 `pi_q*b_q*H_end[q,m]` 求和，
+保留固定任务权重（六任务各1/6），不叠加旧全层年龄项、不做层数补偿。
+当前模板为 `history_age_mode: selected_layers_sum`、`boost=2`、`scale=18`。
+历史更新采用 `history_update_mode: first_observation_ema`：未知任务各模块H默认为1；
+首次成功上传用C直接替换，之后普通EMA（beta=0.9），不再偏差修正，外部 `base_precision=0`。
+初始基础保护仍为1，来自六个任务的均衡默认历史，不再额外加固定1。
+默认 `alpha_max: null`：使用 `rwC/(rwC+Omega+eps)`，不额外裁剪到0.5。
+这里C是当前客户端的模块敏感度，始终正向参与分式；不加入敏感度消融开关。
+旧 profile 缺少历史更新模式仍保留原来的零初始化/偏差修正及固定底座，不自动迁移。
+旧 profile 显式 `selected_layers_max` 仍取最大值，缺少年龄模式字段仍保留旧全层方案；
+需要新 profile 才启用累计模式，可复用匹配的旧 Plan。
+本次仅将入选层额外保护从 max 改成 sum；客户端敏感度、r/w、历史EMA、选层/计龄、
+增量聚合和评估不变。日志记录各任务贡献、贡献任务名单和数量，不再将累计量标作最大来源；
 [实现、日志、公式及运行步骤](docs/ours_selected_layer_protection.md)。
 
 统一注册表支持：
@@ -643,9 +652,10 @@ python tools/estimate_task_compute_factors.py \
 - `sensitivity.observations_by_module`、分布摘要和 top module；
 - `functional_staleness`：版本陈旧度、server drift、local update、相对功能陈旧度、可靠度函数及 gamma；
 - `aggregation.module_alpha_by_module`：每个模块实际使用的共享 A/B 聚合系数；
+- `aggregation.alpha_rule`、`alpha_max`、`client_precision_by_module`：归一化分式、是否裁剪及rwC；CSV中的`alpha_max_configured=none`表示未裁剪，原`alpha_max`列仍是本次观测到的最大alpha；
 - `aggregation.rule`：新版本记录为 `base_relative_delta`，导出 CSV 时对应 `aggregation_rule`；旧日志缺少标记时留空，不改写旧实验含义；
 - `frequency`：聚合前窗口计数、本次任务权重，以及成功聚合后的窗口计数；
-- `memory`：当前任务的原始/偏差修正记忆、接受次数和跨任务历史精度在聚合前后的值；
+- `memory`：历史模式、是否偏差修正、未知先验、外部底座、存储/有效记忆、接受次数及跨任务历史精度；新模式存储值就是有效H，旧模式仍分别记录原始/偏差修正值；
 - rejected update 的拒绝原因和未变化的 memory。
 
 训练过程中可以直接查看最后一条记录：

@@ -1,4 +1,4 @@
-"""Ours-only immutable finished-task layer selection and max age protection.
+"""Ours-only immutable finished-task layer selection and extra age protection.
 
 These helpers inspect small server-side sensitivity dictionaries, not model
 weights or gradients. They never touch training, scheduling or other methods.
@@ -96,3 +96,37 @@ def max_extra(
                 extra[module] = demand
                 owner[module] = task  # Exact positive ties use lexicographically first task.
     return extra, owner
+
+
+def sum_extra(
+    snapshots: Mapping[str, Mapping[str, Any]],
+    weights: Mapping[str, float],
+    age_boosts: Mapping[str, float],
+    modules: Sequence[str],
+    module_layer: Mapping[str, str] | None = None,
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    """Sum pi_q*b_q*mask_q(layer(m))*H_end[q,m], retaining fixed task priors.
+
+    Return each task's demand as well as the sum for truthful diagnostics. Do
+    not normalize by the finished-task count or redistribute unselected mass.
+    """
+    if module_layer is None:
+        layers = layer_modules(modules)
+        module_layer = {
+            module: str(layer) for layer, group in layers.items() for module in group.values()
+        }
+    demands: dict[str, dict[str, float]] = {}
+    for task in sorted(snapshots):
+        row = snapshots[task]
+        scale = weights[task] * age_boosts[task]
+        demands[task] = {
+            module: scale * row["history"][module]
+            if row["layer_mask"][module_layer[module]] else 0.0
+            for module in modules
+        }
+        if any(not math.isfinite(value) or value < 0 for value in demands[task].values()):
+            raise ValueError("Finished-task extra protection must be finite and non-negative")
+    extra = {module: math.fsum(row[module] for row in demands.values()) for module in modules}
+    if any(not math.isfinite(value) for value in extra.values()):
+        raise ValueError("Summed finished-task extra protection must be finite")
+    return extra, demands

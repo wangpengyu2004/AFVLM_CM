@@ -14,17 +14,24 @@ method:
     frequency_min: 0.5
     frequency_max: 1.5
     history_beta: 0.9
+    # Unknown H=1; first accepted C replaces it, later plain EMA (no bias correction).
+    # Missing mode in immutable profiles retains zero-initialized corrected EMA.
+    history_update_mode: first_observation_ema
     history_lambda: 1.0
     history_strength: 1.0
-    # Freeze each task's final corrected EMA; select above-mean Q/K/V/O layers.
-    # Add MAX task demand on selected modules only, never sum old age terms.
+    # Freeze each task's final EMA; select above-mean Q/K/V/O layers.
+    # SUM fixed-prior task demands on selected modules only; replace the old MAX.
+    # Explicit selected_layers_max snapshots retain their original behavior.
     # Old snapshots missing mode retain all_modules_sum; false disables extra age.
     history_age_enabled: true
-    history_age_mode: selected_layers_max
+    history_age_mode: selected_layers_sum
     history_age_boost: 2.0
     history_age_time_scale: 18.0
-    base_precision: 1.0
-    alpha_max: 0.5
+    # Unit priors now live inside each unobserved task, not outside the task sum.
+    base_precision: 0.0
+    # alpha = rwC / (rwC + history_lambda*Omega + eps), no additional hard cap.
+    # Old profiles missing alpha_max retain the historical 0.5 cap.
+    alpha_max: null
     eps: 0.000000000001
     min_update_energy: 0.0000000000000001
 federation:

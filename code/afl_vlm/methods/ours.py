@@ -461,13 +461,13 @@ def compute_module_alpha(
     history_precision: float,
     client_weight: float = 1.0,
     history_lambda: float = 1.0,
-    alpha_max: float = 0.5,
+    alpha_max: float | None = 0.5,
     eps: float = 1e-12,
 ) -> float:
     client_precision = client_weight * reliability * module_sensitivity
     server_precision = history_lambda * history_precision
     alpha = client_precision / (client_precision + server_precision + eps)
-    return min(max(alpha, 0.0), alpha_max)
+    return alpha if alpha_max is None else min(max(alpha, 0.0), alpha_max)
 
 
 def _parameter_delta_norm(state: Mapping[str, Any]) -> float:
@@ -557,6 +557,7 @@ class Ours(Method):
         "frequency_min",
         "frequency_max",
         "history_beta",
+        "history_update_mode",
         "history_lambda",
         "history_strength",
         "history_age_enabled",
@@ -591,7 +592,31 @@ class Ours(Method):
     def _value(self, key: str, default: float | int) -> float:
         return float(self.params.get(key, default))
 
+    def _first_observation_history(self) -> bool:
+        # Immutable profiles missing this flag retain their original statistics.
+        return self.params.get(
+            "history_update_mode", "zero_initialized_corrected_ema"
+        ) == "first_observation_ema"
+
+    def _base_precision(self) -> float:
+        return self._value("base_precision", 0.0 if self._first_observation_history() else 1.0)
+
+    def _alpha_max(self) -> float | None:
+        value = self.params.get("alpha_max", 0.5)
+        return None if value is None else float(value)
+
     def _validate_parameters(self) -> None:
+        history_mode = self.params.get("history_update_mode", "zero_initialized_corrected_ema")
+        if not isinstance(history_mode, str) or history_mode not in {
+            "zero_initialized_corrected_ema", "first_observation_ema",
+        }:
+            raise ValueError("Invalid history_update_mode")
+        base = self._base_precision()
+        if self._first_observation_history():
+            if base != 0.0:
+                raise ValueError("first_observation_ema requires base_precision=0 (no outer prior)")
+        elif not math.isfinite(base) or base <= 0.0:
+            raise ValueError("base_precision must be positive for legacy history")
         history_beta = self._value("history_beta", 0.9)
         if not 0.0 <= history_beta < 1.0:
             raise ValueError("history_beta must be in [0, 1)")
@@ -622,8 +647,6 @@ class Ours(Method):
         positive = {
             "gamma": 1.0,
             "history_lambda": 1.0,
-            "base_precision": 1.0,
-            "alpha_max": 0.5,
             "eps": 1e-12,
             "min_update_energy": 1e-16,
         }
@@ -638,17 +661,23 @@ class Ours(Method):
             raise ValueError("history_age_enabled must be boolean")
         age_mode = self.params.get("history_age_mode", "all_modules_sum")
         if not isinstance(age_mode, str) or age_mode not in {
-            "all_modules_sum", "selected_layers_max",
+            "all_modules_sum", "selected_layers_max", "selected_layers_sum",
         }:
-            raise ValueError("history_age_mode must be all_modules_sum or selected_layers_max")
+            raise ValueError(
+                "history_age_mode must be all_modules_sum, selected_layers_max "
+                "or selected_layers_sum"
+            )
         history_age_boost = self._value("history_age_boost", 1.0)
         if not math.isfinite(history_age_boost) or history_age_boost < 0.0:
             raise ValueError("history_age_boost must be finite and non-negative")
         history_age_time_scale = self._value("history_age_time_scale", 18.0)
         if not math.isfinite(history_age_time_scale) or history_age_time_scale <= 0.0:
             raise ValueError("history_age_time_scale must be finite and positive")
-        if self._value("alpha_max", 0.5) > 1.0:
-            raise ValueError("alpha_max must be <= 1")
+        alpha_max = self._alpha_max()
+        if isinstance(self.params.get("alpha_max"), bool) or (
+            alpha_max is not None and (not math.isfinite(alpha_max) or not 0 < alpha_max <= 1)
+        ):
+            raise ValueError("alpha_max must be null (no clipping) or finite in (0, 1]")
 
     def validate_runtime(self) -> None:
         self._validate_parameters()
@@ -702,7 +731,9 @@ class Ours(Method):
         self._client_tasks = {str(client.id): str(client.task) for client in clients}
         self.task_memory = {
             task: {
-                module: float(self.task_memory.get(task, {}).get(module, 0.0))
+                module: float(self.task_memory.get(task, {}).get(
+                    module, 1.0 if self._first_observation_history() else 0.0
+                ))
                 for module in self._server_metadata
             }
             for task in tasks
@@ -767,7 +798,30 @@ class Ours(Method):
 
     def _selected_layer_age(self) -> bool:
         # Old immutable profiles retain their original full-layer age rule.
-        return self.params.get("history_age_mode", "all_modules_sum") == "selected_layers_max"
+        return self.params.get("history_age_mode", "all_modules_sum") in {
+            "selected_layers_max", "selected_layers_sum",
+        }
+
+    def _selected_age_sum(
+        self, modules: tuple[str, ...]
+    ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+        from afl_vlm.methods.ours_layer_protection import sum_extra
+
+        if not self.params.get("history_age_enabled", False):
+            return dict.fromkeys(modules, 0.0), {}
+        extra, demands = sum_extra(
+            self.task_end_snapshots,
+            self.task_weights,
+            {task: self._task_history_age_weight(task) - 1.0 for task in self.task_end_snapshots},
+            modules,
+            self._age_module_layers,
+        )
+        strength = self._value("history_strength", 1.0)
+        return (
+            {module: strength * value for module, value in extra.items()},
+            {task: {module: strength * value for module, value in row.items()}
+             for task, row in demands.items()},
+        )
 
     def _selected_age_extra(
         self, module: str | None = None
@@ -775,6 +829,10 @@ class Ours(Method):
         modules = (module,) if module is not None else tuple(sorted(self._server_metadata))
         if not self.params.get("history_age_enabled", False) or not self.task_end_snapshots:
             return dict.fromkeys(modules, 0.0), dict.fromkeys(modules)
+        if self.params.get("history_age_mode") == "selected_layers_sum":
+            extra, _ = self._selected_age_sum(modules)
+            # A sum has multiple contributors, not one winning source task.
+            return extra, dict.fromkeys(modules)
         from afl_vlm.methods.ours_layer_protection import max_extra
 
         extra, sources = max_extra(
@@ -840,10 +898,15 @@ class Ours(Method):
             },
         }
         if self._selected_layer_age():
-            extra, sources = self._selected_age_extra()
+            cumulative = self.params.get("history_age_mode") == "selected_layers_sum"
+            if cumulative:
+                extra, demands = self._selected_age_sum(tuple(sorted(self._server_metadata)))
+            else:
+                extra, sources = self._selected_age_extra()
             result.update({
-                "mode": "selected_layers_max",
-                "weight_semantics": "candidate_age_envelope_not_full_history_multiplier",
+                "mode": self.params["history_age_mode"],
+                "weight_semantics": "selected_task_age_demands_summed_with_fixed_priors"
+                if cumulative else "candidate_age_envelope_not_full_history_multiplier",
                 "layer_by_module": dict(self._age_module_layers),
                 "selected_layers_by_task": {
                     task: list(snapshot["selected_layers"])
@@ -854,10 +917,20 @@ class Ours(Method):
                     for layer in row["selected_layers"]
                 }),
                 "extra_precision_by_module": extra,
-                "max_source_by_module": sources,
                 "positive_extra_module_count": sum(value > 0 for value in extra.values()),
                 "extra_precision_summary": _numeric_summary(list(extra.values())),
             })
+            if cumulative:
+                result["extra_precision_by_task"] = demands
+                result["contributors_by_module"] = {
+                    module: [task for task, row in demands.items() if row[module] > 0]
+                    for module in extra
+                }
+                result["contributor_count_by_module"] = {
+                    module: len(tasks) for module, tasks in result["contributors_by_module"].items()
+                }
+            else:
+                result["max_source_by_module"] = sources
         return result
 
     def _finish_history_arrival(
@@ -869,7 +942,7 @@ class Ours(Method):
         if accepted:
             self.history_accepted_updates += 1
         if self.params.get("history_age_enabled", False) and (
-            accepted or not self._selected_layer_age()
+            accepted or (not self._selected_layer_age() and not self._first_observation_history())
         ):
             job = (update.client_id, update.local_round)
             self.history_resolved_jobs.add(job)
@@ -1005,7 +1078,10 @@ class Ours(Method):
         return update
 
     def _corrected_task_memory(self, task: str, module: str) -> float:
+        """Effective H: keep the old helper name for legacy consumers/checkpoints."""
         count = int(self.task_memory_counts.get(task, 0))
+        if self._first_observation_history():
+            return 1.0 if count <= 0 else self.task_memory[task][module]
         if count <= 0:
             return 0.0
         beta = self._value("history_beta", 0.9)
@@ -1014,9 +1090,16 @@ class Ours(Method):
             correction, self._value("eps", 1e-12)
         )
 
+    def _next_task_memory(self, task: str, module: str, sensitivity: float) -> float:
+        """Proposed stored history; the first successful C replaces the unit prior."""
+        if self._first_observation_history() and self.task_memory_counts.get(task, 0) == 0:
+            return sensitivity
+        beta = self._value("history_beta", 0.9)
+        return beta * self.task_memory.get(task, {}).get(module, 0.0) + (1 - beta) * sensitivity
+
     def _historical_precision(self, module: str, *, apply_age_weight: bool = True) -> float:
         if self._selected_layer_age():
-            base = self._value("base_precision", 1.0) + self._value("history_strength", 1.0) * sum(
+            base = self._base_precision() + self._value("history_strength", 1.0) * sum(
                 weight * self._corrected_task_memory(task, module)
                 for task, weight in self.task_weights.items()
             )
@@ -1027,7 +1110,7 @@ class Ours(Method):
             * self._corrected_task_memory(task, module)
             for task, weight in self.task_weights.items()
         )
-        return self._value("base_precision", 1.0) + self._value(
+        return self._base_precision() + self._value(
             "history_strength", 1.0
         ) * memory
 
@@ -1163,8 +1246,14 @@ class Ours(Method):
             for module in sorted(self._server_metadata)
         }
         frequency = self._frequency_diagnostics(update.task)
+        alpha_settings = {
+            "alpha_rule": "normalized_precision_ratio",
+            "alpha_max": self._alpha_max(),
+        }
         diagnostics = {
-            "schema_version": 5 if self._selected_layer_age() else 4,
+            "schema_version": 6 if self._first_observation_history() else (
+                5 if self._selected_layer_age() else 4
+            ),
             "method_variant": "module_gate",
             "client": {
                 "update_id": update.update_id,
@@ -1198,16 +1287,23 @@ class Ours(Method):
             "frequency": frequency,
             "aggregation": {
                 "rule": _AGGREGATION_RULE,
+                **alpha_settings,
                 "accepted": False,
                 "rejection_reason": None,
                 "module_alpha_by_module": {},
+                "client_precision_by_module": {},
                 "alpha_summary": _numeric_summary([]),
             },
             "memory": {
                 "task": update.task,
                 "history_beta": self._value("history_beta", 0.9),
+                "history_update_mode": self.params.get(
+                    "history_update_mode", "zero_initialized_corrected_ema"
+                ),
+                "history_bias_correction": not self._first_observation_history(),
+                "unobserved_task_sensitivity": 1.0 if self._first_observation_history() else 0.0,
                 "history_strength": self._value("history_strength", 1.0),
-                "base_precision": self._value("base_precision", 1.0),
+                "base_precision": self._base_precision(),
                 "history_lambda": self._value("history_lambda", 1.0),
                 "task_memory_count_before": task_memory_count_before,
                 "task_memory_count_after": task_memory_count_before,
@@ -1261,7 +1357,7 @@ class Ours(Method):
                 history_precision=historical_precision_before[module],
                 client_weight=frequency["weight"],
                 history_lambda=self._value("history_lambda", 1.0),
-                alpha_max=self._value("alpha_max", 0.5),
+                alpha_max=self._alpha_max(),
                 eps=self._value("eps", 1e-12),
             )
             for module in sorted(self._server_metadata)
@@ -1272,7 +1368,7 @@ class Ours(Method):
 
         history_beta = self._value("history_beta", 0.9)
         end_snapshot = None
-        if self._selected_layer_age():
+        if self._selected_layer_age() or self._first_observation_history():
             if not all(math.isfinite(value) and value >= 0 for value in alphas.values()):
                 raise ValueError("Selected-layer aggregation produced invalid alpha")
             if sum(alphas.values()) / len(alphas) <= 0:
@@ -1280,22 +1376,23 @@ class Ours(Method):
                 return self._reject(update, server_context, "zero_aggregation_weight", common)
             # Validate the proposed terminal snapshot BEFORE changing counters or EMA.
             if (
-                self.params.get("history_age_enabled", False)
+                self._selected_layer_age()
+                and self.params.get("history_age_enabled", False)
                 and self.task_pending_updates[update.task] == 1
             ):
-                correction = max(1 - history_beta ** (task_memory_count_before + 1),
-                                 self._value("eps", 1e-12))
+                correction = 1.0 if self._first_observation_history() else max(
+                    1 - history_beta ** (task_memory_count_before + 1), self._value("eps", 1e-12)
+                )
                 end_snapshot = self._end_snapshot(update, {
-                    module: (history_beta * task_memory_raw_before[module]
-                             + (1 - history_beta) * sensitivity) / correction
+                    module: self._next_task_memory(update.task, module, sensitivity) / correction
                     for module, sensitivity in module_sensitivity.items()
                 })
+        proposed_memory = {
+            module: self._next_task_memory(update.task, module, sensitivity)
+            for module, sensitivity in module_sensitivity.items()
+        }
         task_memory = self.task_memory.setdefault(update.task, {})
-        for module, sensitivity in module_sensitivity.items():
-            task_memory[module] = (
-                history_beta * task_memory.get(module, 0.0)
-                + (1.0 - history_beta) * sensitivity
-            )
+        task_memory.update(proposed_memory)
         self.task_memory_counts[update.task] = task_memory_count_before + 1
         self._finish_history_arrival(
             update, sum(alphas.values()) / len(alphas) > 0.0, diagnostics, end_snapshot
@@ -1323,10 +1420,15 @@ class Ours(Method):
         }
         diagnostics["aggregation"] = {
             "rule": _AGGREGATION_RULE,
+            **alpha_settings,
             "accepted": True,
             "rejection_reason": None,
             "frequency_weight": frequency["weight"],
             "module_alpha_by_module": dict(alphas),
+            "client_precision_by_module": {
+                module: frequency["weight"] * reliability * sensitivity
+                for module, sensitivity in module_sensitivity.items()
+            },
             "alpha_summary": _numeric_summary(list(alphas.values())),
         }
         diagnostics["memory"].update(
@@ -1363,7 +1465,9 @@ class Ours(Method):
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "state_schema_version": 4,
+            "state_schema_version": 5 if self._first_observation_history() else 4,
+            **({"history_update_mode": "first_observation_ema"}
+               if self._first_observation_history() else {}),
             "method_variant": "module_gate",
             "params": copy.deepcopy(self.params),
             "task_memory": copy.deepcopy(self.task_memory),
@@ -1389,13 +1493,22 @@ class Ours(Method):
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        if int(state.get("state_schema_version", 0)) != 4 or state.get(
+        schema = int(state.get("state_schema_version", 0))
+        if schema not in {4, 5} or state.get(
             "method_variant"
         ) != "module_gate":
             raise ValueError(
-                "Checkpoint is not a Module-Gate state-schema-v4 checkpoint; "
+                "Checkpoint is not a Module-Gate state-schema-v4/v5 checkpoint; "
                 "older memory cannot reconstruct the accepted-task frequency window"
             )
+        saved_mode = state.get("params", {}).get(
+            "history_update_mode", "zero_initialized_corrected_ema"
+        )
+        if (
+            (schema == 5) != (saved_mode == "first_observation_ema")
+            or (schema == 5 and state.get("history_update_mode") != saved_mode)
+        ):
+            raise ValueError("Checkpoint history_update_mode disagrees with its state schema")
         super().load_state_dict(state)
         unknown = set(self.params) - self.allowed_params
         if unknown:
@@ -1416,6 +1529,20 @@ class Ours(Method):
         self.task_weights = {
             str(task): float(value) for task, value in state.get("task_weights", {}).items()
         }
+        if self._first_observation_history():
+            if (
+                set(self.task_memory) != set(self.task_weights)
+                or set(self.task_memory_counts) != set(self.task_weights)
+                or any(
+                    set(memory) != set(state.get("lora_metadata", {}))
+                    or any(not math.isfinite(value) or value < 0 for value in memory.values())
+                    or (self.task_memory_counts[task] == 0 and any(
+                        value != 1.0 for value in memory.values()
+                    ))
+                    for task, memory in self.task_memory.items()
+                )
+            ):
+                raise ValueError("Invalid first-observation task history or unobserved unit prior")
         window = state.get("task_frequency_window")
         if not isinstance(window, list) or any(not isinstance(task, str) for task in window):
             raise ValueError("task_frequency_window must be a list of task strings")
@@ -1573,7 +1700,7 @@ class Ours(Method):
                                  rel_tol=1e-12, abs_tol=1e-12)
                 for module in self._server_metadata
             ):
-                raise ValueError("Finished-task snapshot is not its final corrected EMA")
+                raise ValueError("Finished-task snapshot is not its final effective EMA")
             task_jobs = {job for job, known in self.history_planned_jobs.items() if known == task}
             if snapshot.get("last_update_id") not in {
                 f"{client}-r{local_round}" for client, local_round in task_jobs

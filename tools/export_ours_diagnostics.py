@@ -79,6 +79,8 @@ def export_diagnostics(
                 completion_rows.append(
                     {
                         "task": completed["task"],
+                        "history_update_mode": memory.get("history_update_mode", ""),
+                        "history_bias_correction": memory.get("history_bias_correction", ""),
                         "finished_at": completed["finished_at"],
                         "last_update_id": completed["last_update_id"],
                         "layer_count": completed["layer_count"],
@@ -116,6 +118,18 @@ def export_diagnostics(
                 "receive_version": client["receive_version"],
                 "server_version_after": event.get("server_version_after"),
                 "aggregation_rule": aggregation.get("rule", ""),
+                "history_update_mode": memory.get("history_update_mode", ""),
+                "history_beta": memory.get("history_beta", ""),
+                "history_bias_correction": memory.get("history_bias_correction", ""),
+                "unobserved_task_sensitivity": memory.get("unobserved_task_sensitivity", ""),
+                "base_precision": memory.get("base_precision", ""),
+                "history_age_mode": age_before.get(
+                    "mode", "all_modules_sum" if age_before else ""
+                ),
+                "alpha_rule": aggregation.get("alpha_rule", ""),
+                "alpha_max_configured": (
+                    "none" if aggregation["alpha_max"] is None else aggregation["alpha_max"]
+                ) if "alpha_max" in aggregation else "",
             }
             update_rows.append(
                 {
@@ -167,9 +181,6 @@ def export_diagnostics(
                     "task_memory_count_after": memory.get("task_memory_count_after", ""),
                     "history_strength": memory.get("history_strength", ""),
                     "history_age_enabled": age_before.get("enabled", ""),
-                    "history_age_mode": age_before.get(
-                        "mode", "all_modules_sum" if age_before else ""
-                    ),
                     "history_age_boost": age_before.get("boost", ""),
                     "history_age_time_scale": age_before.get("time_scale", ""),
                     "history_accepted_updates_before": age_before.get("accepted_updates", ""),
@@ -202,6 +213,12 @@ def export_diagnostics(
                     ),
                     "max_sources_before": age_json(age_before, "max_source_by_module"),
                     "max_sources_after": age_json(age_after, "max_source_by_module"),
+                    "extra_precision_by_task_before": age_json(
+                        age_before, "extra_precision_by_task"
+                    ),
+                    "extra_precision_by_task_after": age_json(age_after, "extra_precision_by_task"),
+                    "contributors_by_module_before": age_json(age_before, "contributors_by_module"),
+                    "contributors_by_module_after": age_json(age_after, "contributors_by_module"),
                 }
             )
             modules = sensitivity["module_by_module"]
@@ -219,6 +236,9 @@ def export_diagnostics(
                         "module_sensitivity": module_sensitivity,
                         "observations": observations[module],
                         "module_alpha": alphas.get(module, ""),
+                        "client_precision": aggregation.get(
+                            "client_precision_by_module", {}
+                        ).get(module, ""),
                         "task_memory_raw_before": memory.get(
                             "task_memory_raw_before", memory["task_memory_before"]
                         )[module],
@@ -249,6 +269,26 @@ def export_diagnostics(
                         "history_age_max_source_after": age_after.get(
                             "max_source_by_module", {}
                         ).get(module, ""),
+                        **{
+                            f"history_age_contributors_{stage}": json.dumps(
+                                section["contributors_by_module"][module], ensure_ascii=False
+                            ) if "contributors_by_module" in section else ""
+                            for stage, section in (("before", age_before), ("after", age_after))
+                        },
+                        **{
+                            f"history_age_contributor_count_{stage}": section.get(
+                                "contributor_count_by_module", {}
+                            ).get(module, "")
+                            for stage, section in (("before", age_before), ("after", age_after))
+                        },
+                        **{
+                            f"history_age_task_demands_{stage}": json.dumps(
+                                {task: row[module]
+                                 for task, row in section["extra_precision_by_task"].items()},
+                                sort_keys=True, ensure_ascii=False,
+                            ) if "extra_precision_by_task" in section else ""
+                            for stage, section in (("before", age_before), ("after", age_after))
+                        },
                     }
                 )
 
