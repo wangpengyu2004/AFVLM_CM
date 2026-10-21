@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from afl_vlm.federation.server import FederatedServer
 from afl_vlm.federation.types import ClientSpec, ScheduledEvent, Update
-from afl_vlm.methods.ours import Ours, compute_module_alpha
+from afl_vlm.methods.ours import Ours, _normalize_module_sensitivity, compute_module_alpha
 from afl_vlm.methods.ours_layer_protection import layer_modules, max_extra, select_layers, sum_extra
 
 from tools.export_ours_diagnostics import export_diagnostics
@@ -950,13 +950,116 @@ class CumulativeLayerProtectionTests(unittest.TestCase):
             validate_config(config)
             params = config["method"]["params"]
             self.assertEqual(params["history_age_mode"], "selected_layers_sum")
-            for key, value in {"history_age_boost": 2.0, "history_age_time_scale": 18.0,
+            for key, value in {"history_age_boost": 3.0, "history_age_time_scale": 18.0,
                                "history_beta": 0.9, "history_strength": 1.0, "history_lambda": 1.0,
                                "history_update_mode": "first_observation_ema",
                                "base_precision": 0.0,
                                "alpha_max": None, "gamma": 1.0, "frequency_window_size": 18,
-                               "sensitivity_uniform_mix": 0.5}.items():
+                               "sensitivity_uniform_mix": 0.75}.items():
                 self.assertEqual(params[key], value)
+
+
+    def test_boost_three_scales_only_ended_selected_extra_without_changing_base_or_clock(self):
+        method, server, _, _ = self.configured()
+        self.prefix(server)
+        previous = copy.deepcopy(method.state_dict())
+        previous["params"]["history_age_boost"] = 3.0
+        stronger = Ours()
+        stronger.load_state_dict(previous)
+        low = method._history_age_diagnostics()
+        high = stronger._history_age_diagnostics()
+        for key in ("accepted_updates", "finished_at", "pending_updates", "age_by_task",
+                    "selected_layers_by_task", "selected_layer_union"):
+            self.assertEqual(low[key], high[key])
+        self.assertEqual(method.task_memory, stronger.task_memory)
+        self.assertEqual(method.task_frequency_window, stronger.task_frequency_window)
+        for module in modules(2):
+            old_base = method._historical_precision(module, apply_age_weight=False)
+            new_base = stronger._historical_precision(module, apply_age_weight=False)
+            self.assertEqual(old_base, new_base)
+            old_extra = low["extra_precision_by_module"][module]
+            new_extra = high["extra_precision_by_module"][module]
+            self.assertAlmostEqual(new_extra, 1.5 * old_extra)
+            self.assertAlmostEqual(stronger._historical_precision(module), new_base + new_extra)
+            for task in low["extra_precision_by_task"]:
+                self.assertAlmostEqual(high["extra_precision_by_task"][task][module],
+                                       1.5 * low["extra_precision_by_task"][task][module])
+            old_alpha = compute_module_alpha(1, 1, old_base + old_extra, alpha_max=None)
+            new_alpha = compute_module_alpha(1, 1, new_base + new_extra, alpha_max=None)
+            if old_extra > 0:
+                self.assertLess(new_alpha, old_alpha)
+            else:
+                self.assertEqual(new_alpha, old_alpha)
+        for params in ({"history_age_boost": 3.0}, {"history_age_boost": 3.0,
+                                                  "history_age_enabled": False}):
+            new_method, _, _, _ = self.configured(**params)
+            self.assertTrue(all(value == 0 for value in
+                               new_method._history_age_diagnostics()["extra_precision_by_module"]
+                               .values()))
+
+
+class QuarterFloorConfigurationTests(unittest.TestCase):
+    def scores(self):
+        raw = {name: 2.0 if index < 4 else 0.0 for index, name in enumerate(modules(2))}
+        return _normalize_module_sensitivity(raw, uniform_mix=0.75)[0]
+
+    def test_quarter_floor_keeps_mean_one_and_preserves_old_default_and_fallback(self):
+        raw = {name: 2.0 if index < 4 else 0.0 for index, name in enumerate(modules(2))}
+        scores, valid = _normalize_module_sensitivity(raw, uniform_mix=0.75)
+        self.assertTrue(valid)
+        self.assertAlmostEqual(math.fsum(scores.values()) / len(scores), 1.0)
+        for index, module in enumerate(modules(2)):
+            self.assertAlmostEqual(scores[module], 1.75 if index < 4 else 0.25)
+        legacy, valid = _normalize_module_sensitivity(raw)
+        self.assertTrue(valid)
+        self.assertAlmostEqual(legacy[modules(2)[0]], 1.5)
+        self.assertEqual(legacy[modules(2)[4]], 0.5)
+        fallback, valid = _normalize_module_sensitivity(dict.fromkeys(raw, 0.0), uniform_mix=0.75)
+        self.assertFalse(valid)
+        self.assertEqual(fallback, dict.fromkeys(raw, 1.0))
+
+    def test_quarter_floor_selection_and_boost_three_protection_survive_state_roundtrip(self):
+        method, server, events, specs = configured(
+            layers=2, history_update_mode="first_observation_ema", base_precision=0,
+            alpha_max=None, sensitivity_uniform_mix=0.75,
+            history_age_mode="selected_layers_sum", history_age_boost=3,
+            history_age_time_scale=18,
+        )
+        scores = self.scores()
+        for cid, r in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            send(server, "grounding", cid, r, scores=scores)
+        snapshot = method.task_end_snapshots["grounding"]
+        self.assertEqual(snapshot["selection_floor"], 0.25)
+        self.assertEqual(snapshot["selected_layers"], [0])
+        for name, value in scores.items():
+            self.assertAlmostEqual(snapshot["history"][name], value)
+        # First post-completion update has age0; the next sees age1, unchanged clock.
+        result = send(server, "cls", scores=scores)
+        age = result.metadata["ours_diagnostics"]["memory"]["history_age_before"]
+        self.assertTrue(all(value == 0 for value in age["extra_precision_by_module"].values()))
+        saved = json.loads(json.dumps(method.state_dict()))
+        restored = Ours()
+        restored.load_state_dict(saved)
+        restored.configure_server(server.state, specs)
+        restored.configure_schedule(events)
+        self.assertEqual(restored.state_dict(), saved)
+        row = incoming(server, "caption", scores=scores)
+        left = method.on_arrival(copy.deepcopy(row), server.context())[0]
+        right = restored.on_arrival(copy.deepcopy(row), server.context())[0]
+        self.assertEqual((left.new_state, left.metadata), (right.new_state, right.metadata))
+        diagnostic = left.metadata["ours_diagnostics"]
+        memory = diagnostic["memory"]
+        extra = memory["history_age_before"]["extra_precision_by_module"]
+        for index, name in enumerate(modules(2)):
+            expected = 3 * -math.expm1(-1 / 18) * scores[name] / 6 if index < 4 else 0
+            self.assertAlmostEqual(extra[name], expected)
+            omega = memory["historical_precision_unweighted_before"][name] + expected
+            self.assertAlmostEqual(memory["historical_precision_before"][name], omega)
+            n = diagnostic["aggregation"]["client_precision_by_module"][name]
+            self.assertAlmostEqual(diagnostic["aggregation"]["module_alpha_by_module"][name],
+                                   n / (n + omega + 1e-12))
+        self.assertEqual(method.params["history_age_boost"], 3)
+        self.assertEqual(method.params["history_age_time_scale"], 18)
 
 
 if __name__ == "__main__":

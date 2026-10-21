@@ -602,10 +602,13 @@ python tools/estimate_task_compute_factors.py \
 ## 方法
 
 `ours` 使用“任务结束后重要层累计保护”：只有所有客户端的计划作业成功纳入后，才冻结
-该任务包含最后一次上传的历史 EMA；扣除0.5底座选出任务内高于平均占比的层。
+该任务包含最后一次上传的历史 EMA；扣除当前敏感度底座0.25选出任务内高于平均占比的层。
 只在入选层增加年龄保护，同模块多个结束任务的 `pi_q*b_q*H_end[q,m]` 求和，
 保留固定任务权重（六任务各1/6），不叠加旧全层年龄项、不做层数补偿。
-当前模板为 `history_age_mode: selected_layers_sum`、`boost=2`、`scale=18`。
+当前模板为 `history_age_mode: selected_layers_sum`、`boost=3`、`scale=18`。
+2026-10-21仅将boost从2提高到3；同历史/年龄下额外保护增加50%，基础保护不变。
+当前另将 `sensitivity_uniform_mix` 设为0.75，即 `C=0.25+0.75*C_norm`，均值仍约1；
+boost保持3，不改为4。旧profile保留原配置，联合修改后的效果需要新运行验证。
 历史更新采用 `history_update_mode: first_observation_ema`：未知任务各模块H默认为1；
 首次成功上传用C直接替换，之后普通EMA（beta=0.9），不再偏差修正，外部 `base_precision=0`。
 初始基础保护仍为1，来自六个任务的均衡默认历史，不再额外加固定1。

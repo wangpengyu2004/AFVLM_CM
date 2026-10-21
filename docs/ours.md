@@ -78,8 +78,10 @@ C_norm[k,l] = C_raw[k,l] / (mean_j C_raw[k,j] + eps)
 C[k,l]      = (1-eta) + eta C_norm[k,l]
 ```
 
-The default `eta=0.5` gives a floor of 0.5 while preserving an approximately
-unit client-wide mean. If no module has a valid post-warm-up observation, all
+The current template uses `eta=0.75`, giving a floor of0.25 while preserving an
+approximately unit client-wide mean. Old profiles without an explicit value keep
+the original eta0.5 fallback; do not change their runtime interpretation.
+If no module has a valid post-warm-up observation, all
 module sensitivities fall back to one and the diagnostic validity flag is
 false.
 
@@ -182,7 +184,7 @@ legacy profiles still freeze their corrected EMA.
 u          = number of successfully aggregated client updates so far
 u_finish[q]= u when every planned (client_id, local_round) job of task q is accepted
 age[q,t]   = u - u_finish[q]
-E[q,m]     = max(H_end[q,m] - 0.5, 0)
+E[q,m]     = max(H_end[q,m] - 0.25, 0)
 I[q,layer] = mean_QKVO(E[q,layer,projection])
 p[q,layer] = I[q,layer] / sum_layers I[q,layer]
 mask[q,layer] = p[q,layer] > 1/L + 1e-8
@@ -193,7 +195,7 @@ Omega[t,m] = Omega_base[t,m] + history_strength * sum_finished_q P[q,m]
 
 L is inferred from complete decoder Q/K/V/O metadata (32 for LLaVA1.5-7B), not
 chosen from observed experimental layer lists. The floor is `1-uniform_mix`,
-currently0.5, subtracted only for selection. Zero/indistinguishable scores select
+currently0.25, subtracted only for selection. Zero/indistinguishable scores select
 no layers. H_end/mask are immutable after completion. No fixed K, L/K compensation,
 normalization of extra mass or additive full-layer age term is used.
 Four projections retain their own H_end. Each selected task contributes its own
@@ -201,7 +203,13 @@ demand; overlapping tasks now add protection. Keep pi=1/6 for the six-task setup
 not 1/(number of finished tasks). Empty sums are zero. Base history still sums
 all tasks. Selection union and positive-extra support differ.
 
-Default boost2/scale18 are initial experimental settings, not proven optimal.
+Current boost3/scale18 are experimental settings, not proven optimal. On2026-10-21
+the boost adjustment from2 to3 alone means that at fixed histories/masks/ages, extra precision is
+1.5x, while base precision and the time constant are unchanged. Actual accuracy
+must be measured; stronger damping may slow the remaining tasks.
+The current sensitivity mix is separately changed to eta0.75 (floor0.25), while
+boost stays3, not4. A run combining both changes is not a single-factor comparison
+against the previous floor0.5/boost2 experiment.
 Current aggregation reads pre-update age: first upload after completion has age0,
 second has age1. No parameter anchor, synthetic upload or extra server update.
 Sparsification is not budget-matched relocation. Sum is at least as protective as
@@ -302,7 +310,7 @@ method:
   name: ours
   params:
     sensitivity_warmup_steps: 1
-    sensitivity_uniform_mix: 0.5
+    sensitivity_uniform_mix: 0.75
     gamma: 1.0
     frequency_window_size: 18
     frequency_power: 0.5
@@ -314,7 +322,7 @@ method:
     history_strength: 1.0
     history_age_enabled: true
     history_age_mode: selected_layers_sum
-    history_age_boost: 2.0
+    history_age_boost: 3.0
     history_age_time_scale: 18.0
     base_precision: 0.0
     alpha_max: null
@@ -444,9 +452,9 @@ profile, reuse its identical Plan (replace `YOUR_EXISTING_PROFILE`):
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_sum_firstema_nocap_b2_t18_e1_bs4_ga4_r10_s42 \
+  --profile module_gate_floor025_sum_b3_t18_e1_bs4_ga4_r10_s42 \
   --reuse_plans_from YOUR_EXISTING_PROFILE
-bash scripts/run_one.sh ours 2 module_gate_sum_firstema_nocap_b2_t18_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_floor025_sum_b3_t18_e1_bs4_ga4_r10_s42
 ```
 
 The profile name is a label, not a parameter override. New snapshots read current

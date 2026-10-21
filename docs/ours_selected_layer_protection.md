@@ -2,10 +2,15 @@
 
 2026-10-20 更新：仅把入选层额外年龄保护由逐模块max改成任务加权求和。
 保留原选层/计龄/冻结快照，boost=2、scale=18不变。旧max profile不改写。
+2026-10-21进一步仅将当前模板boost从2提高到3，scale仍为18；旧profile保持各自原值。
+相同历史/选层/年龄下额外P为原来的1.5倍，基础Omega不变；不保证性能必然提升。
+同日当前模板另将敏感度底座改为0.25（uniform_mix=0.75），选层扣除值同步0.25；
+用户确认boost维持3，不提高到4。两项联合改变的运行不能单独归因于底座或boost。
 当前模板采用首次观测初始化EMA。
 未知任务H=1，首次成功C替换默认值，后续普通EMA、不做偏差修正、删除外部固定1。
 另将默认alpha改为rwC/(rwC+Omega+eps)，alpha_max=null，不再额外裁剪到0.5。
-不改客户端敏感度、功能性陈旧度、18次频率窗口、LoRA增量聚合或评估，不加入敏感度消融。
+Module-Gate绝对值统计、功能性陈旧度公式、18次频率窗口、LoRA增量聚合与评估不变；
+客户端C仅调整上述均匀混合系数，不新增敏感度消融开关。
 不改其他 baseline、DDP、本地训练、数据、系统配置及 Plan。
 
 ## 当前配置与旧方案对照
@@ -13,11 +18,12 @@
 ```yaml
 history_update_mode: first_observation_ema
 history_beta: 0.9
+sensitivity_uniform_mix: 0.75  # C=0.25+0.75*C_norm，均值约1
 base_precision: 0.0
 alpha_max: null
 history_age_enabled: true
 history_age_mode: selected_layers_sum
-history_age_boost: 2.0
+history_age_boost: 3.0
 history_age_time_scale: 18.0
 ```
 
@@ -50,7 +56,7 @@ history_age_time_scale: 18.0
 在任务自己的冻结历史上：
 
 ```text
-E[q,m] = max(H_end[q,m] - 0.5, 0)
+E[q,m] = max(H_end[q,m] - 0.25, 0)
 I[q,layer] = mean(E[q,layer,Q/K/V/O])
 p[q,layer] = I[q,layer] / sum_layers I[q,layer]
 M[q,layer] = 1[p[q,layer] > 1/L + 1e-8]
@@ -59,7 +65,7 @@ M[q,layer] = 1[p[q,layer] > 1/L + 1e-8]
 LLaVA-1.5-7B 的 L=32，平均占比1/32=3.125%。只按任务自己的历史选层，不指定8层，
 不硬编码先前实验的层名单。完整 Q/K/V/O 组从 LoRA 元数据解析，32层128模块；
 缺少投影组或名称不匹配明确报错，不猜测归属。
-代码中的扣除底座取 `1-sensitivity_uniform_mix`，当前0.5；仅用于选层，
+代码中的扣除底座取 `1-sensitivity_uniform_mix`，当前0.25；仅用于选层，
 不会修改 C、EMA 或基础历史。无正超额量或没有显著高于平均的层时，名单为空，记录原因。
 非有限历史直接报错。名单与 H_end 在结束后冻结，不被其他任务改写。
 
@@ -69,7 +75,7 @@ LLaVA-1.5-7B 的 L=32，平均占比1/32=3.125%。只按任务自己的历史选
 
 ```text
 age[q] = u - e_q
-b[q] = 2 * (1 - exp(-age[q]/18))
+b[q] = 3 * (1 - exp(-age[q]/18))
 P[q,m] = b[q] * M[q,layer(m)] * H_end[q,m] / 6
 P_sum[m] = sum_finished_tasks P[q,m]    # 无结束任务时为0
 Omega_base[m] = sum_tasks H_before[q,m]/6   # 未观测任务H=1；没有外部固定1
@@ -85,13 +91,14 @@ H_end。六任务固定权重仍各1/6，不按结束任务数重新归一化，
 再与其他任务的H按固定1/6求和；不是对所有任务历史整体乘一个共享权重。
 
 新模式要求 `base_precision=0`；`history_strength` 仍同时缩放基础历史和额外历史，
-`history_lambda` 照常进入原alpha分母，二者默认均为1。选层扣除的0.5是客户端敏感度
+`history_lambda` 照常进入原alpha分母，二者默认均为1。选层扣除的0.25是客户端敏感度
 的均匀下限，与删除的外部固定1不是一回事，仍保持不变。
 
 任务在第e次接受更新结束，第e+1次聚合前年龄0、该任务额外量0；第e+2次才为正。
 新任务结束不会重置旧任务年龄。最终一个任务结束后若无后续更新，不虚构保护迭代。
 覆盖并集仍可扩大；相同轨迹上sum不小于max，重叠位置保护更强、alpha可能更低。
-只改合成方式，不再同时增强boost或缩短scale，避免混淆因素；不能据alpha推断性能提升。
+累计版本曾保持boost2；当前在该版本上仅提高boost到3，未缩短scale。
+额外保护更强会压低后续入选模块的alpha，但不能据此推断性能提升。
 
 ## 记录哪些数据
 
@@ -130,10 +137,10 @@ module表新增 `history_age_task_demands_before/after`、`history_age_contribut
 
 ```bash
 python tools/generate_system_profiles.py \
-  --profile module_gate_sum_firstema_nocap_b2_t18_e1_bs4_ga4_r10_s42 \
+  --profile module_gate_floor025_sum_b3_t18_e1_bs4_ga4_r10_s42 \
   --reuse_plans_from 你的旧profile名称
 
-bash scripts/run_one.sh ours 2 module_gate_sum_firstema_nocap_b2_t18_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours 2 module_gate_floor025_sum_b3_t18_e1_bs4_ga4_r10_s42
 ```
 
 旧 profile 名换成真实名称；新 profile 从当前模板生成全部常规方法配置，不复制旧快照的

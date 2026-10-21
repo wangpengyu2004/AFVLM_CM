@@ -5,8 +5,9 @@ method:
   params:
     # Module-Gate: mean absolute gate magnitude, once per real optimizer step.
     sensitivity_warmup_steps: 1
-    # C = (1-eta) + eta * raw/mean(raw); eta=0.5 gives a 0.5 floor.
-    sensitivity_uniform_mix: 0.5
+    # C = (1-eta) + eta * raw/mean(raw); eta=0.75 gives a 0.25 floor.
+    # Task-end layer selection automatically subtracts the same 0.25 floor.
+    sensitivity_uniform_mix: 0.75
     gamma: 1.0
     # Accepted-update task-frequency correction over the latest W arrivals.
     frequency_window_size: 18
@@ -25,7 +26,8 @@ method:
     # Old snapshots missing mode retain all_modules_sum; false disables extra age.
     history_age_enabled: true
     history_age_mode: selected_layers_sum
-    history_age_boost: 2.0
+    # Stronger ended-task extra protection; the base history and growth time stay unchanged.
+    history_age_boost: 3.0
     history_age_time_scale: 18.0
     # Unit priors now live inside each unobserved task, not outside the task sum.
     base_precision: 0.0
