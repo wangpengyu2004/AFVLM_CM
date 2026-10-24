@@ -9,9 +9,11 @@ from __future__ import annotations
 import ast
 import copy
 import csv
+import io
 import json
 import math
 import random
+import runpy
 import tempfile
 import unittest
 from pathlib import Path
@@ -246,6 +248,33 @@ class RankProbeExportTests(unittest.TestCase):
         path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "Duplicate/non-finite"):
             export_probe_results(self.root)
+
+
+class RankProbeProgressTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.launcher = runpy.run_path(str(ROOT / "scripts/run_local_rank_probe.py"))
+
+    def test_relay_preserves_in_place_refreshes_and_tracebacks_exactly(self) -> None:
+        payload = (b"loading model\n\rrank probe total: 0/18\n"
+                   b"\rlocal: 1/275\x1b[A\n\rlocal: 2/275\x1b[A"
+                   b"\nTraceback (most recent call last):\nRuntimeError: example\n")
+        source = io.BufferedReader(io.BytesIO(payload), buffer_size=7)
+        terminal, log = io.BytesIO(), io.BytesIO()
+        self.launcher["_relay_output"](source, terminal, log)
+        self.assertEqual(terminal.getvalue(), payload)
+        self.assertEqual(log.getvalue(), payload)
+        # The former Popen(text=True) path produced extra lines from these same CRs.
+        translated = io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8").read()
+        self.assertGreater(translated.count("\n"), payload.count(b"\n"))
+
+    def test_relay_handles_split_utf8_without_inserting_line_breaks(self) -> None:
+        payload = ("\r总进度 0/18\n\r训练 1/275\x1b[A" * 1200).encode("utf-8")
+        source = io.BufferedReader(io.BytesIO(payload), buffer_size=3)
+        terminal, log = io.BytesIO(), io.BytesIO()
+        self.launcher["_relay_output"](source, terminal, log)
+        self.assertEqual(terminal.getvalue().decode("utf-8"), payload.decode("utf-8"))
+        self.assertEqual(log.getvalue(), payload)
 
 
 if __name__ == "__main__":

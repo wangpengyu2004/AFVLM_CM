@@ -10,6 +10,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 import yaml
 
@@ -27,6 +28,15 @@ from afl_vlm.experiments.rank_probe import (  # noqa: E402
     validate_probe_config,
     write_json,
 )
+
+
+def _relay_output(source: BinaryIO, terminal: BinaryIO, log: BinaryIO) -> None:
+    """Preserve tqdm CR/cursor sequences; text-mode iteration turns CR into newlines."""
+    while chunk := source.read1(8192):
+        terminal.write(chunk)
+        terminal.flush()
+        log.write(chunk)
+        log.flush()
 
 
 def _stop_child(process: subprocess.Popen) -> None:
@@ -112,18 +122,14 @@ def launch(args: argparse.Namespace) -> Path:
             print(f"[rank-probe] job {number}/{len(jobs)}: {current['job_id']}", flush=True)
             environment = {**os.environ, "PYTHONUNBUFFERED": "1", "HF_HUB_OFFLINE": "1",
                            "TRANSFORMERS_OFFLINE": "1"}
-            with (directory / "launcher.log").open("w", encoding="utf-8") as log:
+            with (directory / "launcher.log").open("wb") as log:
                 process = subprocess.Popen(command, cwd=REPOSITORY_ROOT, env=environment,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                    encoding="utf-8", errors="replace", bufsize=1,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     start_new_session=os.name != "nt")
                 try:
                     if process.stdout is None:
                         raise RuntimeError("Cannot capture worker logs")
-                    for line in process.stdout:
-                        print(line, end="", flush=True)
-                        log.write(line)
-                        log.flush()
+                    _relay_output(process.stdout, sys.stdout.buffer, log)
                     code = process.wait()
                 except BaseException:
                     _stop_child(process)

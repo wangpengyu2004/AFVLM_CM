@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import yaml
+from tqdm.auto import tqdm
 
 from afl_vlm.config import load_config
 from afl_vlm.data.afvlm_cm import AFVLMTaskAdapter
@@ -138,8 +139,8 @@ def evaluate_epoch(torch: Any, model: Any, adapter: AFVLMTaskAdapter,
                     "decoding": "greedy_num_beams1"}
                 append_json(output / "metrics.jsonl", record)
                 records.append(record)
-            print(f"[rank-probe] evaluated {job.key} epoch={epoch}: "
-                  f"{[(row['protocol'], row['metrics']) for row in records]}", flush=True)
+            tqdm.write(f"[rank-probe] evaluated {job.key} epoch={epoch}: "
+                       f"{[(row['protocol'], row['metrics']) for row in records]}")
             return records
 
         return primary_call(torch, score_and_save)
@@ -179,12 +180,18 @@ def _model_provenance(model: Any, job: ProbeJob, torch: Any) -> dict[str, Any]:
 def _execute_job(torch: Any, config: dict[str, Any], data: Mapping[str, Any],
                  job: ProbeJob, output: Path, repo: Path) -> dict[str, Any]:
     import numpy as np
+    from huggingface_hub.utils import disable_progress_bars
+    from transformers.utils.logging import disable_progress_bar
 
     from afl_vlm.models.llava15 import Llava15Adapter
 
     rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     os.environ["AFVLM_PRIMARY_PROCESS"] = "1" if rank == 0 else "0"
+    # These switches affect only this isolated worker process, not other runs.
+    # Keep loading-library bars from occupying the experiment's total/local rows.
+    disable_progress_bars()
+    disable_progress_bar()
     random.seed(job.seed)
     np.random.seed(job.seed)
     torch.manual_seed(job.seed)
@@ -220,10 +227,9 @@ def _execute_job(torch: Any, config: dict[str, Any], data: Mapping[str, Any],
     primary_call(torch, initialize_output)
     if rank == 0:
         effective_batch = world * training['batch_size'] * training['gradient_accumulation']
-        print(f"[rank-probe] loading fresh LLaVA: {job.key}; samples={len(samples)}, "
-              f"epochs={training['local_epochs']}, steps={total_steps}, DDP={world}, "
-              f"effective_batch={effective_batch}",
-              flush=True)
+        tqdm.write(f"[rank-probe] loading fresh LLaVA: {job.key}; samples={len(samples)}, "
+                   f"epochs={training['local_epochs']}, steps={total_steps}, DDP={world}, "
+                   f"effective_batch={effective_batch}")
     model_config = copy.deepcopy(config["model"])
     model_config.update(device_map={"": local_rank},
         model_path=str((repo / model_config["model_path"]).resolve()),
@@ -367,7 +373,23 @@ def run_worker(run_root: Path, job_id: str, repo: Path) -> None:
     try:
         torch.distributed.init_process_group(backend="nccl", init_method="env://",
             timeout=timedelta(seconds=float(config["runtime"]["ddp_timeout_seconds"])))
-        _execute_job(torch, job_config(config, job), data, job, run_root / job.key, repo)
+        rank = torch.distributed.get_rank()
+        completed = sum(row["status"] == "completed" for row in manifest["jobs"])
+        # Same primary process owns both rows, like the original federated runner.
+        # Re-open with the verified prior count when a fresh job process group starts.
+        with tqdm(total=len(manifest["jobs"]), initial=completed, desc="rank probe total",
+                  unit="job", position=0, leave=False, dynamic_ncols=True,
+                  bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} jobs{postfix}",
+                  mininterval=0.5, smoothing=0.0,
+                  disable=rank != 0 or not config["output"]["progress_bar"]) as overall:
+            overall.set_postfix_str(job.key)
+            try:
+                _execute_job(torch, job_config(config, job), data, job, run_root / job.key, repo)
+            except BaseException:
+                overall.leave = True
+                raise
+            overall.update(1)
+            overall.leave = completed + 1 == len(manifest["jobs"])
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
