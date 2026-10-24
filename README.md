@@ -1,5 +1,18 @@
 # AFVLM-CM
 
+新增独立的 **LoRA rank 容量趋势实验**：cls/caption/vqa 各两个既有客户端，分别从基础
+模型训练 rank 2/4/8；每次八卡 DDP 共同训练一个客户端，连续 **5 epochs**，每轮评估并
+只保存评估指标、loss、配置和画图用 CSV，不保存完整预测或 LoRA 参数。
+不使用联邦聚合/异步 Plan；配置独立于 base 和所有
+方法，未修改现有训练器或 baseline。详细设计、验证子集说明与输出见
+[独立 rank 实验](docs/local_rank_probe.md)。服务器八卡启动：
+
+```bash
+bash scripts/run_local_rank_probe.sh --run-name rank_probe_e5_seed42
+# 正式训练完成后，生成rank曲线与增益图：
+python tools/plot_local_rank_probe.py runs/local_rank_probe/rank_probe_e5_seed42
+```
+
 新增独立 `aced`：全客户端初始梯度与首步下降、活跃梯度缓存均值、超时筛选及重新参与。
 沿用固定任务分区、虚拟 Plan 和全局评估，现支持全部可见 GPU 协同的 DDP 梯度收集；
 不改已有 DDP 训练或其他方法。多步 AdamW、额外初始化成本与原文时间戳差异均明确披露，

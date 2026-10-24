@@ -1,0 +1,53 @@
+# Standalone experiment: deliberately does NOT inherit configs/base.yaml or any method/profile.
+experiment:
+  name: local_rank_probe
+  clients: [client_0, client_1]
+  ranks: [2, 4, 8]
+  seeds: [42]
+  lora_alpha_per_rank: 2
+
+runtime:
+  world_size: 8
+  ddp_timeout_seconds: 7200
+
+dataset:
+  partition_root: data/AFVLM_CM/partitioned/2_clients
+  image_root: data/AFVLM_CM/dataset
+  require_images: true
+  tasks: [cls, caption, vqa]
+
+training:
+  local_epochs: 5
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 0.00002
+  max_text_length: 2048
+  optimizer: adamw
+
+model:
+  adapter: llava15
+  model_path: pretrained/llava-v1.5-7b
+  vision_tower_path: pretrained/clip-vit-large-patch14-336
+  local_files_only: true
+  dtype: fp16
+  quantization: none
+  gradient_checkpointing: true
+  conversation_template: v1
+  lora:
+    enabled: true
+    # Overridden independently for each job; alpha/r always stays 2.
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    bias: none
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    train_mm_projector: false
+
+evaluation:
+  generation_max_new_tokens: 128
+  image_disjoint_tasks: [vqa]
+  supplemental_standard_validation: true
+
+output:
+  directory: runs/local_rank_probe
+  progress_bar: true
