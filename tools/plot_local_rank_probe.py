@@ -44,11 +44,11 @@ def plot_results(run_root: Path, output: Path, epoch: int | None = None) -> list
         group["seeds"].add(job["seed"])
         group["ranks"].add(job["lora_rank"])
     for task, group in groups.items():
-        if group["ranks"] != {2, 4, 8}:
-            raise ValueError(f"Rank curves require all three ranks for {task}")
+        if len(group["ranks"]) < 2:
+            raise ValueError(f"Rank curves require at least two ranks for {task}")
         for client in group["clients"]:
             for seed in group["seeds"]:
-                for rank in (2, 4, 8):
+                for rank in sorted(group["ranks"]):
                     if (task, client, seed, rank) not in scores:
                         raise ValueError(f"Incomplete paired matrix for {task}/{client}/seed{seed}")
     output.mkdir(parents=True, exist_ok=True)
@@ -58,23 +58,24 @@ def plot_results(run_root: Path, output: Path, epoch: int | None = None) -> list
     figure, axes = plt.subplots(1, len(tasks), figsize=(5 * len(tasks), 4), squeeze=False)
     for axis, task in zip(axes[0], tasks, strict=True):
         clients, seeds = sorted(groups[task]["clients"]), sorted(groups[task]["seeds"])
+        ranks = sorted(groups[task]["ranks"])
         for client in clients:
-            axis.plot([2, 4, 8], [statistics.fmean(scores[task, client, seed, rank]
-                       for seed in seeds) for rank in (2, 4, 8)], "o--", linewidth=1,
+            axis.plot(ranks, [statistics.fmean(scores[task, client, seed, rank]
+                       for seed in seeds) for rank in ranks], "o--", linewidth=1,
                        alpha=0.65, label=f"{client} (seed mean)")
         # Average clients WITHIN each seed; seed SD is not a client-population CI.
         per_seed = [[statistics.fmean(scores[task, client, seed, rank] for client in clients)
-                     for seed in seeds] for rank in (2, 4, 8)]
+                     for seed in seeds] for rank in ranks]
         means = [statistics.fmean(values) for values in per_seed]
-        axis.plot([2, 4, 8], means, "o-", color="black", linewidth=2.2,
+        axis.plot(ranks, means, "o-", color="black", linewidth=2.2,
                   label=f"equal-client mean (clients={len(clients)}, seeds={len(seeds)})")
         if len(seeds) > 1:
             deviations = [statistics.stdev(values) for values in per_seed]
-            axis.fill_between([2, 4, 8], [m - s for m, s in zip(means, deviations, strict=True)],
+            axis.fill_between(ranks, [m - s for m, s in zip(means, deviations, strict=True)],
                               [m + s for m, s in zip(means, deviations, strict=True)],
                               color="black", alpha=0.12, label="across-seed SD (not CI)")
         axis.set_xscale("log", base=2)
-        axis.set_xticks([2, 4, 8], ["2", "4", "8"])
+        axis.set_xticks(ranks, [str(rank) for rank in ranks])
         axis.set_xlabel("LoRA rank")
         axis.set_ylabel(LABELS[task])
         axis.set_title(f"{task}: fixed epoch {epoch}")
@@ -90,11 +91,14 @@ def plot_results(run_root: Path, output: Path, epoch: int | None = None) -> list
     figure, axes = plt.subplots(1, len(tasks), figsize=(5 * len(tasks), 4), squeeze=False)
     for axis, task in zip(axes[0], tasks, strict=True):
         clients, seeds = sorted(groups[task]["clients"]), sorted(groups[task]["seeds"])
-        for index, (low, high) in enumerate(((2, 4), (4, 8))):
+        ranks = sorted(groups[task]["ranks"])
+        pairs = list(zip(ranks[:-1], ranks[1:], strict=True))
+        width = 0.8 / len(pairs)
+        for index, (low, high) in enumerate(pairs):
             gains = [statistics.fmean(scores[task, client, seed, high]
                      - scores[task, client, seed, low] for seed in seeds) for client in clients]
-            axis.bar([i + (index - 0.5) * 0.35 for i in range(len(clients))], gains,
-                     width=0.35, label=f"rank {low} to {high}")
+            axis.bar([i + (index - (len(pairs) - 1) / 2) * width for i in range(len(clients))],
+                     gains, width=width, label=f"rank {low} to {high}")
         axis.axhline(0, color="black", linewidth=0.8)
         axis.set_xticks(list(range(len(clients))), clients)
         axis.set_ylabel(f"Gain in {LABELS[task]}")

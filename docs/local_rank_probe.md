@@ -121,8 +121,71 @@ bash scripts/run_local_rank_probe.sh --run-name rank_probe_vqa_c0_e5 \
   --task vqa --client client_0
 ```
 
-上述命令训练这个客户端的三种 rank。也支持 `--rank 2`、`--seed 42`；`--seed` 必须
-已在配置种子列表里。缺少三种 rank 的结果不能画完整 rank 曲线，需要保留完整矩阵。
+上述命令训练这个客户端默认的三种 rank。也支持 `--rank 2`、`--seed 42`；`--seed`
+必须已在配置种子列表里。画图需要所选客户端/seed 在所选 rank 上形成完整配对矩阵。
+
+## 已完成 2/4/8，只补跑 16/32
+
+**保留原目录，不修改或覆盖它。** 推荐从原运行的 `resolved_config.yaml` 读取冻结
+配方，而不是修改 `base.yaml` 或把原实验名称重新使用。假设原目录名称是
+`rank_probe_e5_seed42`，在仓库根目录执行：
+
+```bash
+# 如果原实验用了其他名称，只替换这里的路径。
+OLD_RUN=runs/local_rank_probe/rank_probe_e5_seed42
+
+bash scripts/run_local_rank_probe.sh \
+  --extend-from "$OLD_RUN" \
+  --ranks 16 32 \
+  --run-name rank_probe_r16_r32_e5_seed42
+```
+
+这次只生成 6 个客户端 × 2 个新增 rank = **12 次训练**，总进度为 `0/12`。
+保持原八卡 DDP、每卡 batch、梯度累积、epoch、学习率、种子、目标模块和验证协议。
+alpha 按原 `lora_alpha_per_rank` 自动设置；原配方 alpha/r=2 时，rank16/32 对应
+alpha32/64。每次仍从基础模型与新 LoRA 初始化，不加载 rank8 的训练后参数。
+
+补跑入口要求旧实验已经完整完成，检查标注/验证 ID 和共享模型、数据、指标实现的
+哈希一致，并拒绝重跑旧目录里已经完成的同一客户端/rank/seed。
+旧实验若只选择了部分客户端或 seed，补跑也只扩展这些已存在的组合。
+如果需要单独跑一个新增 rank，可用 `--rank 16`；它与 `--ranks` 不能同时使用。
+也可在普通独立运行中使用 `--ranks 2 4 8 16 32`；省略时仍保持原默认 2/4/8。
+不需要重新生成 Plan，也不需要手改原配置文件。
+
+新增数据写入独立目录：
+
+```text
+runs/local_rank_probe/rank_probe_e5_seed42/              # 原2/4/8，保持原样
+runs/local_rank_probe/rank_probe_r16_r32_e5_seed42/       # 新16/32
+```
+
+补跑全部完成后，复制小型结果记录到一个**新的汇总目录**，一起分析五种 rank：
+
+```bash
+python tools/merge_local_rank_probe.py \
+  "$OLD_RUN" \
+  runs/local_rank_probe/rank_probe_r16_r32_e5_seed42 \
+  --output-directory runs/local_rank_probe/rank_probe_r2_4_8_16_32_e5_seed42
+
+python tools/plot_local_rank_probe.py \
+  runs/local_rank_probe/rank_probe_r2_4_8_16_32_e5_seed42
+```
+
+汇总工具**不在任何源目录重新导出 CSV，不移动、不删除、不覆盖原文件**。
+它复制各 job 的数值指标、loss（如有）、配置/采样元信息和完成记录；不复制大日志、
+预测文本或 LoRA 参数。汇总目录已存在时拒绝覆盖，重复操作需换一个新目录名。
+即使没有模型/图片，已经完成的两套结果也可以离线合并。
+
+合并前检查训练与评估配方、数据哈希、共享代码、软件版本、逐轮 optimizer steps、
+验证 ID、样本数及完整配对关系。重复 rank、缺少轮次、只为部分客户端补齐 rank 或
+条件不一致会明确报错，不会静默平均。这里能核对本地权重路径及软件版本，不能从
+旧记录证明大权重文件内容从未变动；请保持原 LLaVA/CLIP 权重不变。
+
+五 rank 汇总保留所有客户端、每个 epoch 的原始数值；默认画固定第 5 轮的曲线，
+横轴为 **2、4、8、16、32**。`rank_gains.csv` 会包含四段增益：
+`gain_2_to_4`、`gain_4_to_8`、`gain_8_to_16`、`gain_16_to_32`，以及各段每新增
+rank 的增益。比较增益饱和时同时看这两套数值，不能忽略各段增加的 rank 数不同。
+旧三 rank 实验的导出与画图命令继续可用。
 
 ## 保存内容
 
@@ -153,7 +216,8 @@ CSV 使用 UTF-8 BOM，可直接用 Excel 打开。`metrics_long.csv` 一行对�
 等权均值；epoch loss 是这些 optimizer 窗口的均值，**不是全语料 token 加权困惑度**。
 完整窗口为 128 样本，尾部窗口和原采样补齐重复数可从配置/采样清单确认。
 
-`rank_gains.csv` 同时保存 Δ(2→4)、Δ(4→8)、每新增 rank 的增益，以及两段增益之比。
+`rank_gains.csv` 保存所选相邻 rank 的增益和每新增 rank 的增益；包含 2/4/8 时也保留
+原来的 Δ(4→8)/Δ(2→4) 比值。
 当 Δ(2→4)≤0 时不计算增益比，避免误导。任务曲线对两个客户端等权，客户端原始曲线
 始终保留；不把两个客户端差异当作独立随机种子置信区间。
 
@@ -184,7 +248,7 @@ python tools/plot_local_rank_probe.py runs/local_rank_probe/rank_probe_e5_seed42
 默认在本次目录 `figures/` 输出 PNG/SVG：
 
 - `rank_validation_epoch5`：三个任务分别成图面板，显示每个客户端曲线及等权均值。
-- `rank_gains_epoch5`：逐客户端比较 2→4、4→8 的收益。
+- `rank_gains_epoch5`：逐客户端比较所选相邻 rank 的收益，五 rank 时包含四段。
 
 可用 `--epoch 1` 查看同一固定轮次的结果。若运行多个 seed，曲线阴影为按 seed
 计算的标准差，不是置信区间；单 seed 不画统计误差带。

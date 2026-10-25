@@ -21,12 +21,17 @@ from afl_vlm.config import load_config  # noqa: E402
 from afl_vlm.data.afvlm_cm import validate_caption_metric_runtime  # noqa: E402
 from afl_vlm.experiments.rank_probe import (  # noqa: E402
     SAFE_NAME,
+    SUPPORTED_RANKS,
     build_jobs,
     export_probe_results,
     hash_file,
     prepare_data_manifest,
     validate_probe_config,
     write_json,
+)
+from afl_vlm.experiments.rank_probe_history import (  # noqa: E402
+    read_completed_run,
+    validate_extension,
 )
 
 
@@ -65,10 +70,26 @@ def _stop_child(process: subprocess.Popen) -> None:
 def launch(args: argparse.Namespace) -> Path:
     import torch
 
-    config = load_config(args.config)
+    previous_manifest = None
+    if args.extend_from:
+        previous_manifest, config, _ = read_completed_run(args.extend_from.resolve())
+        if args.ranks is None and args.lora_rank is None:
+            raise ValueError("Use --ranks 16 32 (or --rank) to specify only the additional ranks")
+    else:
+        config = load_config(args.config)
+    if args.ranks is not None:
+        config["experiment"]["ranks"] = args.ranks
+    elif args.extend_from and args.lora_rank is not None:
+        config["experiment"]["ranks"] = [args.lora_rank]
     validate_probe_config(config)
     jobs = build_jobs(config, task=args.task, client=args.client,
                       lora_rank=args.lora_rank, seed=args.seed)
+    if previous_manifest is not None:
+        previous_groups = {(row["task"], row["client"], row["seed"])
+                           for row in previous_manifest["jobs"]}
+        jobs = [job for job in jobs if (job.task, job.client, job.seed) in previous_groups]
+        if not jobs:
+            raise ValueError("No selected clients/seeds match the previous experiment")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
         raise RuntimeError("This probe requires exactly8 visible CUDA GPUs; no single-GPU fallback")
     for key in ("model_path", "vision_tower_path"):
@@ -81,6 +102,8 @@ def launch(args: argparse.Namespace) -> Path:
     if not SAFE_NAME.fullmatch(name):
         raise ValueError("Unsafe run name; use letters, digits, underscores, hyphens or dots")
     data = prepare_data_manifest(config, REPOSITORY_ROOT)
+    extension = validate_extension(args.extend_from.resolve(), config, data, jobs,
+                                   REPOSITORY_ROOT) if args.extend_from else None
     root = (REPOSITORY_ROOT / config["output"]["directory"] / name).resolve()
     root.mkdir(parents=True, exist_ok=False)  # Never delete/overwrite a previous experiment.
     public = {key: value for key, value in config.items() if not key.startswith("_")}
@@ -95,6 +118,7 @@ def launch(args: argparse.Namespace) -> Path:
         "config_sha256": hash_file(frozen), "data_sha256": hash_file(root / "data_manifest.json"),
         "local_epochs": config["training"]["local_epochs"], "world_size": 8,
         "independent_fresh_process_group_per_job": True, "uses_federation": False,
+        "extends_run": extension,
         "primary_protocol_by_task": {task: row["primary_protocol"]
                                      for task, row in data["tasks"].items()},
         "source_sha256": {path: hash_file(REPOSITORY_ROOT / path) for path in (
@@ -160,12 +184,18 @@ def launch(args: argparse.Namespace) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path,
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--config", type=Path,
                         default=REPOSITORY_ROOT / "configs/probes/local_rank_probe.yaml")
+    inputs.add_argument("--extend-from", type=Path,
+                        help="Read a completed run's frozen config; keep its results untouched")
     parser.add_argument("--run-name", help="New output name; existing runs are never overwritten")
     parser.add_argument("--task", choices=("cls", "caption", "vqa"))
     parser.add_argument("--client", choices=("client_0", "client_1"))
-    parser.add_argument("--rank", dest="lora_rank", type=int, choices=(2, 4, 8))
+    ranks = parser.add_mutually_exclusive_group()
+    ranks.add_argument("--rank", dest="lora_rank", type=int, choices=SUPPORTED_RANKS)
+    ranks.add_argument("--ranks", nargs="+", type=int, choices=SUPPORTED_RANKS,
+                       help="Only train these increasing ranks, e.g. --ranks 16 32")
     parser.add_argument("--seed", type=int, help="Select one seed already listed in the config")
     parser.add_argument("--prepared-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-job", help=argparse.SUPPRESS)

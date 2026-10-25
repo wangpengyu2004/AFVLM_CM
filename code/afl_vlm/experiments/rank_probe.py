@@ -23,6 +23,7 @@ from typing import Any
 from afl_vlm.data.afvlm_cm import AFVLMTaskAdapter
 
 TASK_METRICS = {"cls": "accuracy", "caption": "CIDEr", "vqa": "VQA_accuracy"}
+SUPPORTED_RANKS = (2, 4, 8, 16, 32)
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 
 
@@ -62,8 +63,12 @@ def validate_probe_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Rank probe tasks must be [cls, caption, vqa]")
     if tuple(experiment["clients"]) != ("client_0", "client_1"):
         raise ValueError("Rank probe preserves the existing two clients per task")
-    if tuple(experiment["ranks"]) != (2, 4, 8):
-        raise ValueError("Rank probe ranks must be [2, 4, 8]")
+    ranks = experiment["ranks"]
+    if (not isinstance(ranks, list) or not ranks
+            or any(isinstance(rank, bool) or not isinstance(rank, int)
+                   or rank not in SUPPORTED_RANKS for rank in ranks)
+            or ranks != sorted(set(ranks))):
+        raise ValueError("Ranks must be an increasing unique subset of [2, 4, 8, 16, 32]")
     seeds = experiment["seeds"]
     if not isinstance(seeds, list) or not seeds or len(seeds) != len(set(seeds)):
         raise ValueError("Seeds must be a non-empty unique list")
@@ -262,9 +267,6 @@ LONG_FIELDS = ["job_id", "task", "client", "lora_rank", "lora_alpha", "seed", "e
                "metric", "value", "train_annotation_sha256", "validation_ids_sha256", "job_status"]
 CURVE_FIELDS = ["task", "seed", "lora_rank", "epoch", "protocol", "metric", "mean",
                 "client_count", "expected_client_count", "complete"]
-GAIN_FIELDS = ["task", "client", "seed", "epoch", "metric", "score_rank2", "score_rank4",
-               "score_rank8", "gain_2_to_4", "gain_4_to_8", "gain_per_added_rank_2_to_4",
-               "gain_per_added_rank_4_to_8", "gain_ratio_48_over_24"]
 STEP_FIELDS = ["job_id", "task", "client", "lora_rank", "lora_alpha", "seed", "epoch",
                "optimizer_step", "epoch_step", "mean_loss_across_ddp_ranks",
                "elapsed_seconds_including_evaluation", "job_status"]
@@ -283,6 +285,7 @@ def export_probe_results(run_root: Path) -> dict[str, int]:
     grouped: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
     scores: dict[tuple[Any, ...], dict[int, float]] = defaultdict(dict)
     expected = defaultdict(set)
+    expected_ranks = sorted({job["lora_rank"] for job in manifest["jobs"]})
     for job in manifest["jobs"]:
         expected[job["task"]].add(job["client"])
         for filename, target, fields, identity_field in (
@@ -326,18 +329,28 @@ def export_probe_results(run_root: Path) -> dict[str, int]:
                "complete": set(values) == expected[key[0]]}
               for key, values in sorted(grouped.items())]
     gains = []
+    pairs = list(zip(expected_ranks[:-1], expected_ranks[1:], strict=True))
+    gain_fields = (["task", "client", "seed", "epoch", "metric"]
+                   + [f"score_rank{rank}" for rank in expected_ranks]
+                   + [f"gain_{low}_to_{high}" for low, high in pairs]
+                   + [f"gain_per_added_rank_{low}_to_{high}" for low, high in pairs]
+                   + ["gain_ratio_48_over_24"])
     for key, ranks in sorted(scores.items()):
-        if set(ranks) != {2, 4, 8}:
+        if set(ranks) != set(expected_ranks) or not pairs:
             continue
-        first, second = ranks[4] - ranks[2], ranks[8] - ranks[4]
-        gains.append({"task": key[0], "client": key[1], "seed": key[2], "epoch": key[3],
-            "metric": key[4], "score_rank2": ranks[2], "score_rank4": ranks[4],
-            "score_rank8": ranks[8], "gain_2_to_4": first, "gain_4_to_8": second,
-            "gain_per_added_rank_2_to_4": first / 2, "gain_per_added_rank_4_to_8": second / 4,
-            "gain_ratio_48_over_24": second / first if first > 1e-12 else ""})
+        row = {"task": key[0], "client": key[1], "seed": key[2], "epoch": key[3],
+               "metric": key[4], "gain_ratio_48_over_24": ""}
+        row.update({f"score_rank{rank}": value for rank, value in ranks.items()})
+        for low, high in pairs:
+            gain = ranks[high] - ranks[low]
+            row[f"gain_{low}_to_{high}"] = gain
+            row[f"gain_per_added_rank_{low}_to_{high}"] = gain / (high - low)
+        if {2, 4, 8} <= ranks.keys() and ranks[4] - ranks[2] > 1e-12:
+            row["gain_ratio_48_over_24"] = (ranks[8] - ranks[4]) / (ranks[4] - ranks[2])
+        gains.append(row)
     write_csv(run_root / "metrics_long.csv", rows, LONG_FIELDS)
     write_csv(run_root / "task_rank_curves.csv", curves, CURVE_FIELDS)
-    write_csv(run_root / "rank_gains.csv", gains, GAIN_FIELDS)
+    write_csv(run_root / "rank_gains.csv", gains, gain_fields)
     write_csv(run_root / "training_steps.csv", steps, STEP_FIELDS)
     write_csv(run_root / "epoch_training.csv", epochs, EPOCH_FIELDS)
     final_epoch = int(manifest["local_epochs"])

@@ -13,6 +13,10 @@ bash scripts/run_local_rank_probe.sh --run-name rank_probe_e5_seed42
 python tools/plot_local_rank_probe.py runs/local_rank_probe/rank_probe_e5_seed42
 ```
 
+已完成 rank 2/4/8 后，可用 `--extend-from 原运行目录 --ranks 16 32` 只补跑新增 rank，
+沿用原冻结配方并另存结果；再用 `tools/merge_local_rank_probe.py` 生成新的五 rank
+汇总目录，原数据保持原样。完整命令见[补跑与合并说明](docs/local_rank_probe.md#已完成-248只补跑-1632)。
+
 新增独立 `aced`：全客户端初始梯度与首步下降、活跃梯度缓存均值、超时筛选及重新参与。
 沿用固定任务分区、虚拟 Plan 和全局评估，现支持全部可见 GPU 协同的 DDP 梯度收集；
 不改已有 DDP 训练或其他方法。多步 AdamW、额外初始化成本与原文时间戳差异均明确披露，
