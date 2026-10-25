@@ -1,0 +1,137 @@
+schema_version: 1
+name: hc_r32_e1_bs4_ga4_r10_s42
+created_utc: '2026-10-25T19:40:21.679029+00:00'
+source_commit: ce07e436c428f1b2af480c8cfe3a00b853692ade
+plan_source: generated_from_local_data
+run_seed: 42
+training:
+  local_epochs: 1
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 2.0e-05
+  max_text_length: 2048
+  optimizer: adamw
+  batch_size_scope: reference_ddp
+  reference_world_size: 8
+batch_budget:
+  scope: reference_ddp
+  reference_effective_batch_size: 128
+  reference_world_size: 8
+  reference_source: command_line
+  loss_normalization: reference_rank_micro_batch_mean
+  plan_step_semantics: legacy_single_rank_nominal_steps
+federation:
+  rounds: 10
+task_compute_factors:
+  cls: 1.0
+  caption: 1.0
+  vqa: 1.0
+  chart_vqa: 1.0
+  visual_reasoning: 1.0
+  grounding: 1.0
+runtime:
+  backend: client_parallel
+  executor_policy: capability
+  devices: all
+  aggregation_device: auto
+  start_method: spawn
+  startup_timeout_seconds: 1800
+  ddp_timeout_seconds: 7200
+  arrival_policy: planned
+  worker_queue: plan_arrival_edf
+settings:
+- 2
+- 5
+- 10
+methods:
+- aced
+- adamasfl
+- c2afcl
+- ca2fl
+- dop_lora
+- fedadam
+- fedasmu
+- fedasync
+- fedavg
+- fedbuff
+- fedcompass
+- fedprox
+- local
+- masfl
+- nufilt_lora
+- opcm_lora
+- orthofl
+- ours
+- ours_hc
+- pilot
+- unifed_lora
+files_sha256:
+  configs/10clients/aced.yaml: 3d94ee8457613ea1d6b2b2d4250c08503f4cea3216198dacb9e0f391083e8514
+  configs/10clients/adamasfl.yaml: 3617122efd2845ba3488cb77141e55330a18ae44704446ded3b318550cd18d6f
+  configs/10clients/c2afcl.yaml: d47a293fe689ed0c05b72e043522ea5589f7f299428168c33939e1baaf679fb5
+  configs/10clients/ca2fl.yaml: 53fa222704cb05281b6728468d63c529bcf9eb8a68e62536099d65bdf694b1e7
+  configs/10clients/dop_lora.yaml: c57d7045557b579943e4993935eca12f07aeae8d465668602419c7786dcae3d3
+  configs/10clients/fedadam.yaml: 9fc41f3dd76e8f5a08e8324805524d0d3ab0ec7403c0a2e115639c985eb45e8b
+  configs/10clients/fedasmu.yaml: 6d0b3b9c291f62cefb3f77e95ecd6b4b2eb64ee7b1d744d9acbc0d652c13f4dc
+  configs/10clients/fedasync.yaml: 2596300d13b69cdaa3c59d0a59988750e2b42d3efdf9afe761f62fd8c771bc22
+  configs/10clients/fedavg.yaml: bbe7c8cb937efe256ad325b5ac83a5e38070fcd395190d9e71a2d970718dd7c4
+  configs/10clients/fedbuff.yaml: b191e1c352bd851ba44ec30063a1f283a5db50bd451a7e708e5b277b42793b1c
+  configs/10clients/fedcompass.yaml: c73fb4a82ce7ab60441b8afd3bea4e789566d9b7c9e569e28fc88df723359558
+  configs/10clients/fedprox.yaml: 0f5739f1701438952cfe5aa94abeee575caf06ef106681d5847cf4100244e03f
+  configs/10clients/local.yaml: 4b2cdeb3b6a74f2a5881ca647537ed902383711f20a788bc632d8d567ac3c6f6
+  configs/10clients/masfl.yaml: 4bfb643467e710b67ed90a69ba04124eb460197fce2cd949a7f227ae7684a949
+  configs/10clients/nufilt_lora.yaml: 655b00467defdf2ac6f00b615bf540e9e6e5ad8411bb6def09fb169c02b30730
+  configs/10clients/opcm_lora.yaml: dc1b73d5e25bbb112e25c01e4fe9b9f69526638ae4aab940da4394712d6f15cb
+  configs/10clients/orthofl.yaml: bf2fe8df4e1a2d4f48e89ffd2e034af8501f1f1c5c42a8325e722fca0f62c2b8
+  configs/10clients/ours.yaml: d48638dd9fb042be69bfad2b4a1c4b006acc501aa05005432d35bde9995b3584
+  configs/10clients/ours_hc.yaml: 7ee4548e9f108b9d316e221a5c2c534fb8c6910dffa232e42c395885f4addaf8
+  configs/10clients/pilot.yaml: 09bf93d5a595777db6ef55b4fd145291762964f5c2e77a5f513ec8fbe7796977
+  configs/10clients/unifed_lora.yaml: 60fc3c7fe061aff72717ee225c8957263b58290e18b344e880d42ef517027773
+  configs/2clients/aced.yaml: 203ab12e458ab6316f73d16f41b21925992865a513c3322fdb3553dd8b936ec3
+  configs/2clients/adamasfl.yaml: f8e53e9f216726f71fed9a0eac88098f986d8e2e4e90e5ce417d13879db80a42
+  configs/2clients/c2afcl.yaml: 387efe1b5d7f2604aedeedd0188832259ed9e4e09906d32f6550c47ff585e3aa
+  configs/2clients/ca2fl.yaml: d4ce939c23e1cb5bc97c8a6dca7f49a7273ea1b20100ca245bc0a1d75d9bc86f
+  configs/2clients/dop_lora.yaml: c80cc8c57ed491fe38b92497789bd07a3ae0854d5741294cc0400a21ce271fe6
+  configs/2clients/fedadam.yaml: bdb7bb49ad15abc3819dacab942a3cba3758f79d3d4bed4d6f45245bdf1dc4a1
+  configs/2clients/fedasmu.yaml: 03cacc81c688340b4cbfd92fa85d3b86d5ee02f8f168623b4c1424baaacdf790
+  configs/2clients/fedasync.yaml: 0e3dd4cf5cc726bc85b00c622e20445880957245b7b609ce75a9aa343ffd9677
+  configs/2clients/fedavg.yaml: a58e3a65ceedc2b58975e19d96ba7b99385b1cada1d585792faa109f682ec969
+  configs/2clients/fedbuff.yaml: c3f72b282b7666cf8a9c6a97be68d2438eb0e5e254f597b009a8723bfccb5bb0
+  configs/2clients/fedcompass.yaml: 022cd3ea53a8323d37ab5b86f885febb7d310357fb1c3ea00f36d74bc52e21c7
+  configs/2clients/fedprox.yaml: 1e9d3718661acadfe5ef57669b9a525d0eeb69ef636d64157ca4a644654fe67f
+  configs/2clients/local.yaml: 9ec86abf9ebad67b7a94e00f4fcc18d6a2817592936d97fbcec5fe391e02e41c
+  configs/2clients/masfl.yaml: c1732a0cb0b294fb256f089a7debf96d655d2bfa37b04b66fd999813c5871a8b
+  configs/2clients/nufilt_lora.yaml: 5fd7db765c1d9f145086086041fe475a17f26c4e8f20a1f2ab52a93dda1c5a61
+  configs/2clients/opcm_lora.yaml: 0177f8948cfb7c835a28036bc92b980c2320689167e634e01251428f7930c46c
+  configs/2clients/orthofl.yaml: 14046754d61e5f85483a288e03535c8a4059c908b98decead3fe206b99545ed2
+  configs/2clients/ours.yaml: f6abebd158ca046045ff62ae46e5ac75dfbcab21d95ad7737ce8b49eef67a23a
+  configs/2clients/ours_hc.yaml: 591c694bb0e61796de2e5cd0150ab6dbb474ad039773af36fb913e6306501473
+  configs/2clients/pilot.yaml: 7fa790f4ab0afbbdd826d9c1a9970cd1630e834f4203728adc7f3c11fcde1586
+  configs/2clients/unifed_lora.yaml: 0468164d34d6e2edf4dcc51c511ac01bf765b158c8184eafb4d83fe829593e91
+  configs/5clients/aced.yaml: 16682b379829a71b9f25cc67114e64011c652cd7029b2b32828a533739621a39
+  configs/5clients/adamasfl.yaml: 584d2d1cb3d74ff84c70e25a5e38467691e708c75e2f0498e5c4515b1a977a6c
+  configs/5clients/c2afcl.yaml: c7acca8b275db7196d98e8315fbee1ea9a9f9ac63fc1a0fa705fb35ac20240cc
+  configs/5clients/ca2fl.yaml: c8a2acae3d0da10f659aae7d3f7cbffa54738080b263256987f2c123755fd885
+  configs/5clients/dop_lora.yaml: 925a3bf99c9e35c55c9aba3448cb6383cf51a442579cd4a5130570652cd573d2
+  configs/5clients/fedadam.yaml: ba2f5941dd7255589f5dcaad2c06a4e353b5bb3eb1302e03526748a41e6b277c
+  configs/5clients/fedasmu.yaml: 7acfcfe993f52e4ef501959ee30758cd23d29157607a4fdd6145e35340ff6706
+  configs/5clients/fedasync.yaml: eb60272283532e89359683a3368ac284e25dd9c9ccb6354367419ca9e8cbe721
+  configs/5clients/fedavg.yaml: 7d5f91ebd636c7ff49e446087ee27d6f5434484512cfab4bd0d63db1f45ee680
+  configs/5clients/fedbuff.yaml: 965083db9d97e2719504f45e7c367d01a748e9e10c502136401dfa88f50ae80b
+  configs/5clients/fedcompass.yaml: 525be7022148f481440300720fe8eaec025cc942bc33b0662630f2e32c169168
+  configs/5clients/fedprox.yaml: 79a79e5b5b97b549cc670e07cf0de3be593a7a29e284b65e34f7ae0b0b1fac8b
+  configs/5clients/local.yaml: 949fbcdf57ba26371cb5ac35c5452dd3d366a60b4b2c8ad73985be0687cafd10
+  configs/5clients/masfl.yaml: 0795646992626174aff5318c8faaf99e01f29c59b5015031769f07c40ad225f5
+  configs/5clients/nufilt_lora.yaml: 723fb991d32321902e34c1bdd68c681f2d64093a128629d877c92a39668ec599
+  configs/5clients/opcm_lora.yaml: 28df54d228499ee484b924029c28089d4b27af1ba7c7223fb1db70eab3cc467f
+  configs/5clients/orthofl.yaml: 26fdbfedc15f51f00ec282181460310cfdd5d2c404d02be2b95b6b0dda467e25
+  configs/5clients/ours.yaml: 704bb80f9118fa0bf0c6002c2c27c3b901813795d34bf7ed294f333820b506bb
+  configs/5clients/ours_hc.yaml: a944cbf52b705dd64cfee6ca8fd2dbeed569a6b250b3cde32e95989dd9260615
+  configs/5clients/pilot.yaml: 68f100fe78d45255f03bda5d51d797e8bf97000023bb02cc1dfbd6502db4d6fe
+  configs/5clients/unifed_lora.yaml: 6e13388f3705f22cf3b2ac5cbb41314f7dc9b9f4861883d409fa4523a86d4a8d
+  plans/10clients/async_train_plan.json: cc1c2f05b51f4649ae203e3e65a4a89305bf99d00b5cde44b23ecfaca102e982
+  plans/10clients/system_profile.json: ac17e5a6eb467062989d278441a485911279651138a82331addaa20da4d72257
+  plans/2clients/async_train_plan.json: 100f9ae5b7d45320452a09f078cdf94c17edf2441025aa1291395ca72a2f01ff
+  plans/2clients/system_profile.json: 898dea066ac75d2b8fa77d739ebd78f4840787c87b042afdec8c613e90c61c71
+  plans/5clients/async_train_plan.json: fbac8cffb66b85b0753bf60b465be146c9d40ae56d1252c58c4da8e1b1eb274e
+  plans/5clients/system_profile.json: bb0d33a837f856f6e055fb021a137811431b081bb1eba94cdc567692b9d27ee2

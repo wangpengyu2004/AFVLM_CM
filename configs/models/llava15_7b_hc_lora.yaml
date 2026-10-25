@@ -1,0 +1,6 @@
+# Candidate capacity only; local retained capacity is learned, never forced to this rank.
+inherits: llava15_7b_lora.yaml
+model:
+  lora:
+    r: 32
+    alpha: 64

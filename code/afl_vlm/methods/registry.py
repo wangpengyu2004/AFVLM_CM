@@ -34,6 +34,7 @@ def _load_builtins() -> None:
         standard,
     )
     from afl_vlm.methods.continual_merge import method as continual_merge  # noqa: F401
+    from afl_vlm.methods.ours_hc import method as ours_hc  # noqa: F401
     from afl_vlm.methods.pilot import method as pilot  # noqa: F401
     from afl_vlm.methods.unifed_lora import method as unifed_lora  # noqa: F401
 

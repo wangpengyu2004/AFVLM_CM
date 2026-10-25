@@ -1,5 +1,23 @@
 # AFVLM-CM
 
+新增独立方法 `ours_hc`：每次本地训练重新学习 Hard Concrete 门控，固定尾部统计模块
+敏感度，按原始索引上传稀疏 LoRA 增量；服务器使用选中支持上的功能可靠性、任务频率
+和模块级历史 EMA 融合，最终仍评估完整全局模型。不改原 `ours`，也不加入默认 baseline
+批次。配置生成和启动与其他普通方法一致，使用 `generate_system_profiles.py` 和
+`bash scripts/run_one.sh ours_hc 2 PROFILE`。三档配置、八卡启动、诊断导出及实现边界见
+[ours_hc 方法说明](docs/ours_hc.md)。本地已生成当前68k数据、八卡参考的完整profile：
+
+```bash
+bash scripts/run_one.sh ours_hc 2 hc_r32_e1_bs4_ga4_r10_s42
+```
+
+将 `2` 改成 `5` 或 `10` 即运行对应客户端规模。此profile包含所有普通方法的三档配置，
+新方法默认候选rank32，其他方法保留各自配置。将来修改参数后仍使用原生成命令：
+
+```bash
+python tools/generate_system_profiles.py --profile 新的profile名称
+```
+
 新增独立的 **LoRA rank 容量趋势实验**：cls/caption/vqa 各两个既有客户端，分别从基础
 模型训练 rank 2/4/8；每次八卡 DDP 共同训练一个客户端，连续 **5 epochs**，每轮评估并
 只保存评估指标、loss、配置和画图用 CSV，不保存完整预测或 LoRA 参数。
@@ -211,13 +229,13 @@ configs/
 
 | 目录 | 作用 | 是否应修改/删除 |
 |---|---|---|
-| `configs/methods/` | 各算法的可编辑参数源；54 个常规入口与3个独立 one-shot 入口通过 `inherits` 读取；两种生成器分别解析对应方法参数 | 可以按实验需要修改；不能删除 |
+| `configs/methods/` | 各算法的可编辑参数源；63 个常规入口与3个独立 one-shot 入口通过 `inherits` 读取；两种生成器分别解析对应方法参数 | 可以按实验需要修改；不能删除 |
 | `plans/afvlm_cm/` | 默认兼容运行使用的 system profile 与 TrainPlan；保证 `bash scripts/run_one.sh <method> <setting>` 和原始实验 YAML 仍可直接运行 | 不要手工修改；当前不能删除 |
 | `experiment_profiles/` | 已冻结的完整配置、system profile 和 TrainPlan 快照，用于正式实验复现和切换旧实验 | 不要修改或覆盖；新参数应创建新 profile |
 
 因此，平时应修改 `configs/base.yaml`、`configs/models/` 或 `configs/methods/`，然后生成新的 `experiment_profiles/<name>/`。正式运行优先指定 profile；`plans/` 仅作为默认兼容入口保留。
 
-同一规模的普通方法继承相同模型、LoRA、客户端 AdamW、学习率、本地 epoch、batch size、随机种子、数据与评估配置。算法必要例外须单独披露：MasFL/AdaMasFL 用 SGD，FedCompass 动态分配本地步数，Pilot 增加视觉适配器，UniFed-LoRA 使用客户端生成参数，FedASMU额外获取新全局状态并计算客户端目标反馈；不能宣称这些方法具有完全相同的参数量或成本。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。新 profile 保存完全解析后的 54 份实验配置、三档 system profile/TrainPlan、文件哈希和唯一输出路径；历史 profile 仍保留原状，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
+同一规模的普通方法继承相同模型、LoRA、客户端 AdamW、学习率、本地 epoch、batch size、随机种子、数据与评估配置。算法必要例外须单独披露：MasFL/AdaMasFL 用 SGD，FedCompass 动态分配本地步数，Pilot 增加视觉适配器，UniFed-LoRA 使用客户端生成参数，FedASMU额外获取新全局状态并计算客户端目标反馈；不能宣称这些方法具有完全相同的参数量或成本。`plans/afvlm_cm/{2,5,10}clients/` 保留最初的默认系统画像和 TrainPlan；新的正式实验应创建不可变的命名 profile。新 profile 保存全部普通方法的解析后实验配置（当前63份）、三档 system profile/TrainPlan、文件哈希和唯一输出路径；历史 profile 仍保留原状，因此以后修改 `base.yaml` 或方法配置不会改变旧实验。除 FedCompass 的本地工作量分配外，同一 profile 内的异步算法使用相同到达条件。
 
 普通方法的本地训练量只由 `training.local_epochs` 控制，不再同时设置通用的 `base_local_steps`。TrainPlan 中记录的 `local_steps` 是根据客户端样本数、batch size、梯度累积和 `local_epochs` 推导出的预计优化器步数，只用于虚拟耗时和算法钩子，不会截断普通客户端训练。FedCompass 是唯一例外：其计算能力感知调度器必须动态分配本地迭代，因此使用 `min_local_steps` / `max_local_steps` 作为方法专属边界。
 
@@ -468,7 +486,7 @@ python tools/generate_system_profiles.py \
   --profile e2_bs1_ga4_r20_s42
 ```
 
-此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部 54 份解析后配置；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
+此时不要传 `--reuse_plans_from`。生成器会读取服务器现有的 `data/AFVLM_CM/partitioned/`，为 2、5、10 clients/task 三档分别生成 system profile 与 TrainPlan，并保存全部普通方法的解析后配置（当前63份）；不会改写 `plans/afvlm_cm/` 或任何旧 profile。
 
 如果需要新的随机种子，可显式指定：
 
@@ -1041,7 +1059,7 @@ one-shot10epoch与10轮×1epoch只是相近样本遍历预算，优化器连续�
 
 ## 静态工程检查
 
-以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、63 个配置（60常规+3个one-shot）、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
+以下命令只检查 Python 语法/导入、YAML 解析与继承、注册表、66 个配置（63常规+3个one-shot）、路径以及原始分区完整性；不会加载 LLaVA、下载权重或启动训练：
 
 ```bash
 python -m compileall -q code scripts tools

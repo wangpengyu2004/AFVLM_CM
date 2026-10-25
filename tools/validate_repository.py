@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import sys
@@ -40,12 +41,14 @@ EXPECTED_METHODS = (
     "pilot",
     "unifed_lora",
     "ours",
+    "ours_hc",
     "opcm_lora",
     "dop_lora",
     "nufilt_lora",
     "opcm_oneshot",
 )
 LEGACY_METHODS = set(EXPECTED_METHODS) - {
+    "ours_hc",
     "opcm_lora", "dop_lora", "nufilt_lora", "orthofl", "c2afcl", "opcm_oneshot", "ca2fl", "aced",
 }
 SETTINGS = (2, 5, 10)
@@ -220,7 +223,16 @@ def main() -> None:
                     "training",
                     "evaluation",
                 ):
-                    if candidate[section] != reference[section]:
+                    compared = candidate[section]
+                    if method == "ours_hc" and section == "model":
+                        compared = copy.deepcopy(compared)
+                        # This independent capacity-selection method deliberately
+                        # starts from a configurable candidate R, not baseline r=8.
+                        if compared["lora"]["alpha"] != 2 * compared["lora"]["r"]:
+                            errors.append("ours_hc candidate LoRA scaling must remain alpha/r=2")
+                        for key in ("r", "alpha"):
+                            compared["lora"][key] = reference["model"]["lora"][key]
+                    if compared != reference[section]:
                         errors.append(f"{method}/{setting} changes shared {section} settings")
                 for key in (
                     "rounds",

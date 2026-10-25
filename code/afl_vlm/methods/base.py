@@ -139,6 +139,13 @@ class Method(ABC):
     def prepare_upload(self, update: Update, context: ClientContext) -> Update:
         return update
 
+    def pack_local_update(self, update: Update, context: ClientContext) -> Update:
+        """Optional wire encoding before worker transport; defaults to identity.
+
+        Server-owned prepare_upload still runs exactly once in the parent.
+        """
+        return update
+
     def client_runtime_state(self, context: ClientContext) -> dict[str, Any]:
         """Export only state required by local hooks for one dispatched job.
 

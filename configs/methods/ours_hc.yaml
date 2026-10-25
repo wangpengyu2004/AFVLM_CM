@@ -1,0 +1,27 @@
+# User's new independent method, NOT a change to methods/ours.yaml.
+method:
+  name: ours_hc
+  params:
+    # Configurable engineering defaults; no claim of tuned/optimal hyperparameters.
+    # Sum of active probabilities, not mean, not an L1 penalty on deterministic gates.
+    l0_lambda: 0.0001
+    gate_temperature: 0.6666666666666666
+    gate_lower: -0.1
+    gate_upper: 1.1
+    gate_initial_active_probability: 0.9
+    gate_learning_rate: 0.2
+    gate_warmup_steps: 1
+    # Reserve the last 20% of EXISTING optimizer steps, never add training steps.
+    fixed_tail_fraction: 0.2
+    sensitivity_uniform_mix: 0.75
+    gamma: 1.0
+    frequency_window_size: 18
+    frequency_power: 0.5
+    frequency_min: 0.5
+    frequency_max: 1.5
+    history_beta: 0.9
+    history_lambda: 1.0
+    eps: 0.000000000001
+    min_update_energy: 0.0000000000000001
+federation:
+  mode: asynchronous

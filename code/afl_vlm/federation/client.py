@@ -135,4 +135,4 @@ class FederatedClient:
                 "federated_parameter_scope": "lora_and_configured_modules",
             },
         )
-        return update
+        return method.pack_local_update(update, context)
