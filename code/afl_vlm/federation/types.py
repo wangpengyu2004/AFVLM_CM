@@ -121,3 +121,5 @@ class MethodCapabilities:
     requires_arrival_objective_feedback: bool = False
     # Standalone comparison: one common-origin job/client, offline final merge.
     requires_one_shot: bool = False
+    # Private pre-Plan capacity calibration; coordinated DDP/serial executor only.
+    requires_client_calibration: bool = False

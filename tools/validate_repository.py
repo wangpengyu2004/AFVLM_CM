@@ -42,12 +42,14 @@ EXPECTED_METHODS = (
     "unifed_lora",
     "ours",
     "ours_hc",
+    "ours_router",
     "opcm_lora",
     "dop_lora",
     "nufilt_lora",
     "opcm_oneshot",
 )
 LEGACY_METHODS = set(EXPECTED_METHODS) - {
+    "ours_router",
     "ours_hc",
     "opcm_lora", "dop_lora", "nufilt_lora", "orthofl", "c2afcl", "opcm_oneshot", "ca2fl", "aced",
 }
@@ -224,7 +226,7 @@ def main() -> None:
                     "evaluation",
                 ):
                     compared = candidate[section]
-                    if method == "ours_hc" and section == "model":
+                    if method in {"ours_hc", "ours_router"} and section == "model":
                         compared = copy.deepcopy(compared)
                         # This independent capacity-selection method deliberately
                         # starts from a configurable candidate R, not baseline r=8.

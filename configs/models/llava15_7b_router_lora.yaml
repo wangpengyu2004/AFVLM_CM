@@ -1,0 +1,5 @@
+inherits: llava15_7b_lora.yaml
+model:
+  lora:
+    r: 32
+    alpha: 64

@@ -73,6 +73,11 @@ class Method(ABC):
         """Observe the final virtual Plan without changing scheduling or local work."""
         return None
 
+    def calibrate_clients(self, model: Any, clients: Mapping[str, Any],
+                          initial_state: LoRAState, train_config: Any, output: Any) -> dict:
+        """Optional pre-Plan local work, never counted as server/client updates."""
+        return {}
+
     def validate_runtime(self) -> None:
         """Fail early when a registered method is intentionally unavailable."""
         return None

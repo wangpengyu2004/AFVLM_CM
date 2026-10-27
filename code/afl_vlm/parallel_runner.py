@@ -227,6 +227,11 @@ def execute_parallel(config: dict[str, Any]) -> dict[str, Any]:
     validate_config(config)
     method = create_method(config["method"]["name"], config["method"].get("params", {}))
     method.validate_runtime()
+    if method.capabilities.requires_client_calibration:
+        raise ValueError(
+            "Private calibrated clients require the coordinated executor; "
+            "launch this method with scripts/run_one.sh (client_ddp), not a worker pool"
+        )
     import numpy as np
 
     runtime = config["runtime"]

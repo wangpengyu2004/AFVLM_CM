@@ -494,6 +494,22 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 "The persisted TrainPlan does not match the system profile task compute factors"
             )
     method.configure_schedule(plan)
+    if method.capabilities.requires_client_calibration:
+        calibration = method.calibrate_clients(
+            model, clients, server.state,
+            TrainConfig(
+                local_epochs=int(training["local_epochs"]),
+                batch_size=int(training["batch_size"]),
+                gradient_accumulation=int(training["gradient_accumulation"]),
+                learning_rate=float(training["learning_rate"]),
+                max_text_length=int(training["max_text_length"]), seed=int(seed),
+                distributed_rank=rank, distributed_world_size=world_size,
+                batch_size_scope=str(training.get("batch_size_scope", "per_device")),
+                reference_world_size=int(training.get("reference_world_size", 8)),
+                optimizer=str(training.get("optimizer", "adamw")),
+            ), output,
+        )
+        _write_json(output / "client_calibration.json", calibration)
     if method.capabilities.requires_initial_gradient:
         import time
 

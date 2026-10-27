@@ -1,0 +1,33 @@
+# Latest independent user design. These are configurable engineering initial values.
+method:
+  name: ours_router
+  params:
+    # One real training probe per client, before the asynchronous Plan.
+    probe_local_epochs: 1
+    capacity_energy_threshold: 0.95
+    capacity_min_rank: 1
+    capacity_max_rank: null
+    # A private MLP per client; input heads shared across compatible modules.
+    router_hidden_size: 32
+    router_learning_rate: 0.001
+    router_label_beta: 0.9
+    router_huber_delta: 1.0
+    router_label_min: 0.000000000001
+    router_max_grad_norm: 1.0
+    sensitivity_warmup_steps: 1
+    sensitivity_uniform_mix: 0.75
+    gamma: 1.0
+    frequency_window_size: 18
+    frequency_power: 0.5
+    frequency_min: 0.5
+    frequency_max: 1.5
+    history_beta: 0.9
+    history_lambda: 1.0
+    # Inherit the current module-level ended-task selected-layer SUM protection.
+    history_age_enabled: true
+    history_age_boost: 3.0
+    history_age_time_scale: 18.0
+    eps: 0.000000000001
+    min_update_energy: 0.0000000000000001
+federation:
+  mode: asynchronous

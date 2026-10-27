@@ -242,7 +242,7 @@ class ConfigurationAndIsolationTests(unittest.TestCase):
     def test_pretransport_hook_is_identity_for_every_existing_method(self):
         item, ctx = incoming(context()), context()
         for name in method_names():
-            if name != "ours_hc":
+            if name not in {"ours_hc", "ours_router"}:
                 self.assertIs(create_method(name).pack_local_update(item, ctx), item, name)
 
     def test_phase_partition_uses_existing_budget_and_keeps_joint_and_fixed_stages(self):
