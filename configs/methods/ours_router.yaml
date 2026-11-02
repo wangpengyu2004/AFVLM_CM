@@ -1,13 +1,27 @@
-# Latest independent user design. These are configurable engineering initial values.
+# 2026-11-02 design: probe warm-up + exact recent conflict + uniform eta*rho.
+# Legacy/overlap_switch frozen profiles preserve their original algorithms.
 method:
   name: ours_router
   params:
-    # One real training probe per client, before the asynchronous Plan.
+    rank_aggregation_mode: conflict_router
+    # Each task keeps its last L accepted uploads; age is global accepted updates.
+    conflict_per_task_window: 3
+    conflict_max_age: 24
+    # Engineering starting value from the design discussion, not a tuned optimum.
+    conflict_penalty: 0.3
+    conflict_min_norm: 0.000000000001
+    # One coefficient for every uploaded module/component, no extra hard cap.
+    server_step_size: 1.0
+    # Full-rank probe also warms the private router. Task-balanced factor
+    # averaging forms a common version-zero LoRA, outside the formal Plan.
     probe_local_epochs: 1
     capacity_energy_threshold: 0.95
     capacity_min_rank: 1
     capacity_max_rank: null
-    # A private MLP per client; input heads shared across compatible modules.
+    # One private MLP per client AND Transformer layer. Q/K/V/O share only
+    # within that layer. Keep the original input -> hidden32/SiLU -> scalar.
+    # Missing router_sharing in old profiles preserves dimension sharing.
+    router_sharing: layer
     router_hidden_size: 32
     router_learning_rate: 0.001
     router_label_beta: 0.9
@@ -17,16 +31,6 @@ method:
     sensitivity_warmup_steps: 1
     sensitivity_uniform_mix: 0.75
     gamma: 1.0
-    frequency_window_size: 18
-    frequency_power: 0.5
-    frequency_min: 0.5
-    frequency_max: 1.5
-    history_beta: 0.9
-    history_lambda: 1.0
-    # Inherit the current module-level ended-task selected-layer SUM protection.
-    history_age_enabled: true
-    history_age_boost: 3.0
-    history_age_time_scale: 18.0
     eps: 0.000000000001
     min_update_energy: 0.0000000000000001
 federation:

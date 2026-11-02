@@ -1,17 +1,27 @@
 # AFVLM-CM
 
-新增最新设计的独立方法 **`ours_router`**：每客户端一次谱能量容量探测，私有MLP在虚拟
-下载时选定top-k，固定小LoRA进行本地训练；用已有梯度监督router，经验只影响下次选择。
-保留旧 `ours`、`ours_hc`，沿用统一全局评估和原Plan。参数与完整说明见
+新增最新设计的独立方法 **`ours_router`**：完整LoRA预估时同步训练私有MLP，按谱能量
+确定客户端各模块容量；任务均衡合成共同全局起点，再在虚拟下载时按“贡献评分减近期
+跨任务冲突”选top-k。固定紧凑LoRA训练，上传统一使用 `alpha=eta*rho` 增量聚合。
+2026-11-02新版每任务保留最近3次成功上传、超过24次全局成功聚合失效；用服务器实际
+功能变化的低秩因子和缓存Gram精确计算方向，不用随机投影。冲突只影响后续选择，
+不再叠加频率、历史分母或结束年龄项。旧legacy/overlap_switch冻结配置仍用原模式。
+保留旧 `ours`、`ours_hc`，
+沿用统一全局评估和原Plan。参数与完整说明见
 [ours_router方法](docs/ours_router.md)。与其他普通方法使用同一个生成器和启动入口：
 
+当前 Router 按客户端和 Transformer 层独立，同层 Q/K/V/O 共享，保留 `8194→32→1`
+结构。训练记录逐模块 Spearman、Top-k/Top-1 重合率及有效性，诊断导出新增
+`router_ranking.csv`。配置与 Plan 由用户在服务器生成，本地不预生成实验 profile。
+
 ```bash
-python tools/generate_system_profiles.py --profile router_r32_e1_bs4_ga4_r10_s42
-bash scripts/run_one.sh ours_router 2 router_r32_e1_bs4_ga4_r10_s42
+python tools/generate_system_profiles.py --profile router_conflict_r32_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours_router 2 router_conflict_r32_e1_bs4_ga4_r10_s42
 ```
 
 生成器会包含所有普通方法、2/5/10三档的完整配置；将启动命令中的2换成5或10即可。
-容量探测在本方法正式Plan之前自动执行，单独记录成本，不需要另一套配置生成器。
+容量探测、Router预热和共同初始化在本方法正式Plan之前自动执行，单独记录成本，
+不计正式上传/版本，不需要另一套配置生成器。
 旧profile保持原样，新增方法需要生成新profile；其他方法不会执行这项探测。
 
 新增独立方法 `ours_hc`：每次本地训练重新学习 Hard Concrete 门控，固定尾部统计模块

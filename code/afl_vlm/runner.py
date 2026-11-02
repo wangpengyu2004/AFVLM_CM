@@ -509,6 +509,7 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
                 optimizer=str(training.get("optimizer", "adamw")),
             ), output,
         )
+        server.initialize_from_calibration()
         _write_json(output / "client_calibration.json", calibration)
     if method.capabilities.requires_initial_gradient:
         import time
@@ -702,19 +703,27 @@ def execute_serial(config: dict[str, Any]) -> dict[str, Any]:
         client_method = create_method(method.name, method.params)
         client_method.load_client_runtime_state(job_method_states.pop(event.event_id), context)
         fresh_snapshot = logical_fresh_states.pop(event.event_id, None)
-        update = clients[event.client_id].train_prepared(
-            model=model,
-            method=client_method,
-            global_state=base_state,
-            start_state=start_state,
-            context=context,
-            train_config=train_config,
-            group_id=event.group_id,
-            group_size=group_sizes.get(event.group_id),
-            fresh_state_provider=(lambda snapshot=fresh_snapshot: snapshot)
-            if fresh_snapshot is not None
-            else None,
-        )
+        try:
+            update = clients[event.client_id].train_prepared(
+                model=model,
+                method=client_method,
+                global_state=base_state,
+                start_state=start_state,
+                context=context,
+                train_config=train_config,
+                group_id=event.group_id,
+                group_size=group_sizes.get(event.group_id),
+                fresh_state_provider=(lambda snapshot=fresh_snapshot: snapshot)
+                if fresh_snapshot is not None
+                else None,
+            )
+        except Exception:
+            if method.capabilities.requires_job_resolution:
+                terminal = server.resolve_job(
+                    event.client_id, event.local_round, "failed", event.arrival_time
+                )
+                _append(output / "job_resolutions.jsonl", {"method": method.name, **terminal})
+            raise
         update = method.prepare_upload(update, context)
         update.metadata.update(event.metadata)
         _append(

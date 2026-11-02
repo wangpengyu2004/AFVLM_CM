@@ -78,9 +78,18 @@ class Method(ABC):
         """Optional pre-Plan local work, never counted as server/client updates."""
         return {}
 
+    def calibration_initial_state(self) -> LoRAState | None:
+        """Optional common version-zero state after calibration; ordinary methods keep None."""
+        return None
+
     def validate_runtime(self) -> None:
         """Fail early when a registered method is intentionally unavailable."""
         return None
+
+    def on_job_resolved(self, client_id: str, local_round: int, outcome: str,
+                        virtual_time: float | None = None) -> dict:
+        """Explicit terminal scheduler notification; ordinary methods do nothing."""
+        return {}
 
     def configure_local_training(self, train_config: Any) -> Any:
         """Algorithm-specific optimizer requirements; default preserves all settings."""

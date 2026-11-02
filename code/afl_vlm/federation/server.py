@@ -45,6 +45,20 @@ class FederatedServer:
             raise ValueError("Server initialization cannot count new client uploads")
         return self._apply(mutation, self.version, self.version)
 
+    def initialize_from_calibration(self) -> None:
+        """Install an opt-in common starting point without inventing a Plan upload/version."""
+        if self.version != 0 or self.received_updates != 0:
+            raise RuntimeError("Client calibration must precede all Plan updates")
+        state = self.method.calibration_initial_state()
+        if state is None:
+            return
+        if set(state) != set(self.state):
+            raise ValueError("Calibrated initialization changed the federated parameter schema")
+        candidate = StateStore(state)
+        if self.model is not None:
+            self.model.load_trainable(clone_state(state))
+        self.state_store = candidate
+
     def receive(self, update: Update) -> list[ApplyResult]:
         receive_version = self.version
         self.received_updates += 1
@@ -73,15 +87,38 @@ class FederatedServer:
                 return results
             results.extend(self._apply(item, self.version, self.version) for item in mutations)
 
+    def resolve_job(self, client_id: str, local_round: int, outcome: str,
+                    virtual_time: float | None = None) -> dict:
+        """Only the scheduler may confirm a known job will never be retried."""
+        if not self.method.capabilities.requires_job_resolution:
+            return {}
+        return self.method.on_job_resolved(client_id, local_round, outcome, virtual_time)
+
     def _apply(self, mutation: Any, receive_version: int, base_version: int) -> ApplyResult:
         if mutation.increment_version:
-            self.version += 1
-            self.state_store.put(self.version, mutation.new_state)
-            if self.model is not None:
-                self.model.load_trainable(clone_state(mutation.new_state))
+            if mutation.on_commit is not None:
+                # Opt-in transaction: do not publish a version/history before a
+                # required model copy succeeds. Existing algorithms keep their path.
+                previous = self.state if self.model is not None else None
+                if self.model is not None:
+                    try:
+                        self.model.load_trainable(clone_state(mutation.new_state))
+                    except Exception:
+                        self.model.load_trainable(previous)
+                        raise
+                next_version = self.version + 1
+                self.state_store.put(next_version, mutation.new_state)
+                self.version = next_version
+            else:
+                self.version += 1
+                self.state_store.put(self.version, mutation.new_state)
+                if self.model is not None:
+                    self.model.load_trainable(clone_state(mutation.new_state))
         self.accepted_updates += (
             len(mutation.contributing_update_ids) if mutation.applied_weight > 0 else 0
         )
+        if mutation.on_commit is not None:
+            mutation.on_commit()
         return ApplyResult(
             True,
             float(mutation.applied_weight),

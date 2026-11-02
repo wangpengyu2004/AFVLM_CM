@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +69,8 @@ class ServerMutation:
     contributing_update_ids: list[str]
     increment_version: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional small-state transaction, run only after model/state application.
+    on_commit: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -123,3 +126,4 @@ class MethodCapabilities:
     requires_one_shot: bool = False
     # Private pre-Plan capacity calibration; coordinated DDP/serial executor only.
     requires_client_calibration: bool = False
+    requires_job_resolution: bool = False

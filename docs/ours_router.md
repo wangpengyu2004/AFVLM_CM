@@ -1,194 +1,266 @@
-# ours_router：一次容量探测＋客户端私有评分器＋模块级异步融合
+# ours_router：容量预估、私有 Router 与近期任务冲突选择
 
-依据《详细讲解这篇论文的方法》对话在2026-10-27最后确认的设计实现。
-这是新方法 `ours_router`，不替换旧 `ours` 或 Hard Concrete 版本 `ours_hc`。
-最新设计不再每次学习连续门控容量：容量预先估计，私有router只负责“选哪些”。
+当前默认实现依据《详细讲解这篇论文的方法》对话在 **2026-11-02** 最后确认的设计：
+**完整预估并预热 Router → 初始化共同全局 LoRA → 贡献评分减冲突惩罚选择
+→ 紧凑 LoRA 训练 → 按陈旧度立即增量聚合 → 用实际变化更新近期方向。**
 
-## 统一配置生成与启动
+最新窗口为 **每任务最近 L=3 次成功聚合上传，并且记录年龄不超过 T=24 次全局成功聚合**。
+不是每客户端三次，不是每分量三次，也不是全局最近18次。
 
-参数源：
+此版本仍注册为 `ours_router`。旧 `ours`、`ours_hc` 和其他基线保留。
+源码不自动迁移旧冻结配置：缺少模式参数时仍为 legacy；显式
+`overlap_switch` 仍运行前一版集合开关/历史保护。新模式为 `conflict_router`。
 
-- `configs/base.yaml`：共有训练、系统与评估设置。
-- `configs/models/llava15_7b_router_lora.yaml`：本方法候选容量，默认R32、alpha64。
-- `configs/methods/ours_router.yaml`：探测、router和服务器融合系数。
-- `configs/experiments/llava/afvlm_cm/{2,5,10}clients/ours_router.yaml`：三个继承模板。
+## 配置与直接启动
 
-在服务器项目环境、仓库根目录使用原生成器：
+共同训练参数在 `configs/base.yaml`；候选容量在
+`configs/models/llava15_7b_router_lora.yaml`；本方法参数在
+`configs/methods/ours_router.yaml`。默认候选 rank32、LoRA alpha64；
+默认本地训练由 base 控制，当前 epoch1、每卡 batch4、梯度累积4、学习率2e-5、
+文本上限2048。八卡有效批量128，原训练循环、采样、DDP和多模态 collator 不变。
 
-```bash
-python tools/generate_system_profiles.py \
-  --profile router_r32_e1_bs4_ga4_r10_s42
-```
-
-一次生成**所有普通方法、三档设置**的完整配置（当前22种方法×3=66份），以及三档
-system profile、TrainPlan和manifest。独立one-shot协议继续由原来的one-shot生成器处理。
-profile名称只是标识，实际训练参数来自当前配置源。默认自动识别可见GPU；CPU电脑上
-仅离线生成配置时可以显式传 `--reference_world_size 8`，无需改base里的GPU参数。
-
-若要与已有实验复用完全相同的系统条件和虚拟Plan，在数据和本地训练预算兼容时：
+在服务器项目根目录、已配置的 Python 环境中生成新的不可变 profile：
 
 ```bash
-python tools/generate_system_profiles.py \
-  --profile router_r32_reuse_e1_bs4_ga4_r10_s42 \
-  --reuse_plans_from hc_r32_e1_bs4_ga4_r10_s42
+python tools/generate_system_profiles.py --profile router_conflict_r32_e1_bs4_ga4_r10_s42
 ```
 
-不会改旧profile。参数改变后应创建新名称，不编辑已经运行的冻结配置。
+生成所有普通方法在2/5/10三档的完整配置，以及 system profile、TrainPlan、manifest。
+profile 名称只是标识，不会代替 YAML 设置参数。生成前检查 base，勿仅修改名字。
+离线无 GPU 的电脑生成八卡参考配置时，可额外传 `--reference_world_size 8`；
+服务器默认自动识别可见 GPU，无需在 base 手填卡数。
 
-选择一个规模启动；启动器自动让全部可见GPU共同训练一个客户端：
+数据、epoch、batch等预算未变时，可以复用既有 Plan：
+在同一生成命令末尾加 `--reuse_plans_from 你的旧profile名称`。
+新算法不要求更改虚拟系统条件；不得覆盖旧 profile，不能把旧模式配置直接当成新方法。
+准备阶段的额外训练和初始化不属于正式 Plan。
+
+选择一个规模运行即可，无需另一套生成器或 torchrun 命令：
 
 ```bash
-bash scripts/run_one.sh ours_router 2 router_r32_e1_bs4_ga4_r10_s42
-bash scripts/run_one.sh ours_router 5 router_r32_e1_bs4_ga4_r10_s42
-bash scripts/run_one.sh ours_router 10 router_r32_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours_router 2 router_conflict_r32_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours_router 5 router_conflict_r32_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours_router 10 router_conflict_r32_e1_bs4_ga4_r10_s42
 ```
 
-如使用复用Plan的profile，将上述最后一个参数换成对应名称。YAML中的
-`backend: client_parallel`配合`executor_policy: capability`是统一入口，能力选择结果为
-`client_ddp`。不要强制改为每卡一个客户端：此版私有router跨参与留在协调执行器中，
-手工强制worker-pool会提前报错。八卡时B4/G4有效批量128；参考预算和原DDP训练函数不变。
-也支持现有serial协调执行器，但正式八卡实验用上面的run_one入口。
-serial模式要求整份模型在一张GPU上，不使用跨卡的device_map自动切分。
+启动器按 capability 自动选择 client_ddp，全部可见 GPU 共同训练一个客户端。
+YAML 的 client_parallel + executor_policy: capability 是统一入口，不表示本方法实际
+使用每卡一个客户端。私有 Router 需要协调执行器，不能强制改成 worker pool。
+普通生成器、run_one、数据、评估协议及正式 Plan 的起始/到达顺序均保持原设计。
 
-## 1．一次性估计每个客户端、每个模块的容量
+## 1．一次完整预估与共同初始化
 
-正式Plan开始前，每个客户端从**相同初始全局LoRA**独立训练一次探测LoRA。
-默认1个本地epoch，训练集、学习率、batch、梯度累积和主训练相同；完成后恢复初始
-参数，不把探测权重聚合进服务器，不生成正式上传、不增加server_version。
-通常PEFT初始化为A随机、B零，所以初始有效更新BA=0；不会把A也置零。
-
-对每个模块估计有效更新 `kappa*B_probe*A_probe` 的谱能量，选满足
-`sum(sigma[:r]^2)/sum(sigma^2) >= capacity_energy_threshold` 的最小整数r，再施加上下界。
-默认阈值0.95、最小1、最大不超过服务器候选R，允许任意整数，不固定为2/4/8等档位。
-若达到上限仍不满足阈值，或探测更新能量为零，会明确记录threshold_met/energy_valid，
-零能量回退最小容量；不能把回退解释为已估计最优容量。
-
-用 `QR(B)` 与 `QR(A.T)` 的小核心 `R_B*R_A.T` 求奇异值，不物化4096×4096的BA，
-得到的非零奇异谱与完整BA一致。这里只用谱确定数量，**不旋转全局因子、不把奇异方向
-当成全局分量编号**。不运行多个rank对照，不做压缩后额外前向检查。
-各客户端所有模块的容量在此次正式运行中保持固定。
-
-探测是实质性的额外算法开销，单独记录在`client_calibration.json`和
-`capacity_calibration.jsonl`。虚拟Plan时间不包含它；论文需要额外报告探测optimizer
-steps和wall time。steps按协同DDP任务计，不再乘GPU数。不会为其他baseline悄悄增加预算。
-
-## 2．每次虚拟下载时选择分量，本次集合不变
-
-客户端保留私有MLP，对每个候选分量输入：
+每个客户端从同一初始 LoRA 独立训练完整候选 rank，默认一个本地 epoch，仅用训练集。
+在每个完整 optimizer step，读取已累积且同步的、更新前的 A/B 和梯度：
 
 ```text
-x_j = concat(a_j/max(||a_j||,eps), b_j/max(||b_j||,eps), ||a_j||, ||b_j||)
-s_j = MLP_client(x_j)                 # 无sigmoid/softmax，允许负数
-S = topk(s, calibrated_capacity)
+u_j = -sum(b_j * grad_b_j)
+Feature_j = concat(a_j/max(norm(a_j),eps), b_j/max(norm(b_j),eps),
+                   norm(a_j), norm(b_j))
 ```
 
-同一客户端对输入/输出维度兼容的模块共享MLP；不同维度使用独立输入头。默认一层
-hidden32的SiLU MLP和线性实数输出。它不输入任务ID、样本或梯度；梯度只用于制作标签。
-未获得有效监督的冷router随机选择指定数量的分量，客户端独立、可复现。
-晚加入的冷router也用随机选择，但全局LoRA已非零时不声称各种选择输出相同。
+特征和标签来自同一更新前状态，并完全 detach；主 LoRA 正常 AdamW 更新后，
+私有 FP32 MLP 用独立优化器做有符号 Huber 回归。没有 v 标签，没有额外 VLM
+前向/反向，Router 的损失和预测不进入主模型损失。当前主训练无 GradScaler；
+已有梯度 hook 位于完整累积/DDP同步之后、主 optimizer 更新之前。
+若以后引入 AMP scaler，必须保留“unscale 后读梯度”的约束。
 
-选择在**Plan的start事件**根据该时刻下载快照完成；即使物理DDP稍后才计算，也不拿
-更新后的全局模型重新评分。索引保留原始编号、允许不连续和跨客户端重叠。
-本次本地训练期间不换索引，分数不乘进LoRA。rank0广播控制索引，保证DDP各副本形状一致。
+Router 当前模板设置 router_sharing: layer：每个客户端、每个 Transformer 层拥有
+独立评分网络，同一层 Q/K/V/O 共用该层网络；不同层即使维度一致也不共享权重。
+保留原结构：输入 -> Linear(hidden32) -> SiLU -> Linear(1)，仅一个隐藏层，
+对当前LLaVA投影即8194->32->1，没有增加隐藏层或改成64维。
+评分和预估/正式监督均按真实 layers.N 模块名定位同一网络，不依赖客户端编号。
+同层模块必须有相同输入/输出特征维度；不满足时明确报错，不静默拆成多个网络。
+32层时每客户端32个网络、约839万参数；按12客户端权重/梯度/Adam状态全部常驻估算，
+每卡私有Router约1.5GiB，不含临时内存，真实峰值仍须服务器测量。未新增CPU卸载策略。
+各层参数独立，沿用原客户端AdamW参数组、全局损失平均和梯度裁剪规则。
 
-## 3．物理提取小因子，主训练与router旁路分开
+默认 hidden32/SiLU、学习率0.001、Huber delta1、weight_decay0、eps1e-8、
+梯度范数上限1。模块内标签使用绝对幅度 EMA（beta0.9）作尺度，第一次有效值初始化；
+它不是方向历史。全零标签跳过，不把未观测分量填成零标签。
+如果整个预估没有任何有效 Router 监督，明确报错，不冒充已经预热的评分器。
 
-本方法的模型实例把选中A行/B列变成真正的小Parameter，前向和主AdamW只处理这些因子，
-不是仅把完整R的梯度乘掩码。沿用服务器原 `kappa=alpha_global/R_global`，不会因局部r变小
-而改成alpha/r。DDP包装器在更换参数形状后重建，整个本地job内形状和optimizer保持固定。
-本地job结束后恢复完整候选结构；公共LLaVA实现和其他方法没有安装这些实例扩展。
-旧DDP包装器在重建前释放并回收，避免保留旧reducer钩子；清理行为可参照
-[PyTorch 2.0.1 Reducer析构实现](https://github.com/pytorch/pytorch/blob/v2.0.1/torch/csrc/distributed/c10d/reducer.cpp#L239)。
+旧冻结配置缺少 router_sharing 时仍使用原 dimension 共享，旧私有checkpoint仍可加载。
+新的按层私有checkpoint包含router_layout，拒绝静默加载维度共享权重或不匹配的层映射。
+服务器应生成新profile启用按层配置；本地不预生成。仅改变Router结构不要求新建系统
+画像/Plan，预算兼容时仍可用 --reuse_plans_from 旧profile名称。旧实验结果不能直接
+当作新结构结果，两种结构的评分/选择和正式性能可能不同。
 
-每个完整optimizer step：
+预估结束，用有效更新 kappa*B*A 的奇异值平方能量估计容量：
+达到95%累计能量的最小整数 rank，默认下限1、上限不超过候选 rank。
+使用 QR 后 rank 规模的小核心做 SVD，不物化完整 BA，不重排或旋转 A/B；
+容量不足/零能量会记录 energy_valid、threshold_met、bounded_by_maximum。
+当前预估假设初始有效 LoRA 输出为零；代码显式拒绝非零 B 的初始状态，
+防止把端点 BA 错当成相对更新。后续各模块容量固定，选择位置可变。
 
-1. 主模型正常任务前向、梯度累积、DDP同步。
-2. 在主optimizer更新前，读取参数和梯度，保存detached特征与有符号标签
-   `u_j = -sum(b_j * grad_b_j)`；两者来自同一份更新前参数。
-3. 主optimizer正常更新A/B，不加入router损失。
-4. 私有MLP用保存的特征和标签做Huber回归；其输入和标签均断开主模型图。
-
-梯度中已包含LoRA缩放，不再次乘kappa。模块内标签尺度使用mean(abs(u))的EMA，首次
-有效值直接初始化；默认beta0.9。全零标签没有排序信息，跳过该模块的监督，不把未选
-分量标成零。私有MLP默认FP32 AdamW、lr0.001、weight_decay0、eps1e-8、Huber delta1、
-梯度范数上限1。只有这个小网络发生额外反向，不增加VLM前向或VLM反向。
-当前主训练没有GradScaler；标签读取的是累积并同步后的原尺度梯度。
-
-router未注册为VLM子模块，不进入主模型DDP reducer或联邦可训练参数。各DDP副本用已
-同步的参数/梯度更新自己的同配方私有副本；最终控制索引仍以rank0为准。
-router初始化使用隔离随机流，辅助分支不消耗主模型dropout随机数。
-
-模块敏感度仍是已有Module-Gate绝对响应均值，跳过首个optimizer step：
-`h=0.5*(<grad_A,A>+<grad_B,B>)`，`S=mean(abs(h))`，默认
-`C=0.25+0.75*S/(mean_modules(S)+eps)`。这里按整模块统计，和分量级有符号router标签分开。
-没有Hard Concrete正则、连续门控学习、尾部切换或逐rank历史。
-
-## 4．稀疏增量上传和模块级服务器融合
-
-上传只有版本、原始索引、选中因子的base-relative增量、模块敏感度和数值诊断。
-不上传router权重/optimizer、冻结骨干、完整下载参数或完整本地端点。
-某些内部字段仍沿用既有indexed_delta_v1协议的`hc_*`名字，只是兼容的张量编码键；
-本方法不构造或吸收Hard Concrete幅度。
+所有客户端预估后，形成正式训练的共同版本零起点：
 
 ```text
-D = sum_m C_m * ||kappa*(B_now[:,S] A_now[S,:] - B_base[:,S] A_base[S,:])||_F^2
-U = sum_m C_m * ||kappa*(B_local A_local - B_base[:,S] A_base[S,:])||_F^2
-rho = exp(-gamma*sqrt(D/(U+eps)))             # gamma=1，整条上传共用
-w = clip(((window_length/Q+1)/(count_q+1))**0.5, 0.5, 1.5)
-N_m = rho*w*C_m
-alpha_m = N_m/(N_m + history_lambda*Omega_m + eps)
-A_global[S,:] += alpha_m*delta_A
-B_global[:,S] += alpha_m*delta_B
+omega_i = (1 / number_of_tasks) * n_i / sum_{clients in task(i)} n
+A_global_0 = sum_i omega_i * A_probe_i
+B_global_0 = sum_i omega_i * B_probe_i
 ```
 
-距离在三个模型的**同一选中支持**上比较，保留分量间交叉项，使用小Gram矩阵计算。
-未选位置不写回；全局因子不裁剪、不置零。每模块一个alpha，无0.5额外硬上限。
-频率窗口默认最近18次成功接受上传，Q仍是配置的六任务总数，当前上传成功后才加入。
+这是明确的工程选择：任务等权、同任务内部按样本数加权。
+分别平均 A/B 不等价于平均 BA，不声称无损融合。
+私有 Router、其 optimizer 与标签尺度保留；正式 LoRA optimizer 重新初始化。
+初始化不计入正式上传、评估间隔或 server_version；正式方向窗口从空开始。
+额外预估成本与初始化权重完整记录，不能忽略它们与无准备阶段基线的成本差异。
 
-历史沿用当前模块级规则：未观测H=1，首次成功C替换，后续普通EMA beta0.9；不乘rho/w，
-无零初始化偏差修正，无外部固定1。`Omega_base=sum_q H_q/Q`。
-保留当前任务结束选层累加保护：所有计划上传成功后冻结该任务最后EMA，扣敏感度底座
-只用于选择高于平均份额的Q/K/V/O层，额外需求按固定任务先验求和，boost3/time_scale18。
-每次按年龄重算，不跨步重复累积。结束后的第一条上传聚合前age=0。
-`history_age_enabled: false`可关闭这一额外项，基础历史仍保留。
-拒绝上传不推进版本、任务历史、频率窗口或成功结束计数。
+## 2．虚拟下载时评分，固定支持紧凑训练
 
-最后仍用完整服务器LoRA评估所有六任务，不使用router或客户端子模型。
-原来的统一指标、评估阈值、固定数据划分和虚拟Plan顺序保持原样。
+客户端下载完整全局 A/B，仅为所有候选分量打分：
 
-## 保存与导出
+```text
+s_j = private_router(Feature(A_global[j], B_global[:,j]))
+s_normalized_j = s_j / (max(abs(s)) + eps)
+z_j = s_normalized_j - conflict_penalty * c_task,j
+S = TopK(z, calibrated_rank)
+```
 
-新profile下输出路径：
-`runs/llava/afvlm_cm/profiles/PROFILE/2clients/ours_router/seed42/`。
-已有events/updates/task_metrics、最终指标和全局检查点继续使用。
+默认 conflict_penalty=0.3 是对话中的工程起点，不是调优结论。
+只有本任务和至少另一个任务在该位置均有有效累计方向时才扣分；
+未知位置暂不惩罚，也不放进平均分母，不设中性先验或强制探索。
+即使客户端首次正式参与，若选择时已有有效冲突信息，也照常使用。
+精确并列用独立固定种子打破，不消耗主模型/dropout随机流。
 
-- `client_calibration.json`、`capacity_calibration.jsonl`：谱能量、容量、阈值是否满足、额外成本。
-- `events.jsonl`的`router_diagnostics`：每模块所选数量/索引、C、D/U/rho/w、历史、Omega和alpha。
-- 本地trajectory：逐optimizer-step任务loss、router loss、有效监督模块数、标签幅度及累计学习步数。
-  task_loss沿用现有microbatch/进程平均口径，不是全语料token加权困惑度。
-- `client_private/TASK/client_N/router_latest.pt`：模拟客户端私有router和optimizer的最新状态，
-  只由rank0写入本地磁盘，不参与上传、聚合或全局模型检查点。
+评分和冲突快照取自 **Plan 的虚拟下载事件**。物理训练稍后执行不会重新选择；
+rank0 广播整个控制选择，DDP各副本索引/形状相同。
+客户端提取选中的 A 行/B 列组成真正的小 Parameter，未选分量不参与本地前向。
+始终保留全局 kappa=alpha_global/R_global，不按局部 rank 改缩放。
+单次参与的索引固定，Router继续旁路学习，只影响下一次参与。
+不申请空位、不重置少用分量，不强制独占、换位或永久封禁。
+结构切换沿用既有方法私有的 DDP 解包/重建路径，公共训练器不改变。
+
+## 3．按原功能性陈旧度统一立即聚合
+
+上传：任务/客户端/版本、原始分量索引、相对下载快照的选中 A/B 增量、模块敏感度。
+不上传骨干、Router权重/optimizer或完整端点。协议中的 hc_* 是兼容字段名，不是门控。
+
+模块敏感度沿用现有 Module-Gate：跳过首个 optimizer step，累计
+abs(0.5*(<grad_A,A>+<grad_B,B>)) 的均值，默认 C=0.25+0.75*S/mean(S)。
+它仅参与已有的功能性陈旧度计算，不再生成不同模块的融合系数。
+
+在 base/current/local 三个模型完全相同的本次选中支持上：
+
+```text
+D = sum_m C_m * ||kappa*(B_current[S] A_current[S] - B_base[S] A_base[S])||_F^2
+U = sum_m C_m * ||kappa*(B_local A_local - B_base[S] A_base[S])||_F^2
+rho = exp(-gamma * sqrt(D/(U+eps)))
+alpha = server_step_size * rho
+A_global[S,:] += alpha * delta_A
+B_global[:,S] += alpha * delta_B
+```
+
+默认 gamma=1、server_step_size=1。同次上传所有模块/分量共用 alpha，无额外0.5上限。
+未上传位置不写回。没有重叠开关、频率补偿、历史敏感度分母或任务结束年龄增强。
+冲突不再次乘进当前聚合系数。极小能量、非有限值和重复身份仍校验。
+
+## 4．精确近期功能方向：每任务 L=3，最大年龄 T=24
+
+记录真实服务器本次聚合前后变化，而非原始客户端提议：
+
+```text
+E_u,m,j = kappa * (b_after a_after - b_before a_before)
+```
+
+代码使用等价、数值更稳定的 rank2 因子：
+
+```text
+L_u = [kappa*(b_after-b_before), kappa*b_before]
+R_u = [a_after, a_after-a_before]^T
+E_u = L_u @ R_u.T
+<E_u,E_v> = sum((L_u.T @ L_v) * (R_u.T @ R_v))
+```
+
+仅缓存每次实际上传分量的因子及内积表 G，历史内积不重复计算；
+新增记录只算与已有记录的内积，移除记录同步切除相应行列。
+没有随机投影、完整权重矩阵、拼接 delta 的余弦或方向 EMA。
+FP16输入提升为FP32因子，小Gram运算/累加用FP64，结果仍存在浮点误差。
+
+全局每成功聚合一个正式上传 t 加1，记录本次 accepted_at：
+同任务只保留最近3次成功上传，且 t-accepted_at<=24 才有效；
+第24次仍有效、第25次失效。同任务不同客户端共用队列，
+新记录只能刷新自己的时间，不能刷新旧记录或未上传位置。
+失败、拒绝、重复上传、准备阶段均不进入此窗口。
+任务结束后也不永久冻结旧方向，按同一有效期淘汰。
+
+对每个模块、每个分量，把同任务有效记录相加成 M_q。
+利用 Gram 分组求和计算 <M_q,M_k> 和范数：
+
+```text
+cosine_qk = <M_q,M_k> / (norm(M_q)*norm(M_k)+eps)
+d_qk = max(0, -clip(cosine_qk,-1,1))
+c_q = mean_{valid OTHER tasks k} d_qk
+```
+
+每任务一份累计方向，不按上传次数投票。
+没有本任务方向、没有有效其他任务、累计变化抵消或近零时，都标记未知。
+范数有效性同时考虑 conflict_min_norm=1e-12 与Gram抵消舍入容差。
+这表示“近期功能方向兼容性代理”，不证明另一任务损失一定上升，也不保证频率公平。
+
+候选全局参数和候选冲突窗口先计算并校验，既有 opt-in 事务回调在服务器模型/版本
+成功应用后才发布记录。失败不推进方向时钟。保护其他方法的默认回调仍为空。
+历史因子保留在服务器所在设备，不每步搬CPU；恢复时在边界移动一次。
+协调DDP每个副本维护相同服务器状态，因此历史也占用每卡显存，开销随
+任务数*L*选择rank*(输入维度+输出维度)增长，诊断记录实际字节，不能承诺零开销。
+
+## 日志、导出与实现边界
+
+正常 events/updates/task_metrics、最终指标和可选全局检查点继续使用。
+新增/扩展：
+
+- client_calibration.json / capacity_calibration.jsonl：容量、真实准备成本、初始化权重、
+  每步任务/Router loss、有效监督数。
+- client_private/TASK/client_N/router_latest.pt：客户端私有Router/optimizer，rank0本地保存；
+  不属于联邦上传。预估结束时也保存，后续每次成功本地训练更新。
+- router_diagnostics：C、D/U/rho、统一alpha、上传索引、下载时所有候选的原评分/归一化评分/
+  冲突/有效比较数/最终分数、选择改变数和有效比较覆盖率、各任务窗口时间/年龄/内存。
+- 方法checkpoint schema4：精确方向因子、小Gram、记录时钟、Plan、在途选择等；
+  跨 legacy/overlap/conflict 模式不能静默迁移。全局检查点不包含全部客户端私有经验，
+  本修改没有增加中途训练resume入口。
+
+导出无需模型或图片：
 
 ```bash
-python tools/export_ours_router_diagnostics.py \
-  runs/llava/afvlm_cm/profiles/router_r32_e1_bs4_ga4_r10_s42/2clients/ours_router/seed42
+python tools/export_ours_router_diagnostics.py runs/llava/afvlm_cm/profiles/router_conflict_r32_e1_bs4_ga4_r10_s42/2clients/ours_router/seed42
 ```
 
-得到`router_diagnostics/{updates,modules,local_steps,capacities}.csv`。
-communication中的张量字节和JSON体积是payload口径，不等同实际网络协议总字节。
-导出目录存在时拒绝覆盖，可用`--output-directory 新目录`。逐步轨迹在本地训练结束并
-处理上传时写入事件；不是每步实时检查点，失败前未上传部分不保证保留。
+输出 router_diagnostics 下的 updates、modules、local_steps、capacities、components、
+resolutions、conflict_selection、conflict_windows、probe_steps CSV。
+新增 router_ranking.csv：逐客户端、任务、optimizer step、模块记录 Spearman 排序相关性、
+Top-k重合率和Top-1重合率。local_steps.csv 与 probe_steps.csv 同时包含有效模块均值和
+有效模块数（router_spearman_mean、router_topk_overlap_mean、router_top1_overlap_mean）。
+其中router_head标识实际使用的层网络；updates.csv另记录router_sharing与router_head_count。
 
-## 实现边界
+诊断复用现有 Router 更新前预测与同一 LoRA 更新前状态的有符号 u 标签，不增加前向、
+反向、损失项或DDP通信。只由主进程计算；小统计在每个完整step一次性传回CPU。
+Spearman 使用并列平均秩；Top-k = 两个前k集合交集大小/k，默认k=ceil(观察数*25%)，
+观察数>=2时保证k小于观察数，另记录Top-1。每行记录n、k、全局索引、候选rank和
+独立随机排序的参考重合率k/n（Top-1为1/n），避免把不同池大小的数值直接等同。
+常量预测/标签、仅一个分量、无有效监督时结果为null；Top-k截断边界存在并列时也
+标记该项无效，不把任意并列打破当成真实排序能力。均值只统计对应指标有效的模块。
 
-这是一项研究设计：谱能量不保证最优容量，一阶删除标签不保证真实删除损失或未来训练收益。
-只监督选中分量存在选择偏差；当前没有额外探索策略或额外删除前向。
-完整候选LoRA仍需下载，容量探测有额外成本，候选R32与基线r8不是相同参数预算。
-DDP协调执行器保留客户端私有状态；当前不支持任意worker迁移，也不提供整套训练中途恢复。
-全局检查点本身不包含私有router，不能拿它单独恢复客户端经验。
+预估阶段scope=full_candidate_components，覆盖完整候选池；正式阶段
+scope=selected_components_only，仅比较当前已选分量内部排序。正式阶段未选分量没有
+标签，不能声称该指标验证了全部候选中的最终Top-k选择。诊断不包含冲突惩罚。
+这是同一训练梯度代理上的在线拟合诊断，不是独立验证集的排序泛化或真实性能证明。
+旧日志没有这些观测时导出留空，不补造数据；旧配置无需为本次日志改动重新生成Plan。
+新模式旧历史列留空，不能把它们当作零历史保护；conflict_selection覆盖所有候选而非
+仅上传位置。拒绝时alpha为0。保留导出拒绝覆盖行为，可用 --output-directory 新目录。
+日志是上传结束后写入，不是逐步恢复检查点。
 
-只新增默认关闭的calibration能力和生命周期钩子，旧方法不会执行探测；统一注册表发现
-新方法，普通生成器和run_one不用加方法分支。原配置/profile、数据、旧ours/ours_hc与
-baseline算法未改写。新超参数是公开的工程起点，不称为已调优结果。
-当前只进行非训练工程、张量方程、协议和配置检查，未加载7B或启动训练；真实八卡
-DDP参数切换、显存、性能和最终精度还需要服务器正式运行验证。
+最终仍评估完整全局 LoRA 在六个任务的表现，不启用私有Router或任务子模型。
+公共训练/DDP、生成指标、数据、原Plan与其他方法配置不变。
+额外容量预估、Router回归、方向因子显存与准备聚合须单独披露；
+候选R32也不能宣称与r8基线有相同参数预算。
+已提供非训练方程、事务、有效期、配置和兼容性检查；
+真实8卡NCCL、峰值显存及最终性能必须在服务器正式实验验证。
+
+## 历史配置兼容
+
+- 缺少 rank_aggregation_mode 或显式 legacy：7c5638b 的预估后恢复初始模型、冷Router、
+  原模块级敏感度/频率/历史/结束年龄聚合。
+- 显式 overlap_switch：保留此前每客户端最近选择并集、重叠位置使用历史保护分式、
+  非重叠位置乘rho、任务结束冻结支持和历史的实现。
+- 当前模板 conflict_router：本文新设计。使用新profile，不编辑旧结果对应的冻结配置。

@@ -55,6 +55,8 @@ class LocalRouter:
         }
         self.slots, self.private, self.capacities = {}, {}, {}
         self.active, self.base, self.choice = False, {}, {}
+        self.probing = False
+        self.initialized_state = None
         self.output = None
         self.pending, self.trajectory, self.loss_sum, self.loss_count = {}, [], None, 0
         by_id = {id(a): name for name, (a, _, _) in _discover_model_modules(model).items()}
@@ -120,29 +122,45 @@ class LocalRouter:
             ]
             device = next(iter(self.slots.values()))[2].device
             self.private[client] = PrivateRouter(
-                dimensions, device, stable_seed(seed, client), self.params
+                dimensions, device, stable_seed(seed, client), self.params,
+                module_metadata=self.full_metadata,
             )
         return self.private[client]
 
-    def select(self, state: dict, context: Any) -> dict:
+    def select(self, state: dict, context: Any, conflict: dict | None = None) -> dict:
         import torch
 
         if context.client_id not in self.capacities:
             raise RuntimeError("Client capacity calibration must precede the virtual Plan")
         router = self.router(context.client_id, context.seed)
-        chosen, sources = {}, {}
+        chosen, sources, diagnostics = {}, {}, {}
         with torch.no_grad():
             for name, item in self.full_metadata.items():
                 a, b = state[item["a_name"]], state[item["b_name"]]
                 k = self.capacities[context.client_id][name]["rank"]
                 # Cold routers have no meaningful ranking, including late joiners.
-                if router.steps == 0:
+                if conflict is not None:
+                    if router.steps == 0:
+                        raise RuntimeError(
+                            "The full-rank probe produced no valid router supervision; "
+                            "increase probe_local_epochs rather than using an untrained router"
+                        )
+                    from afl_vlm.methods.ours_router.router import conflict_topk
+
+                    indices, diagnostics[name] = conflict_topk(
+                        router.predict(a, b, name), conflict["modules"][name], k,
+                        float(self.params.get("conflict_penalty", 0.3)),
+                        float(self.params.get("eps", 1e-12)),
+                        stable_seed(context.seed, name),
+                    )
+                    sources[name] = "warmed_router_conflict_topk"
+                elif router.steps == 0:
                     generator = torch.Generator(device=a.device)
                     generator.manual_seed(stable_seed(context.seed, name))
                     indices = torch.randperm(item["rank"], generator=generator, device=a.device)[:k]
                     sources[name] = "uniform_cold_start"
                 else:
-                    scores = router.predict(a, b)
+                    scores = router.predict(a, b, name)
                     if not bool(torch.isfinite(scores).all()):
                         raise ValueError("Non-finite private component scores")
                     # Stable tie-breaking in original global index order.
@@ -152,13 +170,21 @@ class LocalRouter:
         # One authoritative support, identical across all DDP replicas.
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             message = [
-                {"indices": chosen, "source": sources}
+                {"indices": chosen, "source": sources, **(
+                    {"conflict_selection": {"clock": conflict["clock"],
+                                            "window": conflict["window"],
+                                            "modules": diagnostics}}
+                    if conflict is not None else {}
+                )}
                 if torch.distributed.get_rank() == 0
                 else None
             ]
             torch.distributed.broadcast_object_list(message, src=0)
             return message[0]
-        return {"indices": chosen, "source": sources}
+        return {"indices": chosen, "source": sources, **(
+            {"conflict_selection": {"clock": conflict["clock"], "window": conflict["window"],
+                                    "modules": diagnostics}} if conflict is not None else {}
+        )}
 
     def prepare(self, context: Any, selection: dict) -> None:
         import torch
@@ -219,13 +245,16 @@ class LocalRouter:
     def observe(self, step: int) -> None:
         import torch
 
-        self.tracker.update(step)
+        if not self.probing:
+            self.tracker.update(step)
         self.pending = {}
         with torch.no_grad():
-            for name, (a, b, _) in self.tracker.modules.items():
+            modules = _discover_model_modules(self.model) if self.probing else self.tracker.modules
+            for name, (a, b, _) in modules.items():
                 if b.grad is not None:
                     self.pending[name] = (
-                        PrivateRouter.key(a.shape[1], b.shape[0]),
+                        PrivateRouter.key(a.shape[1], b.shape[0], name,
+                                          str(self.params.get("router_sharing", "dimension"))),
                         component_features(a, b, float(self.params.get("eps", 1e-12))),
                         component_targets(b, b.grad),
                     )
@@ -237,6 +266,23 @@ class LocalRouter:
             raise RuntimeError("Router step is missing synchronized pre-update observations")
         report = self.client_router.learn(self.pending)
         report.update(optimizer_step=step)
+        if "router_ranking" in report:
+            ranking = report["router_ranking"]
+            ranking["phase"] = "probe" if self.probing else "formal"
+            ranking["scope"] = (
+                "full_candidate_components" if self.probing else "selected_components_only"
+            )
+            for name, detail in ranking["modules"].items():
+                detail["global_candidate_rank"] = self.full_metadata[name]["rank"]
+                detail["router_head"] = PrivateRouter.key(
+                    self.full_metadata[name]["in_features"],
+                    self.full_metadata[name]["out_features"],
+                    name, str(self.params.get("router_sharing", "dimension")),
+                )
+                detail["component_indices"] = (
+                    list(range(self.full_metadata[name]["rank"])) if self.probing
+                    else list(self.choice[name])
+                )
         loss = torch.stack((self.loss_sum, self.loss_sum.new_tensor(self.loss_count)))
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(loss)
@@ -277,6 +323,8 @@ class LocalRouter:
                 "router_parameter_count": sum(
                     p.numel() for p in self.client_router.heads.parameters()
                 ),
+                "router_sharing": self.client_router.sharing,
+                "router_head_count": len(self.client_router.heads),
                 "selection_fixed_for_job": True,
             },
         }
@@ -291,6 +339,10 @@ class LocalRouter:
         return result
 
     def calibrate(self, clients: dict, initial: dict, config: Any, output: Path) -> dict:
+        if self.params.get("rank_aggregation_mode") == "conflict_router":
+            from afl_vlm.methods.ours_router.probe import calibrate
+
+            return calibrate(self, clients, initial, config, output)
         import torch
 
         self.output = output
