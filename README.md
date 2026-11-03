@@ -1,5 +1,12 @@
 # AFVLM-CM
 
+当前统一训练默认值为 `batch_size: 2`、`gradient_accumulation: 4`。
+八卡DDP有效批量64；单卡客户端按同一八卡参考分片自动累积32次，有效批量也为64。
+所有普通方法应使用同一个新profile比较；旧profile和已有结果保持原预算，
+旧有效批量128的结果不能直接与新64配置视为相同训练设置。
+本次必须重新生成配置和Plan，勿使用 `--reuse_plans_from` 复用旧128预算的Plan。
+文中历史bs4/ga4示例及旧冻结profile仍表示旧实验；profile名字本身不设置参数。
+
 新增最新设计的独立方法 **`ours_router`**：完整LoRA预估时同步训练私有MLP，按谱能量
 确定客户端各模块容量；任务均衡合成共同全局起点，再在虚拟下载时按“贡献评分减近期
 跨任务冲突”选top-k。固定紧凑LoRA训练，上传统一使用 `alpha=eta*rho` 增量聚合。
@@ -15,8 +22,8 @@
 `router_ranking.csv`。配置与 Plan 由用户在服务器生成，本地不预生成实验 profile。
 
 ```bash
-python tools/generate_system_profiles.py --profile router_conflict_r32_e1_bs4_ga4_r10_s42
-bash scripts/run_one.sh ours_router 2 router_conflict_r32_e1_bs4_ga4_r10_s42
+python tools/generate_system_profiles.py --profile all_e1_bs2_ga4_r10_s42
+bash scripts/run_one.sh ours_router 2 all_e1_bs2_ga4_r10_s42
 ```
 
 生成器会包含所有普通方法、2/5/10三档的完整配置；将启动命令中的2换成5或10即可。
@@ -440,8 +447,8 @@ bash scripts/run_baselines.sh 2 module_gate_freqw18_e1_bs4_ga4_r10_s42
 将第二个参数改为 `5` 或 `10` 即选择 5/10 clients per task。base.yaml 无需手填
 `batch_size_scope`、`reference_world_size`；生成 profile 时自动识别可见 GPU 数，
 并将参考卡数固定到所有方法的快照中。有效批量是 batch × 累积 × 保存的参考卡数。
-在八卡服务器生成时，默认128条记录。
-8 卡 DDP 保持每卡4条、累积4次；单卡客户端自动使用4条、累积32次。
+在八卡服务器生成时，当前默认64条记录。
+8 卡 DDP 使用每卡2条、累积4次；单卡客户端自动使用2条、累积32次。
 旧 profile 缺少该字段时保留原来的每卡批量语义，必须创建新 profile 才会启用公平模式。
 完整配置、尾批及迁移说明见 [跨执行器批量公平性](docs/batch_fairness.md)。
 无 CUDA 的电脑上生成时，可加 `--reference_world_size 8` 指定目标服务器参考卡数，
@@ -614,8 +621,8 @@ UniFed-LoRA 每 rank 复制服务器超网络，**不会按八卡分摊显存**�
 在已有 optimizer-boundary hook 解析加入梯度，避免给重入式 checkpoint 增加重复反向路径。
 单卡对齐和其他 baseline 必需的 SGD/特殊梯度操作保留。
 根因线索、公式和验证边界见[历史 DDP 与 FedAsync 修复说明](docs/ddp_training_compatibility.md)。
-新 profile 自动识别并保存参考卡数；八卡服务器生成的快照固定参考预算128，
-DDP 保留原每卡4条、累积4次；worker-pool 在单卡复现八个参考分片，累积32次。
+新 profile 自动识别并保存参考卡数；当前八卡服务器生成的快照固定参考预算64，
+DDP 使用每卡2条、累积4次；worker-pool 在单卡复现八个参考分片，累积32次。
 两者保留相同的原始分片补齐、尾批和 micro-batch 平均损失规则。
 缺少 scope 字段的旧 profile 仍是 `per_device`，其 DDP 有效批量继续乘 GPU 数。
 直接运行可编辑模板时，训练入口在启动 workers 前识别卡数并保存到 resolved config；
@@ -791,7 +798,7 @@ bash scripts/run_one.sh aced 10 aced_e1_bs4_ga4_r10_s42
 与旧 profile 相同。默认批处理脚本列表不变，ACED 单独运行。初始化先额外计算每客户端
 一个有效批量的梯度并进行一次全局下降，单独记入 `algorithm_initialization.json`；
 不把它或缓存复用冒充新的 Plan 上传。普通评估仍按首次纳入聚合的上传预算触发。
-本方法现默认使用全部可见 GPU 的 DDP；初始化按真实 rank 分片，参考八卡有效批量仍为 128。
+本方法现默认使用全部可见 GPU 的 DDP；初始化按真实 rank 分片，当前共同默认八卡有效批量为64。
 不改变已有 ours/OPCM 的八卡路径；旧缺少参考元数据的 per_device 快照应重新建 profile。
 原文差异、活动年龄与真实陈旧度区别、缓存显存和日志见 [完整说明](docs/aced.md)。
 

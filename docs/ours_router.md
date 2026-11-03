@@ -16,13 +16,15 @@
 共同训练参数在 `configs/base.yaml`；候选容量在
 `configs/models/llava15_7b_router_lora.yaml`；本方法参数在
 `configs/methods/ours_router.yaml`。默认候选 rank32、LoRA alpha64；
-默认本地训练由 base 控制，当前 epoch1、每卡 batch4、梯度累积4、学习率2e-5、
-文本上限2048。八卡有效批量128，原训练循环、采样、DDP和多模态 collator 不变。
+默认本地训练由 base 控制，当前 epoch1、每卡 batch2、梯度累积4、学习率2e-5、
+文本上限2048。八卡有效批量64，与其他方法共同采用新预算；训练循环、采样、DDP和
+多模态collator代码不变。单卡客户端使用batch2/累积32对齐64，不要求继续保持128。
+旧bs4/累积4的profile仍保留原预算，必须新建profile/Plan；不要复用旧128预算的Plan。
 
 在服务器项目根目录、已配置的 Python 环境中生成新的不可变 profile：
 
 ```bash
-python tools/generate_system_profiles.py --profile router_conflict_r32_e1_bs4_ga4_r10_s42
+python tools/generate_system_profiles.py --profile all_e1_bs2_ga4_r10_s42
 ```
 
 生成所有普通方法在2/5/10三档的完整配置，以及 system profile、TrainPlan、manifest。
@@ -38,9 +40,9 @@ profile 名称只是标识，不会代替 YAML 设置参数。生成前检查 ba
 选择一个规模运行即可，无需另一套生成器或 torchrun 命令：
 
 ```bash
-bash scripts/run_one.sh ours_router 2 router_conflict_r32_e1_bs4_ga4_r10_s42
-bash scripts/run_one.sh ours_router 5 router_conflict_r32_e1_bs4_ga4_r10_s42
-bash scripts/run_one.sh ours_router 10 router_conflict_r32_e1_bs4_ga4_r10_s42
+bash scripts/run_one.sh ours_router 2 all_e1_bs2_ga4_r10_s42
+bash scripts/run_one.sh ours_router 5 all_e1_bs2_ga4_r10_s42
+bash scripts/run_one.sh ours_router 10 all_e1_bs2_ga4_r10_s42
 ```
 
 启动器按 capability 自动选择 client_ddp，全部可见 GPU 共同训练一个客户端。
@@ -212,9 +214,9 @@ c_q = mean_{valid OTHER tasks k} d_qk
 gram_bytes是小Gram表字节，另记录factor_storage_device和gram_storage_device。
 这项显存修正不要求重新生成配置或Plan，不会修改批量、梯度累积、优化步数或聚合公式。
 
-若修正后长Grounding批次仍超过显存，可另建实验使用batch2/累积8（八卡有效批量仍128），
-但这不是此次自动变更。micro-batch改变可能影响dropout及token平均损失权重，不能声称
-与原batch4/累积4逐位等价；旧结果及配置应保留。不要降低文本上限来丢弃多轮监督。
+本次共同默认已改为batch2/累积4。有效批量由128变64，optimizer steps也会改变，
+因此新旧实验不是同一训练预算；所有对比方法应使用同一新profile重跑。
+旧结果及配置保留。不要降低文本上限来丢弃多轮监督。
 
 ## 日志、导出与实现边界
 
@@ -234,7 +236,7 @@ gram_bytes是小Gram表字节，另记录factor_storage_device和gram_storage_de
 导出无需模型或图片：
 
 ```bash
-python tools/export_ours_router_diagnostics.py runs/llava/afvlm_cm/profiles/router_conflict_r32_e1_bs4_ga4_r10_s42/2clients/ours_router/seed42
+python tools/export_ours_router_diagnostics.py runs/llava/afvlm_cm/profiles/all_e1_bs2_ga4_r10_s42/2clients/ours_router/seed42
 ```
 
 输出 router_diagnostics 下的 updates、modules、local_steps、capacities、components、

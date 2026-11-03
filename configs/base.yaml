@@ -17,8 +17,9 @@ runtime:
 training:
   local_epochs: 1
   # Reference GPU count is auto-detected and frozen in generated profiles.
-  # With 8 visible GPUs: DDP B4/G4; one-GPU clients automatically use B4/G32.
-  batch_size: 4
+  # With 8 visible GPUs: DDP B2/G4; one-GPU clients automatically use B2/G32.
+  # Shared effective batch is 64; regenerate profiles/Plans after this change.
+  batch_size: 2
   gradient_accumulation: 4
   learning_rate: 0.00002
   # The active Grounding conversations fit the native LLaVA 2k context.
