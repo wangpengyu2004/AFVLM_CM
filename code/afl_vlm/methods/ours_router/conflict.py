@@ -42,7 +42,8 @@ class TaskConflictWindow:
         E = kappa*(b+ a+ - b- a-)
           = [kappa*(b+ - b-), kappa*b-] @ [a+, a+ - a-].
         The second exact factorization avoids subtracting two large near-equal
-        Gram terms. All historical factors stay immutable and on their device.
+        Gram terms. Immutable historical factors are stored losslessly on CPU;
+        only the small Grams and the current module's products reside on GPU.
         """
         import torch
 
@@ -100,8 +101,11 @@ class TaskConflictWindow:
                     # limits cancellation of multiple opposing historical changes.
                     current_left = left.index_select(0, ci).double()
                     r = right.index_select(0, ci).double()
-                    ol = old["left"].index_select(0, oi).double()
-                    oright = old["right"].index_select(0, oi).double()
+                    # CPU is storage only. Copy one module's factors back to
+                    # the server device BEFORE indexing or doing any algebra.
+                    # The VLM backward must not retain all L*Q factor records.
+                    ol = old["left"].to(device=a0.device).index_select(0, oi).double()
+                    oright = old["right"].to(device=a0.device).index_select(0, oi).double()
                     products = ((current_left @ ol.transpose(1, 2)) *
                                 (r @ oright.transpose(1, 2))).sum((1, 2))
                     if not bool(torch.isfinite(products).all()):
@@ -110,6 +114,11 @@ class TaskConflictWindow:
                     gram[global_indices, n, old_position] = products
                     gram[global_indices, old_position, n] = products
                 new.grams[name] = gram
+                record["modules"][name] = {
+                    "indices": indices,
+                    "left": left.detach().cpu(),
+                    "right": right.detach().cpu(),
+                }
         new.rows.append(record)
         return new
 
@@ -163,6 +172,9 @@ class TaskConflictWindow:
                                "age": self.clock - row["accepted_at"]}
                               for row in self.rows if row["task"] == q]
                           for q in self.tasks},
+                "factor_storage_device": "cpu",
+                "gram_storage_device": str(next(iter(self.grams.values())).device)
+                if self.grams else None,
                 "factor_bytes": sum(v[side].numel() * v[side].element_size()
                                     for row in self.rows for v in row["modules"].values()
                                     for side in ("left", "right")),
@@ -204,7 +216,7 @@ class TaskConflictWindow:
             raise ValueError("Conflict clock and retained records disagree")
         candidate = self._new()
         candidate.clock = clock
-        candidate.rows = nested_to_device(copy.deepcopy(rows), device)
+        candidate.rows = nested_to_device(copy.deepcopy(rows), "cpu")
         candidate.grams = nested_to_device(copy.deepcopy(source["grams"]), device)
         import torch
 
@@ -231,9 +243,19 @@ class TaskConflictWindow:
         self.clock, self.rows, self.grams = candidate.clock, candidate.rows, candidate.grams
 
     def to(self, device: Any) -> None:
-        """Move restored storage once at the first server/download boundary."""
+        """Stage small Grams on the server device; factors are CPU storage only.
+
+        Also accepts old in-memory/restored caches containing device factors.
+        Dtypes/values are unchanged; no CPU functional products are introduced.
+        """
+        import torch
+
         from afl_vlm.models.base import nested_to_device
 
-        if self.rows and next(iter(self.grams.values())).device != device:
-            self.rows = nested_to_device(self.rows, device)
-            self.grams = nested_to_device(self.grams, device)
+        device = torch.device(device)
+        if self.rows:
+            if any(v[side].device.type != "cpu" for row in self.rows
+                   for v in row["modules"].values() for side in ("left", "right")):
+                self.rows = nested_to_device(self.rows, "cpu")
+            if next(iter(self.grams.values())).device != device:
+                self.grams = nested_to_device(self.grams, device)

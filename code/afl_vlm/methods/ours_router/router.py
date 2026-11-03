@@ -212,6 +212,10 @@ class PrivateRouter:
                 )
                 self.optimizer.step()
                 self.steps += 1
+            # These gradients have already been consumed. Keeping them until
+            # this client participates again costs one full private Router per
+            # idle client on EVERY DDP replica. Adam moments/weights are kept.
+            self.optimizer.zero_grad(set_to_none=True)
         report = {
             "router_loss": float(summary[0]),
             "router_valid_modules": int(summary[1]),
