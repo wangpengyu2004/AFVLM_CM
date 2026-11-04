@@ -9,7 +9,13 @@
 
 新增最新设计的独立方法 **`ours_router`**：完整LoRA预估时同步训练私有MLP，按谱能量
 确定客户端各模块容量；任务均衡合成共同全局起点，再在虚拟下载时按“贡献评分减近期
-跨任务冲突”选top-k。固定紧凑LoRA训练，上传统一使用 `alpha=eta*rho` 增量聚合。
+跨任务冲突”选top-k。在下载时完整LoRA背景下训练选中分量，上传统一使用
+`alpha=eta*rho` 增量聚合。
+2026-11-04默认启用 `local_frozen_background: true` 和
+`staleness_mode: full_functional_absolute`：未选分量冻结参与前向，rho按下载与到达时
+完整有效权重的距离计算，不除以本地更新能量。训练与上传参数仍只包含选中分量。
+需生成新profile启用；缺少新字段的旧profile保持原算法。只改这两项且数据和训练预算
+不变时，可用 `--reuse_plans_from 旧profile名称` 保留原系统画像与虚拟到达条件。
 2026-11-02新版每任务保留最近3次成功上传、超过24次全局成功聚合失效；用服务器实际
 功能变化的低秩因子和缓存Gram精确计算方向，不用随机投影。冲突只影响后续选择，
 不再叠加频率、历史分母或结束年龄项。旧legacy/overlap_switch冻结配置仍用原模式。
@@ -20,10 +26,17 @@
 当前 Router 按客户端和 Transformer 层独立，同层 Q/K/V/O 共享，保留 `8194→32→1`
 结构。训练记录逐模块 Spearman、Top-k/Top-1 重合率及有效性，诊断导出新增
 `router_ranking.csv`。配置与 Plan 由用户在服务器生成，本地不预生成实验 profile。
+当前 `router_supervision: full_candidates` 为所有分量生成正常反向的固定-one gate标签，
+冻结背景分量也参与Router的Huber监督；选中A/B的训练和上传范围保持原样。
+全候选排序scope记录为full_candidate_components；缺少新字段的旧配置保留选中集合监督。
+标签尺度仍使用原EMA；默认只使用Huber回归，router_rank_lambda=0.0，
+不构造成对排序损失。Spearman、Top-k/Top-1重合率继续作为诊断记录。
+默认router_loss等于router_regression_loss，排序损失与有效对数为0。
+完整实现和额外显存/通信成本见方法说明。
 
 ```bash
-python tools/generate_system_profiles.py --profile all_e1_bs2_ga4_r10_s42
-bash scripts/run_one.sh ours_router 2 all_e1_bs2_ga4_r10_s42
+python tools/generate_system_profiles.py --profile router_full_huber_g075_e1_bs2_ga4_r10_s42
+bash scripts/run_one.sh ours_router 2 router_full_huber_g075_e1_bs2_ga4_r10_s42
 ```
 
 生成器会包含所有普通方法、2/5/10三档的完整配置；将启动命令中的2换成5或10即可。

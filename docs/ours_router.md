@@ -1,8 +1,16 @@
 # ours_router：容量预估、私有 Router 与近期任务冲突选择
 
-当前默认实现依据《详细讲解这篇论文的方法》对话在 **2026-11-02** 最后确认的设计：
+当前默认实现依据《详细讲解这篇论文的方法》对话在 **2026-11-04** 确认的设计：
 **完整预估并预热 Router → 初始化共同全局 LoRA → 贡献评分减冲突惩罚选择
-→ 紧凑 LoRA 训练 → 按陈旧度立即增量聚合 → 用实际变化更新近期方向。**
+→ 完整下载背景下训练选中紧凑 LoRA → 按完整功能距离立即增量聚合 → 更新近期方向。**
+
+新增默认配置 `local_frozen_background: true`、
+`staleness_mode: full_functional_absolute`。缺少这两个字段的旧冻结 profile
+仍执行紧凑前向和选中支持的相对陈旧度；需生成新 profile，不能直接续接旧算法 checkpoint。
+完整候选监督另由 `router_supervision: full_candidates` 启用；缺少该字段仍使用原选中集合监督。
+本版只使用Huber回归和原模块标签尺度EMA，`router_rank_lambda: 0.0`。
+Spearman、Top-k/Top-1重合率仅作诊断，不进入训练目标。
+旧配置缺少 `router_rank_lambda` 时同样采用Huber-only训练路径。
 
 最新窗口为 **每任务最近 L=3 次成功聚合上传，并且记录年龄不超过 T=24 次全局成功聚合**。
 不是每客户端三次，不是每分量三次，也不是全局最近18次。
@@ -24,7 +32,7 @@
 在服务器项目根目录、已配置的 Python 环境中生成新的不可变 profile：
 
 ```bash
-python tools/generate_system_profiles.py --profile all_e1_bs2_ga4_r10_s42
+python tools/generate_system_profiles.py --profile router_full_huber_g075_e1_bs2_ga4_r10_s42
 ```
 
 生成所有普通方法在2/5/10三档的完整配置，以及 system profile、TrainPlan、manifest。
@@ -40,9 +48,9 @@ profile 名称只是标识，不会代替 YAML 设置参数。生成前检查 ba
 选择一个规模运行即可，无需另一套生成器或 torchrun 命令：
 
 ```bash
-bash scripts/run_one.sh ours_router 2 all_e1_bs2_ga4_r10_s42
-bash scripts/run_one.sh ours_router 5 all_e1_bs2_ga4_r10_s42
-bash scripts/run_one.sh ours_router 10 all_e1_bs2_ga4_r10_s42
+bash scripts/run_one.sh ours_router 2 router_full_huber_g075_e1_bs2_ga4_r10_s42
+bash scripts/run_one.sh ours_router 5 router_full_huber_g075_e1_bs2_ga4_r10_s42
+bash scripts/run_one.sh ours_router 10 router_full_huber_g075_e1_bs2_ga4_r10_s42
 ```
 
 启动器按 capability 自动选择 client_ddp，全部可见 GPU 共同训练一个客户端。
@@ -113,7 +121,7 @@ B_global_0 = sum_i omega_i * B_probe_i
 
 ## 2．虚拟下载时评分，固定支持紧凑训练
 
-客户端下载完整全局 A/B，仅为所有候选分量打分：
+客户端下载完整全局 A/B，为所有候选分量打分并提供固定背景：
 
 ```text
 s_j = private_router(Feature(A_global[j], B_global[:,j]))
@@ -130,33 +138,73 @@ S = TopK(z, calibrated_rank)
 
 评分和冲突快照取自 **Plan 的虚拟下载事件**。物理训练稍后执行不会重新选择；
 rank0 广播整个控制选择，DDP各副本索引/形状相同。
-客户端提取选中的 A 行/B 列组成真正的小 Parameter，未选分量不参与本地前向。
+客户端提取选中的 A 行/B 列组成真正的小 Parameter，未选分量复制为下载时的固定背景。
+本地前向为 W0 + kappa*(B_unselected_download*A_unselected_download + B_selected*A_selected)。
+固定背景不进优化器、不上传，仍须保留经过输入激活的梯度。内部按选中/未选顺序
+临时拼接因子计算，PEFT原有dropout仅作用一次、scaling仅作用一次；不构造稠密BA。
+参数与上传保持紧凑，但中间激活及因子前向使用完整rank，不能声称总计算等同紧凑模型。
+本地结束恢复原始因子及forward，后续客户端和全局评估不带临时背景。
 始终保留全局 kappa=alpha_global/R_global，不按局部 rank 改缩放。
 单次参与的索引固定，Router继续旁路学习，只影响下一次参与。
 不申请空位、不重置少用分量，不强制独占、换位或永久封禁。
 结构切换沿用既有方法私有的 DDP 解包/重建路径，公共训练器不改变。
 
-## 3．按原功能性陈旧度统一立即聚合
+### 完整候选贡献监督
+
+正式训练为每模块所有原始rank位置建立恒为1的叶张量h（requires_grad=True），
+在A输出到B输入之间乘h，内部排列映射回原始全局索引。h不注册为Parameter或buffer，
+不进LoRA/Router优化器、参数裁剪、快照或上传，也不决定选择/容量。
+正常累积反向同时得到全部位置的h.grad，包括A/B冻结的背景位置。
+每完整optimizer step读取u=-h.grad；h始终为1，读取后清空grad，本地结束移除全部gate。
+DDP不自动同步这些普通叶张量，因此将所有模块梯度和存在标志打包，一次SUM
+all_reduce后除以world_size。归约不修改A/B梯度；缺失或非有限标签显式报错。
+输入为该步当前选中A/B与下载时冻结背景重建的完整候选特征，和标签来自同一更新前状态。
+随后主LoRA正常更新，再用detach的完整特征/标签更新Router，Huber按各模块完整R平均。
+预估阶段全部A/B可训练，继续用等价的B侧标签覆盖完整池，保持原有预热路径。
+不额外调用VLM前向或反向；新增gate乘法/梯度、一次小向量归约和全候选特征存储。
+R32、128模块时特征约128MiB/副本，归约向量含存在标志约16.5KiB/step，
+实际激活/耗时仍需服务器测量。
+
+### Router只使用Huber回归
+
+使用原EMA幅度归一化后的detach标签y，在每个模块全部候选分量上计算
+mean_j Huber(s_j,y_j)，再对有效模块等权平均。预估和正式训练均使用该目标。
+`router_rank_lambda=0.0` 会直接跳过成对矩阵构造和排序损失计算，避免在标签
+差距已预测正确时仍持续拉大分数间隔。特征与标签仍断开梯度，只有私有MLP被更新。
+完整冻结背景、全候选gate标签、LoRA训练和上传范围保持不变。
+
+Spearman、Top-k/Top-1重合率仍由已有预测计算并记录，不参与梯度更新。
+为兼容显式启用过排序项的旧profile，保留可选实现及参数；当前默认不启用，
+`router_rank_min_gap` 在权重为0时不生效。已有profile若显式写了非零权重，
+需要改为0或重新生成配置；代码不会静默改变旧配置。
+相同系统、数据与训练预算下可以复用Plan，无需重新生成虚拟到达条件。
+
+## 3．按完整功能性距离统一立即聚合
 
 上传：任务/客户端/版本、原始分量索引、相对下载快照的选中 A/B 增量、模块敏感度。
 不上传骨干、Router权重/optimizer或完整端点。协议中的 hc_* 是兼容字段名，不是门控。
 
 模块敏感度沿用现有 Module-Gate：跳过首个 optimizer step，累计
 abs(0.5*(<grad_A,A>+<grad_B,B>)) 的均值，默认 C=0.25+0.75*S/mean(S)。
-它仅参与已有的功能性陈旧度计算，不再生成不同模块的融合系数。
+新模式中敏感度仍用于原有本地更新能量诊断/极小更新过滤，但不参与rho或模块系数。
 
-在 base/current/local 三个模型完全相同的本次选中支持上：
+新rho只比较下载时和到达时的完整全局LoRA，包含未选分量和分量间交叉项：
 
 ```text
-D = sum_m C_m * ||kappa*(B_current[S] A_current[S] - B_base[S] A_base[S])||_F^2
-U = sum_m C_m * ||kappa*(B_local A_local - B_base[S] A_base[S])||_F^2
-rho = exp(-gamma * sqrt(D/(U+eps)))
+D = sum_m ||kappa_m*(B_current A_current - B_base A_base)||_F^2
+d = sqrt(D)
+rho = exp(-gamma * d)
 alpha = server_step_size * rho
 A_global[S,:] += alpha * delta_A
 B_global[:,S] += alpha * delta_B
 ```
 
-默认 gamma=1、server_step_size=1。同次上传所有模块/分量共用 alpha，无额外0.5上限。
+默认 gamma=0.75、server_step_size=1。同次上传所有模块/分量共用 alpha，无额外0.5上限。
+该D使用小Gram矩阵计算，不物化完整权重。无更新能量分母、无本地敏感度权重。
+gamma的数值尺度已改变，需检查新运行的absolute_staleness/reliability分布；
+旧日志只有selected D，不能反推出完整D。此权重仍不保证更新改善所有任务。
+新增导出staleness_mode/absolute_staleness/selected_functional_drift/local_frozen_background；
+新模式relative_staleness为空，避免把绝对距离误解为旧比值。
 未上传位置不写回。没有重叠开关、频率补偿、历史敏感度分母或任务结束年龄增强。
 冲突不再次乘进当前聚合系数。极小能量、非有限值和重复身份仍校验。
 
@@ -236,7 +284,7 @@ gram_bytes是小Gram表字节，另记录factor_storage_device和gram_storage_de
 导出无需模型或图片：
 
 ```bash
-python tools/export_ours_router_diagnostics.py runs/llava/afvlm_cm/profiles/all_e1_bs2_ga4_r10_s42/2clients/ours_router/seed42
+python tools/export_ours_router_diagnostics.py runs/llava/afvlm_cm/profiles/router_full_huber_g075_e1_bs2_ga4_r10_s42/2clients/ours_router/seed42
 ```
 
 输出 router_diagnostics 下的 updates、modules、local_steps、capacities、components、
@@ -245,18 +293,25 @@ resolutions、conflict_selection、conflict_windows、probe_steps CSV。
 Top-k重合率和Top-1重合率。local_steps.csv 与 probe_steps.csv 同时包含有效模块均值和
 有效模块数（router_spearman_mean、router_topk_overlap_mean、router_top1_overlap_mean）。
 其中router_head标识实际使用的层网络；updates.csv另记录router_sharing与router_head_count。
+预估/正式逐步日志以及probe_steps.csv/local_steps.csv新增router_regression_loss、
+router_rank_loss、router_rank_pairs、router_rank_valid_modules、router_rank_lambda、
+router_rank_min_gap；默认router_loss等于Huber回归损失，排序项与有效对数为0。
+旧日志没有这些值
+时导出留空，不把旧router_loss臆测拆成新损失。排序指标仍在本步Router更新前计算。
 
 诊断复用现有 Router 更新前预测与同一 LoRA 更新前状态的有符号 u 标签，不增加前向、
-反向、损失项或DDP通信。只由主进程计算；小统计在每个完整step一次性传回CPU。
+反向次数或损失项；完整候选标签另需上述一次gate梯度归约。排序统计只由主进程计算；
+小统计在每个完整step一次性传回CPU。
 Spearman 使用并列平均秩；Top-k = 两个前k集合交集大小/k，默认k=ceil(观察数*25%)，
 观察数>=2时保证k小于观察数，另记录Top-1。每行记录n、k、全局索引、候选rank和
 独立随机排序的参考重合率k/n（Top-1为1/n），避免把不同池大小的数值直接等同。
 常量预测/标签、仅一个分量、无有效监督时结果为null；Top-k截断边界存在并列时也
 标记该项无效，不把任意并列打破当成真实排序能力。均值只统计对应指标有效的模块。
 
-预估阶段scope=full_candidate_components，覆盖完整候选池；正式阶段
-scope=selected_components_only，仅比较当前已选分量内部排序。正式阶段未选分量没有
-标签，不能声称该指标验证了全部候选中的最终Top-k选择。诊断不包含冲突惩罚。
+当前完整监督配置的预估和正式阶段scope均为full_candidate_components，索引覆盖0..R-1，
+可检查完整候选上的Router排序。旧selected配置仍记录selected_components_only，
+旧日志不补造未选标签；两种scope不能直接混合比较。诊断不包含冲突惩罚，Top-k统计
+仍为预测/标签前25%集合重合率，不能等同于容量k对应的最终选择准确率。
 这是同一训练梯度代理上的在线拟合诊断，不是独立验证集的排序泛化或真实性能证明。
 旧日志没有这些观测时导出留空，不补造数据；旧配置无需为本次日志改动重新生成Plan。
 新模式旧历史列留空，不能把它们当作零历史保护；conflict_selection覆盖所有候选而非

@@ -65,6 +65,9 @@ def export(run: Path, output: Path) -> dict:
                             "functional_drift",
                             "functional_local_energy",
                             "relative_staleness",
+                            "absolute_staleness",
+                            "staleness_mode",
+                            "selected_functional_drift",
                             "reliability",
                             "frequency_weight",
                         )
@@ -73,6 +76,8 @@ def export(run: Path, output: Path) -> dict:
                     "local_wall_time_seconds": row["local"].get("local_wall_time_seconds"),
                     "router_parameter_count": row["local"].get("router_parameter_count"),
                     "router_sharing": row["local"].get("router_sharing"),
+                    "local_frozen_background": row["local"].get("local_frozen_background"),
+                    "router_supervision": row["local"].get("router_supervision"),
                     "router_head_count": row["local"].get("router_head_count"),
                     "total_selected_components": sum(row["selected_rank"].values()),
                     "aggregation_mode": row.get("aggregation_mode", "legacy_or_overlap_switch"),

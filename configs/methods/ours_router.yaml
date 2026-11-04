@@ -1,9 +1,14 @@
-# 2026-11-02 design: probe warm-up + exact recent conflict + uniform eta*rho.
+# 2026-11-04: frozen full context + full absolute drift + exact recent conflict.
 # Legacy/overlap_switch frozen profiles preserve their original algorithms.
 method:
   name: ours_router
   params:
     rank_aggregation_mode: conflict_router
+    # 2026-11-04: full downloaded context; only selected factors are trainable.
+    local_frozen_background: true
+    # Fixed-one readout gates supervise every candidate.
+    router_supervision: full_candidates
+    staleness_mode: full_functional_absolute
     # Each task keeps its last L accepted uploads; age is global accepted updates.
     conflict_per_task_window: 3
     conflict_max_age: 24
@@ -26,11 +31,15 @@ method:
     router_learning_rate: 0.001
     router_label_beta: 0.9
     router_huber_delta: 1.0
+    # Huber-only supervision; ranking remains a diagnostic, not an objective.
+    # Zero skips pair construction and the ranking-loss computation entirely.
+    router_rank_lambda: 0.0
+    router_rank_min_gap: 0.1
     router_label_min: 0.000000000001
     router_max_grad_norm: 1.0
     sensitivity_warmup_steps: 1
     sensitivity_uniform_mix: 0.75
-    gamma: 1.0
+    gamma: 0.75
     eps: 0.000000000001
     min_update_energy: 0.0000000000000001
 federation:

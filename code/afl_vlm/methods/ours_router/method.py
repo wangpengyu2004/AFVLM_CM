@@ -72,6 +72,11 @@ class OursRouter(OursHC):
         "conflict_max_age",
         "conflict_penalty",
         "conflict_min_norm",
+        "local_frozen_background",
+        "staleness_mode",
+        "router_supervision",
+        "router_rank_lambda",
+        "router_rank_min_gap",
     }
 
     def __init__(self, params: Mapping[str, Any] | None = None) -> None:
@@ -93,6 +98,29 @@ class OursRouter(OursHC):
         return self.params.get("rank_aggregation_mode", "legacy") == "conflict_router"
 
     def validate_runtime(self) -> None:
+        for key, default in (("router_rank_lambda", 0.0), ("router_rank_min_gap", 0.1)):
+            if not math.isfinite(self.value(key, default)) or self.value(key, default) < 0:
+                raise ValueError(f"{key} must be finite and nonnegative")
+        supervision = self.params.get("router_supervision", "selected")
+        if supervision not in {"selected", "full_candidates"}:
+            raise ValueError("Unknown router_supervision")
+        if supervision == "full_candidates" and (
+            not self.conflict_mode or not self.params.get("local_frozen_background", False)
+        ):
+            raise ValueError(
+                "Full-candidate supervision requires conflict_router frozen background"
+            )
+        if not isinstance(self.params.get("local_frozen_background", False), bool):
+            raise ValueError("local_frozen_background must be boolean")
+        if self.params.get("staleness_mode", "selected_relative") not in {
+            "selected_relative", "full_functional_absolute"
+        }:
+            raise ValueError("Unknown staleness_mode")
+        if not self.conflict_mode and (
+            self.params.get("local_frozen_background", False)
+            or self.params.get("staleness_mode", "selected_relative") != "selected_relative"
+        ):
+            raise ValueError("Full-background/absolute drift options require conflict_router")
         if self.params.get("router_sharing", "dimension") not in {"dimension", "layer"}:
             raise ValueError("router_sharing must be dimension or layer")
         if self.params.get("rank_aggregation_mode", "legacy") not in {

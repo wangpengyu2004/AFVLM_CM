@@ -15,6 +15,16 @@ from afl_vlm.methods.ours_hc import payload
 from afl_vlm.models.base import clone_state
 
 
+def full_functional_drift(base: dict, current: dict, modules: dict) -> float:
+    """Exact full-support BA distance; independent of upload, sensitivity and mask."""
+    return float(sum(
+        payload.lora_functional_distance_sq(
+            current[item["a_name"]], current[item["b_name"]],
+            base[item["a_name"]], base[item["b_name"]], float(item["scaling"]),
+        ) for item in modules.values()
+    ))
+
+
 def arrive(method: Any, update: Any, context: Any) -> list[ServerMutation]:
     payload.validate(update, method.modules)
     key = (update.client_id, update.local_round)
@@ -39,13 +49,17 @@ def arrive(method: Any, update: Any, context: Any) -> list[ServerMutation]:
         window = window._new()
         window.modules = modules
     window.to(next(iter(context.global_state.values())).device)
-    drift, energy = payload.functional_energies(base, context.global_state, update)
+    selected_drift, energy = payload.functional_energies(base, context.global_state, update)
+    mode = method.params.get("staleness_mode", "selected_relative")
+    drift = (full_functional_drift(base, context.global_state, modules)
+             if mode == "full_functional_absolute" else selected_drift)
     if not all(math.isfinite(x) and x >= 0 for x in (drift, energy)):
         raise ValueError("Invalid conflict-router functional energy")
-    relative = math.sqrt(drift / (energy + method.value("eps", 1e-12)))
-    if not math.isfinite(relative):
+    distance = (math.sqrt(drift) if mode == "full_functional_absolute"
+                else math.sqrt(drift / (energy + method.value("eps", 1e-12))))
+    if not math.isfinite(distance):
         raise ValueError("Non-finite functional staleness")
-    rho = math.exp(-method.value("gamma", 1) * relative)
+    rho = math.exp(-method.value("gamma", 1) * distance)
     alpha = method.value("server_step_size", 1) * rho
     accepted = energy >= method.value("min_update_energy", 1e-16) and alpha > 0
     alphas = dict.fromkeys(modules, alpha if accepted else 0.0)
@@ -65,7 +79,10 @@ def arrive(method: Any, update: Any, context: Any) -> list[ServerMutation]:
         "optimizer_steps": update.optimizer_steps, "accepted": accepted,
         "version_staleness": context.version - version,
         "functional_drift": drift, "functional_local_energy": energy,
-        "relative_staleness": relative, "reliability": rho,
+        "relative_staleness": distance if mode == "selected_relative" else None,
+        "absolute_staleness": distance if mode == "full_functional_absolute" else None,
+        "staleness_mode": mode, "selected_functional_drift": selected_drift,
+        "reliability": rho,
         "server_step_size": method.value("server_step_size", 1),
         "uniform_alpha": alpha if accepted else 0.0, "module_alpha": alphas,
         "accepted_updates_before": method.accepted_count,

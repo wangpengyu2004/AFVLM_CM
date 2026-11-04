@@ -56,6 +56,8 @@ class LocalRouter:
         self.slots, self.private, self.capacities = {}, {}, {}
         self.active, self.base, self.choice = False, {}, {}
         self.probing = False
+        self.background_restorers = []
+        self.observation_gates = {}
         self.initialized_state = None
         self.output = None
         self.pending, self.trajectory, self.loss_sum, self.loss_count = {}, [], None, 0
@@ -225,15 +227,44 @@ class LocalRouter:
                 module.lora_B[adapter].in_features = len(self.choice[name])
                 # module.scaling is deliberately untouched: still global alpha/R.
                 module.r[adapter] = len(self.choice[name])
+                if self.params.get("local_frozen_background", False):
+                    from afl_vlm.methods.ours_router.background import attach_background
+
+                    complement = torch.tensor(
+                        [j for j in range(self.full_metadata[name]["rank"])
+                         if j not in self.choice[name]], device=a.device, dtype=torch.long,
+                    )
+                    gate, order = None, None
+                    if self.params.get("router_supervision", "selected") == "full_candidates":
+                        gate = torch.ones(self.full_metadata[name]["rank"], device=a.device,
+                                          dtype=torch.float32, requires_grad=True)
+                        order = torch.cat((indices, complement))
+                        self.observation_gates[name] = gate
+                    if complement.numel() or gate is not None:
+                        self.background_restorers.append(attach_background(
+                            module.lora_A[adapter], module.lora_B[adapter],
+                            a.detach().index_select(0, complement),
+                            b.detach().index_select(1, complement),
+                            **({"gate": gate, "order": order} if gate is not None else {}),
+                        ))
             self.active = True
+        except Exception:
+            # Restore partial installation before propagating setup failures.
+            self.active = True
+            self.restore()
+            raise
         finally:
             self._rewrap(was_ddp)
-        self.tracker = ModuleSensitivityTracker(
-            self.model,
-            warmup_steps=int(self.params.get("sensitivity_warmup_steps", 1)),
-            uniform_mix=float(self.params.get("sensitivity_uniform_mix", 0.75)),
-            eps=float(self.params.get("eps", 1e-12)),
-        )
+        try:
+            self.tracker = ModuleSensitivityTracker(
+                self.model,
+                warmup_steps=int(self.params.get("sensitivity_warmup_steps", 1)),
+                uniform_mix=float(self.params.get("sensitivity_uniform_mix", 0.75)),
+                eps=float(self.params.get("eps", 1e-12)),
+            )
+        except Exception:
+            self.restore()
+            raise
         self.pending, self.trajectory, self.loss_sum, self.loss_count = {}, [], None, 0
 
     def task_loss(self, loss: Any) -> Any:
@@ -248,10 +279,30 @@ class LocalRouter:
         if not self.probing:
             self.tracker.update(step)
         self.pending = {}
+        full = not self.probing and bool(self.observation_gates)
+        if full:
+            from afl_vlm.methods.ours_router.supervision import gate_labels
+
+            labels = gate_labels(self.observation_gates)
         with torch.no_grad():
             modules = _discover_model_modules(self.model) if self.probing else self.tracker.modules
             for name, (a, b, _) in modules.items():
-                if b.grad is not None:
+                if full:
+                    item = self.full_metadata[name]
+                    index = self.index(name, a.device)
+                    # Independent pre-step full state: current selected factors
+                    # and immutable downloaded background, in GLOBAL rank order.
+                    fa = self.base[item["a_name"]].detach().clone()
+                    fb = self.base[item["b_name"]].detach().clone()
+                    fa.index_copy_(0, index, a.detach().to(dtype=fa.dtype))
+                    fb.index_copy_(1, index, b.detach().to(dtype=fb.dtype))
+                    self.pending[name] = (
+                        PrivateRouter.key(a.shape[1], b.shape[0], name,
+                                          str(self.params.get("router_sharing", "dimension"))),
+                        component_features(fa, fb, float(self.params.get("eps", 1e-12))),
+                        labels[name],
+                    )
+                elif b.grad is not None:
                     self.pending[name] = (
                         PrivateRouter.key(a.shape[1], b.shape[0], name,
                                           str(self.params.get("router_sharing", "dimension"))),
@@ -270,7 +321,8 @@ class LocalRouter:
             ranking = report["router_ranking"]
             ranking["phase"] = "probe" if self.probing else "formal"
             ranking["scope"] = (
-                "full_candidate_components" if self.probing else "selected_components_only"
+                "full_candidate_components" if self.probing or self.observation_gates
+                else "selected_components_only"
             )
             for name, detail in ranking["modules"].items():
                 detail["global_candidate_rank"] = self.full_metadata[name]["rank"]
@@ -280,7 +332,8 @@ class LocalRouter:
                     name, str(self.params.get("router_sharing", "dimension")),
                 )
                 detail["component_indices"] = (
-                    list(range(self.full_metadata[name]["rank"])) if self.probing
+                    list(range(self.full_metadata[name]["rank"]))
+                    if self.probing or self.observation_gates
                     else list(self.choice[name])
                 )
         loss = torch.stack((self.loss_sum, self.loss_sum.new_tensor(self.loss_count)))
@@ -294,6 +347,10 @@ class LocalRouter:
         if not self.active:
             return
         was_ddp = self._unwrap()
+        for restore_background in self.background_restorers:
+            restore_background()
+        self.background_restorers.clear()
+        self.observation_gates.clear()
         for name, (module, adapter, a, b) in self.slots.items():
             module.lora_A[adapter].weight, module.lora_B[adapter].weight = a, b
             module.lora_A[adapter].out_features = self.full_metadata[name]["rank"]
@@ -326,6 +383,8 @@ class LocalRouter:
                 "router_sharing": self.client_router.sharing,
                 "router_head_count": len(self.client_router.heads),
                 "selection_fixed_for_job": True,
+                "local_frozen_background": self.params.get("local_frozen_background", False),
+                "router_supervision": self.params.get("router_supervision", "selected"),
             },
         }
         if self.output is not None and os.environ.get("AFVLM_PRIMARY_PROCESS", "1") == "1":

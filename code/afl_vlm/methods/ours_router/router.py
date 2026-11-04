@@ -152,6 +152,9 @@ class PrivateRouter:
         beta = float(self.params.get("router_label_beta", 0.9))
         eps = float(self.params.get("eps", 1e-12))
         losses, validities, magnitudes = [], [], []
+        rank_weight = float(self.params.get("router_rank_lambda", 0.0))
+        rank_gap = float(self.params.get("router_rank_min_gap", 0.1))
+        rank_losses, rank_counts = [], []
         # The primary replica owns diagnostics only. No extra DDP collectives,
         # stochastic operations, model passes, gradient edits or loss terms.
         diagnostics = os.environ.get("AFVLM_PRIMARY_PROCESS", "1") == "1"
@@ -189,13 +192,30 @@ class PrivateRouter:
                 losses.append(loss * valid)
                 validities.append(valid.float())
                 magnitudes.append(magnitude)
+                if rank_weight > 0:
+                    from afl_vlm.methods.ours_router.losses import pairwise_rank_loss
+
+                    rank_loss, pairs = pairwise_rank_loss(predicted, target, rank_gap, valid)
+                    rank_losses.append(rank_loss)
+                    rank_counts.append(pairs)
             count = torch.stack(validities).sum()
             loss = torch.stack(losses).sum() / count.clamp_min(1)
-            summary = torch.stack((loss.detach(), count, torch.stack(magnitudes).mean()))
+            regression = loss
+            rank_loss = loss.detach().new_zeros(())
+            pair_count = rank_modules = rank_loss
+            if rank_weight > 0:
+                pairs = torch.stack(rank_counts)
+                rank_modules = (pairs > 0).sum()
+                pair_count = pairs.sum()
+                rank_loss = torch.stack(rank_losses).sum() / rank_modules.clamp_min(1)
+                loss = regression + rank_weight * rank_loss
+            summary = torch.stack((loss.detach(), count, torch.stack(magnitudes).mean(),
+                                   regression.detach(), rank_loss.detach(), pair_count,
+                                   rank_modules))
             if diagnostics:
                 # One small transfer per complete step, not per rank/module.
                 combined = torch.cat((summary, torch.stack(ranking_values).flatten())).cpu()
-                summary = combined[:3]
+                summary = combined[:7]
             else:
                 summary = summary.cpu()
             if not bool(torch.isfinite(summary).all()):
@@ -221,11 +241,17 @@ class PrivateRouter:
             "router_valid_modules": int(summary[1]),
             "label_abs_mean": float(summary[2]),
             "router_lifetime_steps": self.steps,
+            "router_regression_loss": float(summary[3]),
+            "router_rank_loss": float(summary[4]),
+            "router_rank_pairs": int(summary[5]),
+            "router_rank_valid_modules": int(summary[6]),
+            "router_rank_lambda": rank_weight,
+            "router_rank_min_gap": rank_gap,
         }
         if diagnostics:
             from afl_vlm.methods.ours_router.ranking import FIELDS, ranking_report
 
-            ranking = ranking_report(ranking_names, combined[3:].reshape(-1, len(FIELDS)).tolist())
+            ranking = ranking_report(ranking_names, combined[7:].reshape(-1, len(FIELDS)).tolist())
             report["router_ranking"] = ranking
             for metric in ("spearman", "topk_overlap", "top1_overlap"):
                 report[f"router_{metric}_mean"] = ranking[f"{metric}_mean"]
